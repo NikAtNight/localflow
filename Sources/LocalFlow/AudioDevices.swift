@@ -1,0 +1,73 @@
+import CoreAudio
+import Foundation
+
+struct AudioInputDevice {
+    let id: AudioDeviceID
+    let uid: String
+    let name: String
+}
+
+/// CoreAudio HAL queries for input-capable devices. AVAudioEngine's input
+/// node follows the system default mic; recording from a specific one means
+/// resolving its stable UID (what we persist) to today's transient
+/// AudioDeviceID and pinning that on the input unit.
+enum AudioDevices {
+    static func inputDevices() -> [AudioInputDevice] {
+        allDeviceIDs().compactMap { id in
+            guard hasInputStreams(id),
+                  let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
+                  let name = stringProperty(id, kAudioObjectPropertyName) else { return nil }
+            return AudioInputDevice(id: id, uid: uid, name: name)
+        }
+    }
+
+    static func deviceID(forUID uid: String) -> AudioDeviceID? {
+        inputDevices().first { $0.uid == uid }?.id
+    }
+
+    static func defaultInputDeviceID() -> AudioDeviceID? {
+        var addr = address(kAudioHardwarePropertyDefaultInputDevice)
+        var id = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let err = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &id)
+        return err == noErr && id != kAudioObjectUnknown ? id : nil
+    }
+
+    // MARK: - HAL plumbing
+
+    private static func address(
+        _ selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+    ) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func allDeviceIDs() -> [AudioDeviceID] {
+        var addr = address(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size) == noErr,
+              size > 0 else { return [] }
+        var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &ids) == noErr else {
+            return []
+        }
+        return ids
+    }
+
+    private static func hasInputStreams(_ id: AudioDeviceID) -> Bool {
+        var addr = address(kAudioDevicePropertyStreams, scope: kAudioDevicePropertyScopeInput)
+        var size: UInt32 = 0
+        return AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr && size > 0
+    }
+
+    private static func stringProperty(_ id: AudioDeviceID, _ selector: AudioObjectPropertySelector) -> String? {
+        var addr = address(selector)
+        var value: CFString?
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        let err = withUnsafeMutablePointer(to: &value) {
+            AudioObjectGetPropertyData(id, &addr, 0, nil, &size, $0)
+        }
+        guard err == noErr, let value else { return nil }
+        return value as String
+    }
+}
