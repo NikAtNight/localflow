@@ -24,10 +24,20 @@ final class HotkeyManager {
         /// Option during a Left-Option drag looked like "still pressed" and
         /// left the mic recording. The NX_DEVICE* bits are per-key. fn has
         /// no twin, so the generic mask is exact for it.
-        var flagMask: CGEventFlags {
+        var deviceMask: CGEventFlags {
             switch self {
             case .rightOption: return CGEventFlags(rawValue: 0x40) // NX_DEVICERALTKEYMASK
             case .rightCommand: return CGEventFlags(rawValue: 0x10) // NX_DEVICERCMDKEYMASK
+            case .fn: return .maskSecondaryFn
+            }
+        }
+
+        /// The coarse modifier mask (set for either twin) — the fallback
+        /// signal for input paths that don't report device-specific bits.
+        var genericMask: CGEventFlags {
+            switch self {
+            case .rightOption: return .maskAlternate
+            case .rightCommand: return .maskCommand
             case .fn: return .maskSecondaryFn
             }
         }
@@ -255,7 +265,24 @@ final class HotkeyManager {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         guard keyCode == key.keyCode else { return false }
 
-        let pressed = event.flags.contains(key.flagMask)
+        // Only fires for the push-to-talk key itself — a few lines per
+        // dictation, and the exact evidence needed when detection misfires.
+        NSLog("LocalFlow: hotkey flagsChanged keycode=%d flags=0x%llx isDown=%d",
+              keyCode, event.flags.rawValue, isDown ? 1 : 0)
+
+        let pressed: Bool
+        if event.flags.contains(key.deviceMask) {
+            pressed = true
+        } else if !event.flags.contains(key.genericMask) {
+            pressed = false
+        } else {
+            // Generic mask set but no device bit: a release while the twin
+            // key is held, or an input path that never reports device bits
+            // (some external keyboards / remappers). Either way, an event
+            // for OUR keycode while down can only be a release, and while
+            // up can only be a press.
+            pressed = !isDown
+        }
         guard pressed != isDown else { return false }
         isDown = pressed
 

@@ -18,5 +18,12 @@
 	</dict>
 	<key>ProcessType</key>
 	<string>Interactive</string>
+	<!-- NSLog bodies are privacy-redacted in `log show`; a plain file keeps
+	     the app's own diagnostics readable. Note: transcripts appear in the
+	     end-to-end latency lines, so this file contains dictated text. -->
+	<key>StandardOutPath</key>
+	<string>/Users/nikhlkapadia/Library/Logs/LocalFlow.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/nikhlkapadia/Library/Logs/LocalFlow.log</string>
 </dict>
 </plist>
