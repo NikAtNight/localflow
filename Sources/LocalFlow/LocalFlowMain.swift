@@ -15,6 +15,10 @@ struct LocalFlowMain {
             transcribeFile(arguments[flagIndex + 1])
             return
         }
+        if arguments.contains("--record-test") {
+            recordTest()
+            return
+        }
 
         // A second instance means two event taps and every dictation pasted
         // twice — easy to hit by launching a fresh build while the login
@@ -76,5 +80,43 @@ struct LocalFlowMain {
 
     private static func elapsedMs(since start: Date) -> Int {
         Int(Date().timeIntervalSince(start) * 1000)
+    }
+
+    /// Headless capture check:
+    ///   LocalFlow --record-test
+    /// Records ~2s through the exact AudioRecorder pipeline the hotkey uses
+    /// (device selection, Bluetooth avoidance, format resolution, fallback)
+    /// and reports the outcome — the piece `--transcribe` can't exercise.
+    private static func recordTest() {
+        let stderr = FileHandle.standardError
+        let recorder = AudioRecorder()
+        recorder.deviceUID = Settings.inputDeviceUID
+        var finished = false
+
+        recorder.start { error in
+            if let error {
+                stderr.write(Data("record start FAILED: \(error.localizedDescription)\n".utf8))
+                finished = true
+                return
+            }
+            stderr.write(Data("record started OK — capturing 2s…\n".utf8))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                recorder.stop { samples in
+                    let seconds = Double(samples.count) / AudioRecorder.sampleRate
+                    let peak = samples.map(abs).max() ?? 0
+                    print("captured \(samples.count) samples (\(String(format: "%.2f", seconds))s), peak level \(String(format: "%.4f", peak))")
+                    finished = true
+                }
+            }
+        }
+
+        let deadline = Date().addingTimeInterval(15)
+        while !finished, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        }
+        if !finished {
+            stderr.write(Data("record test timed out\n".utf8))
+            exit(1)
+        }
     }
 }

@@ -120,21 +120,33 @@ final class AudioRecorder {
     private func beginCapture(pinning uid: String?) throws {
         tearDownEngine()
 
+        // Resolve the device and its TRUE format from the HAL before the
+        // engine gets involved. The engine's node formats (and a format:nil
+        // tap, which snapshots them) go stale when a device is pinned over
+        // the default — a 24kHz-cached tap on 48kHz hardware kills engine
+        // init with -10868. The HAL always answers for the actual device.
+        let pinnedID = uid.flatMap { AudioDevices.deviceID(forUID: $0) }
+        if uid != nil, pinnedID == nil {
+            NSLog("LocalFlow: selected microphone (%@) not available — using system default", uid!)
+        }
+        guard let deviceID = pinnedID ?? AudioDevices.defaultInputDeviceID(),
+              let hw = AudioDevices.inputHardwareFormat(deviceID),
+              let tapFormat = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channels: hw.channels)
+        else { throw RecorderError.noInput }
+
         let engine = AVAudioEngine()
         let input = engine.inputNode
-        if let uid { pin(deviceUID: uid, on: input) }
-        let inputFormat = input.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw RecorderError.noInput
+        if let pinnedID {
+            // AUAudioUnit's setter (unlike raw AudioUnitSetProperty) reports
+            // failure as a throwable error instead of silently misbinding.
+            try input.auAudioUnit.setDeviceID(pinnedID)
         }
 
-        // format: nil — take whatever the node actually produces. The
-        // converter is built from the first buffer's real format (and rebuilt
-        // if it changes) instead of a format read before the engine ran;
-        // requesting a format the hardware disagrees with is what crashed.
+        // The converter is still built from each buffer's actual format —
+        // belt and suspenders against a device rate change mid-recording.
         var converter: AVAudioConverter?
         let targetFormat = self.targetFormat
-        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
             guard let self else { return }
             if converter?.inputFormat != buffer.format {
                 converter = AVAudioConverter(from: buffer.format, to: targetFormat)
@@ -168,6 +180,12 @@ final class AudioRecorder {
             // A notification can be in flight while the recording it belongs
             // to is being torn down — react only for the current engine.
             guard let changed, changed === self.engine else { return }
+            // Engines also post a configuration change right after starting
+            // on a pinned non-default device; rebuilding on that
+            // self-notification triggers the next one — an infinite
+            // teardown/rebuild loop that shredded capture into fragments.
+            // Only a stopped engine (device died/reconfigured) needs help.
+            guard !changed.isRunning else { return }
             NSLog("LocalFlow: audio device changed mid-recording — resuming capture")
             do {
                 try self.captureWithFallback()
@@ -175,27 +193,6 @@ final class AudioRecorder {
                 NSLog("LocalFlow: could not resume capture after device change: %@",
                       error.localizedDescription)
             }
-        }
-    }
-
-    /// Pins a specific microphone on the input unit. Must run before reading
-    /// the input format — it changes with the device.
-    private func pin(deviceUID uid: String, on input: AVAudioInputNode) {
-        guard let deviceID = AudioDevices.deviceID(forUID: uid), let unit = input.audioUnit else {
-            NSLog("LocalFlow: selected microphone (%@) not available — using system default", uid)
-            return
-        }
-        var id = deviceID
-        let err = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &id,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        if err != noErr {
-            NSLog("LocalFlow: could not set input device %u (err %d)", id, err)
         }
     }
 

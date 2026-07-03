@@ -48,6 +48,34 @@ enum AudioDevices {
         return value
     }
 
+    /// The device's current input sample rate and channel count, straight
+    /// from the HAL. AVAudioEngine's node formats go stale once a device is
+    /// swapped underneath the engine (they reported the previous default's
+    /// rate even after pinning) — the HAL is the source of truth.
+    static func inputHardwareFormat(_ id: AudioDeviceID) -> (sampleRate: Double, channels: UInt32)? {
+        var rateAddr = address(kAudioDevicePropertyNominalSampleRate, scope: kAudioDevicePropertyScopeInput)
+        var rate: Double = 0
+        var rateSize = UInt32(MemoryLayout<Double>.size)
+        guard AudioObjectGetPropertyData(id, &rateAddr, 0, nil, &rateSize, &rate) == noErr, rate > 0 else {
+            return nil
+        }
+
+        var confAddr = address(kAudioDevicePropertyStreamConfiguration, scope: kAudioDevicePropertyScopeInput)
+        var confSize: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &confAddr, 0, nil, &confSize) == noErr, confSize > 0 else {
+            return nil
+        }
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: Int(confSize),
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { raw.deallocate() }
+        guard AudioObjectGetPropertyData(id, &confAddr, 0, nil, &confSize, raw) == noErr else { return nil }
+        let buffers = UnsafeMutableAudioBufferListPointer(raw.assumingMemoryBound(to: AudioBufferList.self))
+        let channels = buffers.reduce(0) { $0 + $1.mNumberChannels }
+        return channels > 0 ? (rate, channels) : nil
+    }
+
     static func defaultInputDeviceID() -> AudioDeviceID? {
         var addr = address(kAudioHardwarePropertyDefaultInputDevice)
         var id = AudioDeviceID(0)
