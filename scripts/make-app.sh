@@ -41,6 +41,20 @@ else
         "$APP"
 fi
 
+# CoreML specializes the Whisper model once per binary (takes minutes, and
+# the hotkey is dead until it finishes). Pay that cost here, against the
+# signed binary, so the installed app's first dictation is instant. Skipped
+# gracefully if the model isn't downloaded yet (true first install).
+echo "Pre-warming CoreML model cache (can take a few minutes on a new binary)…"
+WARM_AIFF="$(mktemp -t localflow-warm).aiff"
+if say -o "$WARM_AIFF" "warm up" 2>/dev/null &&
+   "$APP/Contents/MacOS/LocalFlow" --transcribe "$WARM_AIFF" >/dev/null 2>&1; then
+    echo "Model cache warm."
+else
+    echo "warning: pre-warm skipped/failed — first in-app dictation will be slow"
+fi
+rm -f "$WARM_AIFF"
+
 echo
 echo "Built $APP"
 

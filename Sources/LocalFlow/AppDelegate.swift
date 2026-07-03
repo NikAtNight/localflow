@@ -258,7 +258,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // state. Pressing while a previous dictation is still transcribing
         // (or after a transient mic error) must start a new recording.
         NSLog("LocalFlow: hotkey pressed (modelLoaded=%d recording=%d)", modelLoaded ? 1 : 0, isRecording ? 1 : 0)
-        guard modelLoaded, !isRecording else { return }
+        guard modelLoaded, !isRecording else {
+            // The model recompiles for minutes after every binary change —
+            // a press during that window must never be silently swallowed.
+            if !modelLoaded { playCue("Basso") }
+            return
+        }
         // A denied mic yields an engine that happily records silence —
         // every dictation would "succeed" with nothing to show. Fail loudly.
         let micAuth = AVCaptureDevice.authorizationStatus(for: .audio)

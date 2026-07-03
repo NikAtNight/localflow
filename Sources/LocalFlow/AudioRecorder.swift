@@ -76,18 +76,40 @@ final class AudioRecorder {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         lock.unlock()
-        try beginCapture()
+        try captureWithFallback()
+    }
+
+    /// Starts capture on the preferred mic; if that fails (a Bluetooth mic
+    /// that won't activate, a half-disconnected device), retries on the
+    /// built-in microphone. Dictation must not die while a working mic
+    /// exists — a wrong-mic recording beats no recording.
+    private func captureWithFallback() throws {
+        let preferred = deviceUID
+        do {
+            try beginCapture(pinning: preferred)
+        } catch {
+            let builtIn = AudioDevices.builtInInputDevice()
+            let attemptedBuiltIn = preferred == nil
+                ? AudioDevices.defaultInputDeviceID() == builtIn?.id
+                : preferred == builtIn?.uid
+            guard let builtIn, !attemptedBuiltIn else { throw error }
+            NSLog("LocalFlow: mic failed to start (%@) — falling back to %@",
+                  error.localizedDescription, builtIn.name)
+            try beginCapture(pinning: builtIn.uid)
+        }
     }
 
     /// Builds a fresh engine and starts appending to `samples`. Split from
     /// `startEngine` so a mid-recording device change can resume capture
-    /// without discarding what was already recorded.
-    private func beginCapture() throws {
+    /// without discarding what was already recorded. A nil `uid` leaves the
+    /// engine on the system default device — a fresh engine binds the
+    /// current default at creation, so no explicit pinning is needed.
+    private func beginCapture(pinning uid: String?) throws {
         tearDownEngine()
 
         let engine = AVAudioEngine()
         let input = engine.inputNode
-        applyDeviceSelection(to: input)
+        if let uid { pin(deviceUID: uid, on: input) }
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             throw RecorderError.noInput
@@ -135,7 +157,7 @@ final class AudioRecorder {
             guard let changed, changed === self.engine else { return }
             NSLog("LocalFlow: audio device changed mid-recording — resuming capture")
             do {
-                try self.beginCapture()
+                try self.captureWithFallback()
             } catch {
                 NSLog("LocalFlow: could not resume capture after device change: %@",
                       error.localizedDescription)
@@ -143,20 +165,13 @@ final class AudioRecorder {
         }
     }
 
-    /// Pins the requested microphone on the input unit. Once pinned, the
-    /// unit stops following the system default, so "default" is re-resolved
-    /// and re-applied explicitly on every start. Must run before reading the
-    /// input format — it changes with the device.
-    private func applyDeviceSelection(to input: AVAudioInputNode) {
-        var wanted: AudioDeviceID?
-        if let deviceUID {
-            wanted = AudioDevices.deviceID(forUID: deviceUID)
-            if wanted == nil {
-                NSLog("LocalFlow: selected microphone (%@) not connected — using system default", deviceUID)
-            }
+    /// Pins a specific microphone on the input unit. Must run before reading
+    /// the input format — it changes with the device.
+    private func pin(deviceUID uid: String, on input: AVAudioInputNode) {
+        guard let deviceID = AudioDevices.deviceID(forUID: uid), let unit = input.audioUnit else {
+            NSLog("LocalFlow: selected microphone (%@) not available — using system default", uid)
+            return
         }
-        guard let deviceID = wanted ?? AudioDevices.defaultInputDeviceID(),
-              let unit = input.audioUnit else { return }
         var id = deviceID
         let err = AudioUnitSetProperty(
             unit,

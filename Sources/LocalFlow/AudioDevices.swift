@@ -25,6 +25,21 @@ enum AudioDevices {
         inputDevices().first { $0.uid == uid }?.id
     }
 
+    /// The built-in microphone — the fallback when a chosen device (often a
+    /// Bluetooth mic mid-mode-switch) fails to start. Nil on Macs without
+    /// one (Mac mini/Studio).
+    static func builtInInputDevice() -> AudioInputDevice? {
+        inputDevices().first { transportType($0.id) == kAudioDeviceTransportTypeBuiltIn }
+    }
+
+    private static func transportType(_ id: AudioDeviceID) -> UInt32 {
+        var addr = address(kAudioDevicePropertyTransportType)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, &value) == noErr else { return 0 }
+        return value
+    }
+
     static func defaultInputDeviceID() -> AudioDeviceID? {
         var addr = address(kAudioHardwarePropertyDefaultInputDevice)
         var id = AudioDeviceID(0)
