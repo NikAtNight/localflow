@@ -84,7 +84,20 @@ final class AudioRecorder {
     /// built-in microphone. Dictation must not die while a working mic
     /// exists — a wrong-mic recording beats no recording.
     private func captureWithFallback() throws {
-        let preferred = deviceUID
+        var preferred = deviceUID
+        // "System Default" deliberately skips a Bluetooth default mic
+        // (AirPods auto-connecting): engaging its hands-free profile is
+        // slow, stutters all system audio (the cues), and often captures
+        // nothing usable. Explicitly picking the Bluetooth mic in the menu
+        // still pins it — that's a real choice, this is just a default.
+        if preferred == nil,
+           let defaultID = AudioDevices.defaultInputDeviceID(),
+           AudioDevices.isBluetooth(defaultID),
+           let builtIn = AudioDevices.builtInInputDevice() {
+            NSLog("LocalFlow: default input is a Bluetooth mic — using %@ instead (pick the Bluetooth mic in the Microphone menu to override)",
+                  builtIn.name)
+            preferred = builtIn.uid
+        }
         do {
             try beginCapture(pinning: preferred)
         } catch {

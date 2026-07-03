@@ -32,6 +32,14 @@ enum AudioDevices {
         inputDevices().first { transportType($0.id) == kAudioDeviceTransportTypeBuiltIn }
     }
 
+    /// Bluetooth mics engage the hands-free profile when recording, which is
+    /// slow to start and degrades all system audio for the duration.
+    static func isBluetooth(_ id: AudioDeviceID) -> Bool {
+        let transport = transportType(id)
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
     private static func transportType(_ id: AudioDeviceID) -> UInt32 {
         var addr = address(kAudioDevicePropertyTransportType)
         var value: UInt32 = 0
