@@ -667,7 +667,20 @@ extension AppDelegate: NSMenuDelegate {
         submenu.removeAllItems()
         let selectedUID = Settings.inputDeviceUID
 
-        let defaultItem = NSMenuItem(title: "System Default", action: #selector(selectMicrophone(_:)), keyEquivalent: "")
+        // Say what "System Default" will actually do — it deliberately
+        // routes around a Bluetooth default mic, and hiding that made the
+        // behavior look broken.
+        var defaultTitle = "System Default"
+        if let defaultID = AudioDevices.defaultInputDeviceID() {
+            let devices = AudioDevices.inputDevices()
+            let defaultName = devices.first { $0.id == defaultID }?.name
+            if AudioDevices.isBluetooth(defaultID), let builtIn = AudioDevices.builtInInputDevice() {
+                defaultTitle = "System Default — \(builtIn.name) (\(defaultName ?? "Bluetooth mic") skipped)"
+            } else if let defaultName {
+                defaultTitle = "System Default (\(defaultName))"
+            }
+        }
+        let defaultItem = NSMenuItem(title: defaultTitle, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
         defaultItem.target = self
         defaultItem.state = selectedUID == nil ? .on : .off
         submenu.addItem(defaultItem)

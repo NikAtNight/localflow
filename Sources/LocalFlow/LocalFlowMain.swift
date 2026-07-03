@@ -84,39 +84,49 @@ struct LocalFlowMain {
 
     /// Headless capture check:
     ///   LocalFlow --record-test
-    /// Records ~2s through the exact AudioRecorder pipeline the hotkey uses
-    /// (device selection, Bluetooth avoidance, format resolution, fallback)
-    /// and reports the outcome — the piece `--transcribe` can't exercise.
+    /// Runs three consecutive ~1.5s captures through the exact AudioRecorder
+    /// pipeline the hotkey uses (device selection, Bluetooth avoidance,
+    /// format resolution, fallback) — consecutive, because engine teardown
+    /// residue only bites the SECOND capture in a process, exactly like a
+    /// user's second hotkey press.
     private static func recordTest() {
         let stderr = FileHandle.standardError
         let recorder = AudioRecorder()
         recorder.deviceUID = Settings.inputDeviceUID
-        var finished = false
+        var failures = 0
 
-        recorder.start { error in
-            if let error {
-                stderr.write(Data("record start FAILED: \(error.localizedDescription)\n".utf8))
-                finished = true
-                return
-            }
-            stderr.write(Data("record started OK — capturing 2s…\n".utf8))
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                recorder.stop { samples in
-                    let seconds = Double(samples.count) / AudioRecorder.sampleRate
-                    let peak = samples.map(abs).max() ?? 0
-                    print("captured \(samples.count) samples (\(String(format: "%.2f", seconds))s), peak level \(String(format: "%.4f", peak))")
+        for round in 1...3 {
+            var finished = false
+            recorder.start { error in
+                if let error {
+                    stderr.write(Data("round \(round): start FAILED: \(error.localizedDescription)\n".utf8))
+                    failures += 1
                     finished = true
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    recorder.stop { samples in
+                        let seconds = Double(samples.count) / AudioRecorder.sampleRate
+                        let peak = samples.map(abs).max() ?? 0
+                        print("round \(round): captured \(samples.count) samples "
+                              + "(\(String(format: "%.2f", seconds))s), peak \(String(format: "%.4f", peak))")
+                        if seconds < 1.2 { failures += 1 }
+                        finished = true
+                    }
                 }
             }
+            let deadline = Date().addingTimeInterval(15)
+            while !finished, Date() < deadline {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            }
+            if !finished {
+                stderr.write(Data("round \(round): timed out\n".utf8))
+                exit(1)
+            }
+            // A beat between rounds, like a user pausing between dictations.
+            RunLoop.main.run(until: Date().addingTimeInterval(0.3))
         }
-
-        let deadline = Date().addingTimeInterval(15)
-        while !finished, Date() < deadline {
-            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
-        }
-        if !finished {
-            stderr.write(Data("record test timed out\n".utf8))
-            exit(1)
-        }
+        print(failures == 0 ? "record test PASSED" : "record test FAILED (\(failures) bad rounds)")
+        exit(failures == 0 ? 0 : 1)
     }
 }

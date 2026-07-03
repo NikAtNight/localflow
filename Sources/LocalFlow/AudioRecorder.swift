@@ -101,14 +101,25 @@ final class AudioRecorder {
         do {
             try beginCapture(pinning: preferred)
         } catch {
-            let builtIn = AudioDevices.builtInInputDevice()
-            let attemptedBuiltIn = preferred == nil
-                ? AudioDevices.defaultInputDeviceID() == builtIn?.id
-                : preferred == builtIn?.uid
-            guard let builtIn, !attemptedBuiltIn else { throw error }
-            NSLog("LocalFlow: mic failed to start (%@) — falling back to %@",
-                  error.localizedDescription, builtIn.name)
-            try beginCapture(pinning: builtIn.uid)
+            // The HAL transiently refuses to start I/O (EAGAIN, "already is
+            // a thread") while Bluetooth devices are mid-transition — a
+            // short pause and one retry absorbs that before giving up on
+            // the device entirely.
+            NSLog("LocalFlow: capture start failed (%@) — retrying once",
+                  error.localizedDescription)
+            usleep(300_000)
+            do {
+                try beginCapture(pinning: preferred)
+            } catch {
+                let builtIn = AudioDevices.builtInInputDevice()
+                let attemptedBuiltIn = preferred == nil
+                    ? AudioDevices.defaultInputDeviceID() == builtIn?.id
+                    : preferred == builtIn?.uid
+                guard let builtIn, !attemptedBuiltIn else { throw error }
+                NSLog("LocalFlow: mic failed to start (%@) — falling back to %@",
+                      error.localizedDescription, builtIn.name)
+                try beginCapture(pinning: builtIn.uid)
+            }
         }
     }
 
