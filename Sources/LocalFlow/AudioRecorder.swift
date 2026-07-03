@@ -1,8 +1,16 @@
-import AudioToolbox
 import AVFoundation
+import CoreMedia
 
-/// Captures microphone audio with AVAudioEngine and converts it on the fly
-/// to 16 kHz mono Float32 PCM — the format Whisper expects.
+/// Captures microphone audio and converts it on the fly to 16 kHz mono
+/// Float32 PCM — the format Whisper expects.
+///
+/// Built on AVCaptureSession, not AVAudioEngine. The engine validates tap
+/// formats against an internal cache that goes stale whenever the device
+/// changes underneath it (Bluetooth mics flip rates on every hands-free
+/// transition) — with a nil tap format it dies at engine start (-10868),
+/// and with an explicit one it dies in installTap with an *uncatchable*
+/// NSException. AVCaptureSession has no cached-format validation at all:
+/// every delivered buffer self-describes its format.
 final class AudioRecorder {
     enum RecorderError: Error, LocalizedError {
         case noInput
@@ -16,9 +24,15 @@ final class AudioRecorder {
 
     static let sampleRate: Double = 16_000
 
-    /// Called on the audio thread with a 0…1 loudness level per captured
+    /// Called on the capture queue with a 0…1 loudness level per captured
     /// buffer — drives the waveform overlay. Callee must hop to main itself.
     var onLevel: ((Float) -> Void)?
+
+    /// Called once per `start`, on the capture queue, when the first buffer
+    /// actually arrives. Session start alone doesn't mean audio is flowing —
+    /// a Bluetooth mic's hands-free profile can take a second (or a rebuild)
+    /// to deliver anything, and the "speak now" cue must not lie.
+    var onCaptureLive: (() -> Void)?
 
     /// UID of the microphone to record from; nil follows the system default.
     /// Takes effect at the next `start`. Written from the main thread (menu
@@ -29,33 +43,32 @@ final class AudioRecorder {
     }
     private var _deviceUID: String?
 
-    private let targetFormat = AVAudioFormat(
+    private static let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: AudioRecorder.sampleRate,
         channels: 1,
         interleaved: false
     )!
 
-    // One engine per recording, never reused. AVAudioEngine caches its input
-    // node's format; after a microphone change the cache can disagree with
-    // the hardware, and installTap raises an uncatchable NSException on the
-    // mismatch (this crashed the app). A fresh engine cannot be stale.
-    private var engine: AVAudioEngine?
-    private var configObserver: NSObjectProtocol?
+    private var session: AVCaptureSession?
+    private var forwarder: SampleForwarder?
+    private var runtimeObserver: NSObjectProtocol?
     private var samples: [Float] = []
+    private var captureLive = false // guarded by `lock`
     private let lock = NSLock()
 
-    // Engine start/stop can block for hundreds of ms (mic hardware spin-up,
-    // TCC prompts) — keep that off the main thread. Serial, so a rapid
-    // press→release→press always runs start/stop/start in order.
+    // Session start/stop can block (mic hardware spin-up, TCC prompts) —
+    // keep that off the main thread. Serial, so a rapid press→release→press
+    // always runs start/stop/start in order.
     private let controlQueue = DispatchQueue(label: "LocalFlow.AudioControl", qos: .userInitiated)
+    private let sampleQueue = DispatchQueue(label: "LocalFlow.AudioSamples", qos: .userInitiated)
 
     /// Starts capture; `completion` runs on the main queue with nil on
     /// success or the error that prevented recording.
     func start(completion: @escaping (Error?) -> Void) {
         controlQueue.async {
             do {
-                try self.startEngine()
+                try self.startCapture()
                 DispatchQueue.main.async { completion(nil) }
             } catch {
                 DispatchQueue.main.async { completion(error) }
@@ -67,44 +80,44 @@ final class AudioRecorder {
     /// recorded since start.
     func stop(completion: @escaping ([Float]) -> Void) {
         controlQueue.async {
-            let samples = self.stopEngine()
-            DispatchQueue.main.async { completion(samples) }
+            self.tearDownSession()
+            self.lock.lock()
+            let captured = self.samples
+            self.samples = []
+            self.lock.unlock()
+            DispatchQueue.main.async { completion(captured) }
         }
     }
 
-    private func startEngine() throws {
+    private func startCapture() throws {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
+        captureLive = false
         lock.unlock()
         try captureWithFallback()
+
+        // A Bluetooth mic's first activation can "start" successfully yet
+        // never deliver a buffer; a single rebuild reliably unsticks it.
+        controlQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self, self.session != nil else { return }
+            self.lock.lock()
+            let live = self.captureLive
+            self.lock.unlock()
+            guard !live else { return }
+            NSLog("LocalFlow: capture started but no audio after 1.2s — rebuilding capture")
+            try? self.captureWithFallback()
+        }
     }
 
-    /// Starts capture on the preferred mic; if that fails (a Bluetooth mic
-    /// that won't activate, a half-disconnected device), retries on the
-    /// built-in microphone. Dictation must not die while a working mic
-    /// exists — a wrong-mic recording beats no recording.
+    /// Starts capture on the preferred mic; if that fails (a device
+    /// mid-transition, a half-disconnected mic), retries once after a beat,
+    /// then falls back to the built-in microphone. Dictation must not die
+    /// while a working mic exists — a wrong-mic recording beats no recording.
     private func captureWithFallback() throws {
-        var preferred = deviceUID
-        // "System Default" deliberately skips a Bluetooth default mic
-        // (AirPods auto-connecting): engaging its hands-free profile is
-        // slow, stutters all system audio (the cues), and often captures
-        // nothing usable. Explicitly picking the Bluetooth mic in the menu
-        // still pins it — that's a real choice, this is just a default.
-        if preferred == nil,
-           let defaultID = AudioDevices.defaultInputDeviceID(),
-           AudioDevices.isBluetooth(defaultID),
-           let builtIn = AudioDevices.builtInInputDevice() {
-            NSLog("LocalFlow: default input is a Bluetooth mic — using %@ instead (pick the Bluetooth mic in the Microphone menu to override)",
-                  builtIn.name)
-            preferred = builtIn.uid
-        }
+        let preferred = deviceUID
         do {
             try beginCapture(pinning: preferred)
         } catch {
-            // The HAL transiently refuses to start I/O (EAGAIN, "already is
-            // a thread") while Bluetooth devices are mid-transition — a
-            // short pause and one retry absorbs that before giving up on
-            // the device entirely.
             NSLog("LocalFlow: capture start failed (%@) — retrying once",
                   error.localizedDescription)
             usleep(300_000)
@@ -123,119 +136,144 @@ final class AudioRecorder {
         }
     }
 
-    /// Builds a fresh engine and starts appending to `samples`. Split from
-    /// `startEngine` so a mid-recording device change can resume capture
-    /// without discarding what was already recorded. A nil `uid` leaves the
-    /// engine on the system default device — a fresh engine binds the
-    /// current default at creation, so no explicit pinning is needed.
+    /// Builds a fresh session capturing from the given device UID (nil =
+    /// current system default). Split from `startCapture` so recovery paths
+    /// can rebuild without discarding what was already recorded.
     private func beginCapture(pinning uid: String?) throws {
-        tearDownEngine()
+        tearDownSession()
 
-        // Resolve the device and its TRUE format from the HAL before the
-        // engine gets involved. The engine's node formats (and a format:nil
-        // tap, which snapshots them) go stale when a device is pinned over
-        // the default — a 24kHz-cached tap on 48kHz hardware kills engine
-        // init with -10868. The HAL always answers for the actual device.
-        let pinnedID = uid.flatMap { AudioDevices.deviceID(forUID: $0) }
-        if uid != nil, pinnedID == nil {
-            NSLog("LocalFlow: selected microphone (%@) not available — using system default", uid!)
-        }
-        guard let deviceID = pinnedID ?? AudioDevices.defaultInputDeviceID(),
-              let hw = AudioDevices.inputHardwareFormat(deviceID),
-              let tapFormat = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channels: hw.channels)
-        else { throw RecorderError.noInput }
-
-        let engine = AVAudioEngine()
-        let input = engine.inputNode
-        if let pinnedID {
-            // AUAudioUnit's setter (unlike raw AudioUnitSetProperty) reports
-            // failure as a throwable error instead of silently misbinding.
-            try input.auAudioUnit.setDeviceID(pinnedID)
-        }
-
-        // The converter is still built from each buffer's actual format —
-        // belt and suspenders against a device rate change mid-recording.
-        var converter: AVAudioConverter?
-        let targetFormat = self.targetFormat
-        input.installTap(onBus: 0, bufferSize: 4096, format: tapFormat) { [weak self] buffer, _ in
-            guard let self else { return }
-            if converter?.inputFormat != buffer.format {
-                converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+        var device: AVCaptureDevice?
+        if let uid {
+            // AVCaptureDevice uniqueIDs are the CoreAudio device UIDs.
+            device = AVCaptureDevice(uniqueID: uid)
+            if device == nil {
+                NSLog("LocalFlow: selected microphone (%@) not available — using system default", uid)
             }
-            guard let converter else { return }
-            self.append(buffer, using: converter)
         }
-        engine.prepare()
+        guard let device = device ?? AVCaptureDevice.default(for: .audio) else {
+            throw RecorderError.noInput
+        }
 
-        // AirPods connecting or the current mic unplugging stops the engine
-        // silently mid-recording; resume on whatever device is current.
-        configObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else { throw RecorderError.noInput }
+        session.addInput(input)
+
+        let output = AVCaptureAudioDataOutput()
+        let forwarder = SampleForwarder(targetFormat: Self.targetFormat) { [weak self] converted in
+            self?.append(converted)
+        }
+        output.setSampleBufferDelegate(forwarder, queue: sampleQueue)
+        guard session.canAddOutput(output) else { throw RecorderError.noInput }
+        session.addOutput(output)
+        session.commitConfiguration()
+
+        runtimeObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureSessionRuntimeError,
+            object: session,
             queue: nil
         ) { [weak self] note in
-            self?.handleConfigurationChange(of: note.object as? AVAudioEngine)
+            self?.handleRuntimeError(of: note.object as? AVCaptureSession)
         }
 
-        self.engine = engine
-        do {
-            try engine.start()
-        } catch {
-            tearDownEngine()
-            throw error
+        session.startRunning()
+        guard session.isRunning else {
+            tearDownSession()
+            throw RecorderError.noInput
         }
+        self.session = session
+        self.forwarder = forwarder
     }
 
-    private func handleConfigurationChange(of changed: AVAudioEngine?) {
+    /// The session hit a runtime error (device yanked, media services
+    /// reset) mid-recording — resume on whatever device is right now,
+    /// keeping the samples already captured.
+    private func handleRuntimeError(of errored: AVCaptureSession?) {
         controlQueue.async {
-            // A notification can be in flight while the recording it belongs
-            // to is being torn down — react only for the current engine.
-            guard let changed, changed === self.engine else { return }
-            // Engines also post a configuration change right after starting
-            // on a pinned non-default device; rebuilding on that
-            // self-notification triggers the next one — an infinite
-            // teardown/rebuild loop that shredded capture into fragments.
-            // Only a stopped engine (device died/reconfigured) needs help.
-            guard !changed.isRunning else { return }
-            NSLog("LocalFlow: audio device changed mid-recording — resuming capture")
+            guard let errored, errored === self.session else { return }
+            NSLog("LocalFlow: capture session error mid-recording — resuming capture")
             do {
                 try self.captureWithFallback()
             } catch {
-                NSLog("LocalFlow: could not resume capture after device change: %@",
-                      error.localizedDescription)
+                NSLog("LocalFlow: could not resume capture: %@", error.localizedDescription)
             }
         }
     }
 
-    private func tearDownEngine() {
-        if let configObserver {
-            NotificationCenter.default.removeObserver(configObserver)
-            self.configObserver = nil
+    private func tearDownSession() {
+        if let runtimeObserver {
+            NotificationCenter.default.removeObserver(runtimeObserver)
+            self.runtimeObserver = nil
         }
-        guard let engine else { return }
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        self.engine = nil
+        guard let session else { return }
+        session.stopRunning()
+        self.session = nil
+        forwarder = nil
     }
 
-    private func stopEngine() -> [Float] {
-        tearDownEngine()
+    private func append(_ converted: AVAudioPCMBuffer) {
+        guard let channel = converted.floatChannelData else { return }
+        let count = Int(converted.frameLength)
+        guard count > 0 else { return }
 
         lock.lock()
-        defer {
-            samples = []
-            lock.unlock()
+        let wasLive = captureLive
+        captureLive = true
+        samples.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: count))
+        lock.unlock()
+        if !wasLive { onCaptureLive?() }
+
+        if let onLevel {
+            var sum: Float = 0
+            for i in 0..<count { sum += channel[0][i] * channel[0][i] }
+            let rms = (sum / Float(count)).squareRoot()
+            // sqrt curve so quiet speech still moves the bars; ~0.2 RMS ≈ full scale
+            onLevel(min(1, rms.squareRoot() * 2.2))
         }
-        return samples
+    }
+}
+
+/// Bridges AVCaptureAudioDataOutput's CMSampleBuffers to 16 kHz mono
+/// Float32 AVAudioPCMBuffers. Owns the converter, rebuilt whenever the
+/// incoming format changes (Bluetooth profile flips mid-recording) — each
+/// buffer self-describes its format, so there is nothing to go stale.
+private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let targetFormat: AVAudioFormat
+    private var converter: AVAudioConverter?
+    private let onPCM: (AVAudioPCMBuffer) -> Void
+
+    init(targetFormat: AVAudioFormat, onPCM: @escaping (AVAudioPCMBuffer) -> Void) {
+        self.targetFormat = targetFormat
+        self.onPCM = onPCM
     }
 
-    private func append(_ buffer: AVAudioPCMBuffer, using converter: AVAudioConverter) {
-        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 32
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc),
+              let sourceFormat = AVAudioFormat(streamDescription: asbd) else { return }
+        let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard frames > 0,
+              let raw = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames) else { return }
+        raw.frameLength = frames
+        guard CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer, at: 0, frameCount: Int32(frames), into: raw.mutableAudioBufferList
+        ) == noErr else { return }
+
+        if converter == nil || converter!.inputFormat != sourceFormat {
+            converter = AVAudioConverter(from: sourceFormat, to: targetFormat)
+        }
+        guard let converter else { return }
+
+        let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
+        let capacity = AVAudioFrameCount(Double(raw.frameLength) * ratio) + 32
         guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
             return
         }
-
         var consumed = false
         var conversionError: NSError?
         converter.convert(to: converted, error: &conversionError) { _, status in
@@ -245,21 +283,9 @@ final class AudioRecorder {
             }
             consumed = true
             status.pointee = .haveData
-            return buffer
+            return raw
         }
-        guard conversionError == nil, let channel = converted.floatChannelData else { return }
-
-        let count = Int(converted.frameLength)
-        lock.lock()
-        samples.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: count))
-        lock.unlock()
-
-        if let onLevel, count > 0 {
-            var sum: Float = 0
-            for i in 0..<count { sum += channel[0][i] * channel[0][i] }
-            let rms = (sum / Float(count)).squareRoot()
-            // sqrt curve so quiet speech still moves the bars; ~0.2 RMS ≈ full scale
-            onLevel(min(1, rms.squareRoot() * 2.2))
-        }
+        guard conversionError == nil, converted.frameLength > 0 else { return }
+        onPCM(converted)
     }
 }

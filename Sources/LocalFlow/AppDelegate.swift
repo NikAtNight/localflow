@@ -76,6 +76,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Called on the audio thread; overlay.push hops to main internally.
         let overlay = self.overlay
         recorder.onLevel = { level in overlay.push(level: level) }
+        // The "speak now" cue fires on the first real audio buffer, not on
+        // engine start — a Bluetooth mic can take a second to deliver.
+        recorder.onCaptureLive = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, self.isRecording else { return }
+                self.playCue("Pop")
+            }
+        }
         recorder.deviceUID = Settings.inputDeviceUID
         observeSystemTransitions()
         registerLoginItemOnce()
@@ -288,12 +296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.playCue("Basso")
                 self.state = .failed("Mic error: \(error.localizedDescription)")
                 self.scheduleFailureRecovery()
-            } else if self.isRecording {
-                // Only now is capture live. The cue is the "speak" signal —
-                // playing it on key-down invited the first syllable while
-                // the engine was still spinning up, clipping it.
-                self.playCue("Pop")
             }
+            // Success cue is handled by onCaptureLive — the first actual
+            // audio buffer — not by engine start, which can precede flowing
+            // audio by over a second on Bluetooth mics.
         }
         // Backstop against a hold that never ends (stuck key, pocket
         // dictation): cap the recording rather than run an open mic.
@@ -667,18 +673,11 @@ extension AppDelegate: NSMenuDelegate {
         submenu.removeAllItems()
         let selectedUID = Settings.inputDeviceUID
 
-        // Say what "System Default" will actually do — it deliberately
-        // routes around a Bluetooth default mic, and hiding that made the
-        // behavior look broken.
+        // Name the device "System Default" currently resolves to.
         var defaultTitle = "System Default"
-        if let defaultID = AudioDevices.defaultInputDeviceID() {
-            let devices = AudioDevices.inputDevices()
-            let defaultName = devices.first { $0.id == defaultID }?.name
-            if AudioDevices.isBluetooth(defaultID), let builtIn = AudioDevices.builtInInputDevice() {
-                defaultTitle = "System Default — \(builtIn.name) (\(defaultName ?? "Bluetooth mic") skipped)"
-            } else if let defaultName {
-                defaultTitle = "System Default (\(defaultName))"
-            }
+        if let defaultID = AudioDevices.defaultInputDeviceID(),
+           let name = AudioDevices.inputDevices().first(where: { $0.id == defaultID })?.name {
+            defaultTitle = "System Default (\(name))"
         }
         let defaultItem = NSMenuItem(title: defaultTitle, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
         defaultItem.target = self

@@ -15,8 +15,11 @@ struct LocalFlowMain {
             transcribeFile(arguments[flagIndex + 1])
             return
         }
-        if arguments.contains("--record-test") {
-            recordTest()
+        if let flagIndex = arguments.firstIndex(of: "--record-test") {
+            // Optional trailing arg: a device UID to record from (defaults
+            // to the saved setting / system default).
+            let uid = flagIndex + 1 < arguments.count ? arguments[flagIndex + 1] : nil
+            recordTest(deviceUID: uid)
             return
         }
 
@@ -89,22 +92,24 @@ struct LocalFlowMain {
     /// format resolution, fallback) — consecutive, because engine teardown
     /// residue only bites the SECOND capture in a process, exactly like a
     /// user's second hotkey press.
-    private static func recordTest() {
+    private static func recordTest(deviceUID: String?) {
         let stderr = FileHandle.standardError
         let recorder = AudioRecorder()
-        recorder.deviceUID = Settings.inputDeviceUID
+        recorder.deviceUID = deviceUID ?? Settings.inputDeviceUID
         var failures = 0
 
         for round in 1...3 {
             var finished = false
+            let startedAt = Date()
             recorder.start { error in
+                stderr.write(Data("round \(round): start took \(Int(Date().timeIntervalSince(startedAt) * 1000))ms\n".utf8))
                 if let error {
                     stderr.write(Data("round \(round): start FAILED: \(error.localizedDescription)\n".utf8))
                     failures += 1
                     finished = true
                     return
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
                     recorder.stop { samples in
                         let seconds = Double(samples.count) / AudioRecorder.sampleRate
                         let peak = samples.map(abs).max() ?? 0
