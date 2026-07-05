@@ -297,20 +297,18 @@ private final class HudView: NSView {
         case .live:
             renderTheme(in: ctx)
         case .warming:
-            // Theme drawn dim with a slow breath: reads as "not listening
-            // yet", and a sub-200ms flash of it (wired mic) just looks like
-            // the panel fading in. Capture-live snaps it to full brightness.
+            // No theme while waiting — its appearance IS the "talk now"
+            // signal, which a dimmed rendering muddied on themes whose idle
+            // motion looks like their live one (starfields). Dots appear
+            // after a grace delay, so a mic that goes live quickly never
+            // shows the explicit "wait" treatment.
             let breath = 0.5 + 0.5 * sin(time * 3.0)
-            renderThemeDimmed(in: ctx, alpha: 0.16 + 0.10 * breath)
-            // The dots only appear after a grace delay, so a mic that goes
-            // live quickly never shows the explicit "wait" treatment.
             let fade = min(1, max(0, (time - phaseStart - 0.18) / 0.25))
             if fade > 0 {
                 let pulse = 0.35 + 0.45 * breath
                 drawDots(in: ctx, alphas: [CGFloat](repeating: pulse * fade, count: 3))
             }
         case .processing:
-            renderThemeDimmed(in: ctx, alpha: 0.26)
             let fade = min(1, max(0, (time - phaseStart) / 0.2))
             // Left-to-right chase: indeterminate "working", distinct from
             // the warming state's in-unison pulse.
@@ -325,17 +323,6 @@ private final class HudView: NSView {
     private func renderTheme(in ctx: CGContext) {
         renderer.render(in: ctx, bounds: bounds, t: time, dt: 1.0 / 30.0,
                         level: frameLevel, spectrum: frameSpectrum)
-    }
-
-    /// A transparency layer, not per-op alpha — renderers self-composite
-    /// (glows, trails) and must be dimmed as one group.
-    private func renderThemeDimmed(in ctx: CGContext, alpha: CGFloat) {
-        ctx.saveGState()
-        ctx.setAlpha(alpha)
-        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
-        renderTheme(in: ctx)
-        ctx.endTransparencyLayer()
-        ctx.restoreGState()
     }
 
     /// Three small dots centered in the HUD — the shared theme-agnostic
