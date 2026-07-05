@@ -93,9 +93,23 @@ final class WaveformOverlay {
         }
     }
 
+    /// Hotkey pressed: the mic engine is starting but no audio has arrived
+    /// yet — a Bluetooth mic can take seconds.
     func show() {
         cancelPreview()
-        present()
+        present(phase: .warming)
+    }
+
+    /// First real audio buffer arrived — snap to the full-brightness waveform.
+    func captureLive() {
+        hudView.setPhase(.live)
+    }
+
+    /// Hotkey released: keep the panel up as an indeterminate loading state
+    /// until the pipeline resolves and the caller hides it (or a new press
+    /// takes the panel over via show()).
+    func beginProcessing() {
+        hudView.setPhase(.processing)
     }
 
     func hide() {
@@ -113,7 +127,7 @@ final class WaveformOverlay {
         })
     }
 
-    private func present() {
+    private func present(phase: HudView.Phase) {
         if HudTheme.current != theme {
             applyTheme(HudTheme.current)
         }
@@ -135,6 +149,7 @@ final class WaveformOverlay {
         programmaticMove = false
 
         hudView.reset()
+        hudView.setPhase(phase)
         hudView.startAnimating()
         panel.alphaValue = 0
         panel.orderFrontRegardless()
@@ -158,7 +173,7 @@ final class WaveformOverlay {
     /// picked from the menu can be judged without dictating anything.
     func preview() {
         cancelPreview()
-        present()
+        present(phase: .live)
         let start = Date()
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -189,7 +204,17 @@ final class WaveformOverlay {
 private final class HudView: NSView {
     override var isFlipped: Bool { true }
 
+    /// Lifecycle states drawn on top of (or instead of) the theme renderer,
+    /// so all 16 themes get them without per-renderer changes:
+    /// warming = mic starting but no audio yet, live = normal waveform,
+    /// processing = transcription running after release.
+    enum Phase {
+        case warming, live, processing
+    }
+
     private let renderer: HudRenderer
+    private var phase: Phase = .live
+    private var phaseStart: CGFloat = 0 // `time` when the phase was entered
     private var latchedLevel: CGFloat = 0
     private var latchedSpectrum = [CGFloat](repeating: 0, count: 12)
     private var frameLevel: CGFloat = 0
@@ -223,8 +248,16 @@ private final class HudView: NSView {
         }
     }
 
+    func setPhase(_ newPhase: Phase) {
+        guard newPhase != phase else { return }
+        phase = newPhase
+        phaseStart = time
+        needsDisplay = true
+    }
+
     func reset() {
         time = 0
+        phaseStart = 0
         latchedLevel = 0
         latchedSpectrum = [CGFloat](repeating: 0, count: 12)
         frameLevel = 0
@@ -260,7 +293,66 @@ private final class HudView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        switch phase {
+        case .live:
+            renderTheme(in: ctx)
+        case .warming:
+            // Theme drawn dim with a slow breath: reads as "not listening
+            // yet", and a sub-200ms flash of it (wired mic) just looks like
+            // the panel fading in. Capture-live snaps it to full brightness.
+            let breath = 0.5 + 0.5 * sin(time * 3.0)
+            renderThemeDimmed(in: ctx, alpha: 0.16 + 0.10 * breath)
+            // The dots only appear after a grace delay, so a mic that goes
+            // live quickly never shows the explicit "wait" treatment.
+            let fade = min(1, max(0, (time - phaseStart - 0.18) / 0.25))
+            if fade > 0 {
+                let pulse = 0.35 + 0.45 * breath
+                drawDots(in: ctx, alphas: [CGFloat](repeating: pulse * fade, count: 3))
+            }
+        case .processing:
+            renderThemeDimmed(in: ctx, alpha: 0.26)
+            let fade = min(1, max(0, (time - phaseStart) / 0.2))
+            // Left-to-right chase: indeterminate "working", distinct from
+            // the warming state's in-unison pulse.
+            let alphas = (0..<3).map { i -> CGFloat in
+                let wave = max(0, sin(time * 5.0 - CGFloat(i) * 1.1))
+                return (0.25 + 0.6 * wave) * fade
+            }
+            drawDots(in: ctx, alphas: alphas)
+        }
+    }
+
+    private func renderTheme(in ctx: CGContext) {
         renderer.render(in: ctx, bounds: bounds, t: time, dt: 1.0 / 30.0,
                         level: frameLevel, spectrum: frameSpectrum)
+    }
+
+    /// A transparency layer, not per-op alpha — renderers self-composite
+    /// (glows, trails) and must be dimmed as one group.
+    private func renderThemeDimmed(in ctx: CGContext, alpha: CGFloat) {
+        ctx.saveGState()
+        ctx.setAlpha(alpha)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        renderTheme(in: ctx)
+        ctx.endTransparencyLayer()
+        ctx.restoreGState()
+    }
+
+    /// Three small dots centered in the HUD — the shared theme-agnostic
+    /// vocabulary for both waiting states. The soft shadow keeps them
+    /// readable when a bare theme puts them straight over a light desktop.
+    private func drawDots(in ctx: CGContext, alphas: [CGFloat]) {
+        let radius: CGFloat = 3
+        let spacing: CGFloat = 14
+        ctx.saveGState()
+        ctx.setShadow(offset: .zero, blur: 4,
+                      color: NSColor.black.withAlphaComponent(0.5).cgColor)
+        for (i, alpha) in alphas.enumerated() {
+            let x = bounds.midX + (CGFloat(i) - 1) * spacing
+            ctx.setFillColor(NSColor.white.withAlphaComponent(alpha).cgColor)
+            ctx.fillEllipse(in: CGRect(x: x - radius, y: bounds.midY - radius,
+                                       width: radius * 2, height: radius * 2))
+        }
+        ctx.restoreGState()
     }
 }

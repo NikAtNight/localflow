@@ -88,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.onCaptureLive = { [weak self] in
             DispatchQueue.main.async {
                 guard let self, self.isRecording else { return }
+                self.overlay.captureLive()
                 self.playCue("Pop")
             }
         }
@@ -368,11 +369,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSLog("LocalFlow: hotkey released (recording=%d)", isRecording ? 1 : 0)
         guard isRecording else { return }
         isRecording = false
-        overlay.hide()
+        // The HUD stays up as a loading state until this dictation resolves;
+        // the generation ties the eventual dismissHud to this dictation so a
+        // newer press's HUD is never torn down by a stale completion.
+        overlay.beginProcessing()
+        let generation = recordingGeneration
         let releasedAt = Date()
         recorder.stop { [weak self] samples in
-            self?.process(samples: samples, releasedAt: releasedAt)
+            self?.process(samples: samples, releasedAt: releasedAt, hudGeneration: generation)
         }
+    }
+
+    /// Hides the processing HUD for the dictation identified by `generation`
+    /// — unless a newer press has taken the panel over (recording/warming
+    /// always wins over processing). `nil` means no HUD was attached (menu
+    /// retry).
+    private func dismissHud(_ generation: Int?) {
+        guard let generation, generation == recordingGeneration else { return }
+        overlay.hide()
     }
 
     // An accidental hotkey brush captures a sliver of near-silence, and
@@ -384,13 +398,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // let the transcriber drop canonical hallucination phrases.
     private static let quietAudioDBFS: Float = -40
 
-    private func process(samples: [Float], releasedAt: Date) {
+    private func process(samples: [Float], releasedAt: Date, hudGeneration: Int? = nil) {
         let duration = Double(samples.count) / AudioRecorder.sampleRate
         let dbfs = AudioRecorder.rmsDBFS(of: samples)
         guard duration >= Self.minDictationSeconds, dbfs > Self.silenceFloorDBFS else {
             NSLog("LocalFlow: skipping transcription — %.2fs at %.0f dBFS is too short or silent",
                   duration, dbfs)
             reportHeardNothing()
+            dismissHud(hudGeneration)
             return
         }
 
@@ -408,6 +423,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // user only finds out nothing was pasted much later.
                     NSLog("LocalFlow: transcription produced no text (%.1fs of audio)", duration)
                     reportHeardNothing()
+                    dismissHud(hudGeneration)
                     finishProcessing()
                     return
                 }
@@ -448,6 +464,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.scheduleFailureRecovery()
                     }
                 }
+                // The Cmd-V is posted synchronously inside inject — the HUD's
+                // job ends here; the 2.5s paste-confirmation window runs on
+                // cues/banners alone.
+                dismissHud(hudGeneration)
 
                 // The metric the plan says to watch: hotkey-release → pasted text.
                 let ms = Int(Date().timeIntervalSince(releasedAt) * 1000)
@@ -457,6 +477,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 finishProcessing()
             } catch {
                 processingCount -= 1
+                dismissHud(hudGeneration)
                 // Don't discard the audio: the error may be transient, and
                 // re-dictating a long passage from memory is the worst case.
                 retrySamples = samples
