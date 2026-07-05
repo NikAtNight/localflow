@@ -49,7 +49,9 @@ struct OllamaCleaner {
         var request = URLRequest(url: baseURL.appendingPathComponent("api/generate"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 20
+        // A cold Ollama model load routinely takes >20s with zero bytes; this
+        // is an idle timeout, so keep it generous or cleanup silently drops out.
+        request.timeoutInterval = 120
         request.httpBody = try JSONEncoder().encode(GenerateRequest(
             model: model,
             system: systemPrompt,

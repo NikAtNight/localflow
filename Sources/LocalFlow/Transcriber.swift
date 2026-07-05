@@ -95,13 +95,20 @@ actor Transcriber {
     }
 
     /// Whisper sometimes emits bracketed markers like [BLANK_AUDIO] or (music).
+    /// Only strip what looks like a marker — dictated text legitimately
+    /// contains brackets and parentheses (e.g. "f(x)").
     private static func stripSpecialTokens(from text: String) -> String {
         var result = text
-        for pattern in ["\\[[^\\]]*\\]", "\\([^)]*\\)", "<[^>]*>"] {
+        let patterns = [
+            "\\[[A-Z_ ]+\\]",
+            "(?i)\\((?:music|laughs|laughter|applause|noise|silence|inaudible|coughs)\\)",
+            "<[^>]*>",
+        ]
+        for pattern in patterns {
             result = result.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
         }
         return result
-            .replacingOccurrences(of: "  ", with: " ")
+            .replacingOccurrences(of: " {2,}", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

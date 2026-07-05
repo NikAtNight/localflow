@@ -51,7 +51,26 @@ final class HotkeyManager {
         }
     }
 
-    var key: Key = .rightOption
+    /// Read from the main thread; the setter forwards the change to the tap
+    /// run loop, where the copy the callback actually matches against lives.
+    /// A change mid-hold ends the hold (via `onRelease`) — otherwise the
+    /// release of the old key never matches and the mic stays open.
+    var key: Key {
+        get { _key }
+        set {
+            _key = newValue
+            performOnTapRunLoop { [weak self] in
+                guard let self, self.tapKey != newValue else { return }
+                if self.isDown {
+                    self.isDown = false
+                    let release = self.onRelease
+                    DispatchQueue.main.async { release?() }
+                }
+                self.tapKey = newValue
+            }
+        }
+    }
+    private var _key: Key = .rightOption // main-thread copy for UI reads
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
     /// Called on the main queue when the verified tap later stops delivering
@@ -61,10 +80,29 @@ final class HotkeyManager {
     private var tap: CFMachPort?
     private var tapThread: Thread?
     private var tapRunLoop: CFRunLoop?
-    private var isDown = false // touched only on the tap thread
+    // Touched only on the tap run loop (see performOnTapRunLoop).
+    private var isDown = false
+    private var tapKey: Key = .rightOption
+    private var threadTap: CFMachPort?
+    // Main-thread only.
     private var probeSeen = false
     private var watchdog: Timer?
     private var missedProbes = 0
+    // Ties the 0.8s verification and health-check closures to their own
+    // start attempt, so a later start() can't be torn down by a stale one.
+    private var startGeneration = 0
+
+    /// Runs `block` on the tap thread's run loop — the only place the
+    /// tap-side state above may be touched once the tap is up. Runs inline
+    /// when no tap thread exists yet.
+    private func performOnTapRunLoop(_ block: @escaping () -> Void) {
+        guard let tapRunLoop else {
+            block()
+            return
+        }
+        CFRunLoopPerformBlock(tapRunLoop, CFRunLoopMode.commonModes.rawValue, block)
+        CFRunLoopWakeUp(tapRunLoop)
+    }
 
     /// Marks our self-test event so the callback can recognize it.
     private static let probeMagic: Int64 = 0x10CA1F10
@@ -77,6 +115,7 @@ final class HotkeyManager {
     ///
     /// `completion(true/false)` runs on the main queue.
     func start(completion: @escaping (Bool) -> Void) {
+        startGeneration += 1
         stop()
         // .defaultTap (gated on Accessibility — which the app needs for
         // pasting anyway, so it's the grant users actually maintain) is
@@ -98,10 +137,11 @@ final class HotkeyManager {
             return
         }
 
+        let generation = startGeneration
         probeSeen = false
         postProbe()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self else { return }
+            guard let self, generation == self.startGeneration else { return }
             if self.probeSeen {
                 NSLog("LocalFlow: event tap verified (%@)",
                       option == .listenOnly ? "listen-only" : "active")
@@ -146,7 +186,11 @@ final class HotkeyManager {
         // system until macOS kills the tap by timeout.
         let ready = DispatchSemaphore(value: 0)
         let thread = Thread { [weak self] in
-            self?.tapRunLoop = CFRunLoopGetCurrent()
+            if let self {
+                self.tapRunLoop = CFRunLoopGetCurrent()
+                self.threadTap = tap
+                self.tapKey = self._key // _key can't change until start() returns
+            }
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
             ready.signal()
@@ -203,10 +247,11 @@ final class HotkeyManager {
         // event delivery — don't declare the tap dead over it.
         guard !IsSecureEventInputEnabled() else { return }
 
+        let generation = startGeneration
         probeSeen = false
         postProbe()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
-            guard let self, self.tap != nil else { return }
+            guard let self, self.tap != nil, generation == self.startGeneration else { return }
             if self.probeSeen {
                 self.missedProbes = 0
                 return
@@ -221,30 +266,43 @@ final class HotkeyManager {
 
     /// Forgets an in-progress hold without firing `onRelease`. For sleep /
     /// session-switch: the release event will never arrive, and stale
-    /// `isDown` state would swallow the next press. Only safe to call when
-    /// no physical key is held (i.e. the machine is going away from the
-    /// user), since the tap thread also touches `isDown`.
+    /// `isDown` state would swallow the next press.
     func cancelHold() {
-        isDown = false
+        performOnTapRunLoop { [weak self] in
+            self?.isDown = false
+        }
     }
 
     func stop() {
         watchdog?.invalidate()
         watchdog = nil
         missedProbes = 0
-        if let tap {
-            CGEvent.tapEnable(tap: tap, enable: false)
-            // Invalidating the port also invalidates its run loop source.
-            CFMachPortInvalidate(tap)
-        }
-        if let tapRunLoop {
-            CFRunLoopStop(tapRunLoop)
-        }
-        tap = nil
-        tapThread = nil
-        tapRunLoop = nil
-        isDown = false
         probeSeen = false
+        let tap = self.tap
+        self.tap = nil
+        self.tapThread = nil
+        guard let runLoop = tapRunLoop else {
+            isDown = false
+            if let tap {
+                CGEvent.tapEnable(tap: tap, enable: false)
+                CFMachPortInvalidate(tap)
+            }
+            return
+        }
+        tapRunLoop = nil
+        // Tear down on the tap run loop so the callback never races the
+        // resets; the last block parks the thread's run loop.
+        CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes.rawValue) { [weak self] in
+            self?.isDown = false
+            self?.threadTap = nil
+            if let tap {
+                CGEvent.tapEnable(tap: tap, enable: false)
+                // Invalidating the port also invalidates its run loop source.
+                CFMachPortInvalidate(tap)
+            }
+            CFRunLoopStop(CFRunLoopGetCurrent())
+        }
+        CFRunLoopWakeUp(runLoop)
     }
 
     /// Returns true when the event was LocalFlow's own health probe, so the
@@ -253,7 +311,7 @@ final class HotkeyManager {
         // macOS disables taps that stall; re-enable and carry on.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             NSLog("LocalFlow: event tap disabled by system (%d) — re-enabling", type.rawValue)
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
+            if let threadTap { CGEvent.tapEnable(tap: threadTap, enable: true) }
             return false
         }
         if event.getIntegerValueField(.eventSourceUserData) == Self.probeMagic {
@@ -263,7 +321,7 @@ final class HotkeyManager {
         guard type == .flagsChanged else { return false }
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        guard keyCode == key.keyCode else { return false }
+        guard keyCode == tapKey.keyCode else { return false }
 
         // Only fires for the push-to-talk key itself — a few lines per
         // dictation, and the exact evidence needed when detection misfires.
@@ -271,9 +329,9 @@ final class HotkeyManager {
               keyCode, event.flags.rawValue, isDown ? 1 : 0)
 
         let pressed: Bool
-        if event.flags.contains(key.deviceMask) {
+        if event.flags.contains(tapKey.deviceMask) {
             pressed = true
-        } else if !event.flags.contains(key.genericMask) {
+        } else if !event.flags.contains(tapKey.genericMask) {
             pressed = false
         } else {
             // Generic mask set but no device bit: a release while the twin

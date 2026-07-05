@@ -14,14 +14,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem!
     private var statusMenuItem: NSMenuItem!
-    private var cleanupMenuItem: NSMenuItem!
-    private var microphoneMenuItem: NSMenuItem!
     private var recentMenuItem: NSMenuItem!
     private var retryMenuItem: NSMenuItem!
+    private var settingsModel: SettingsModel!
+    private var settingsController: SettingsPanelController!
 
     // Safety nets: a paste can fail (secure input quirks, slow app) and a
     // transcription can error — neither should ever lose the user's words.
-    private var recentTranscripts: [String] = []
+    private var recentTranscripts: [RecentDictation] = []
     private var retrySamples: [Float]?
 
     private let hotkey = HotkeyManager()
@@ -68,6 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        buildSettings()
         buildStatusItem()
         requestPermissions()
         startHotkey()
@@ -76,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Called on the audio thread; overlay.push hops to main internally.
         let overlay = self.overlay
         recorder.onLevel = { level in overlay.push(level: level) }
+        recorder.onSpectrum = { bands in overlay.push(spectrum: bands) }
         // The "speak now" cue fires on the first real audio buffer, not on
         // engine start — a Bluetooth mic can take a second to deliver.
         recorder.onCaptureLive = { [weak self] in
@@ -84,9 +86,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.playCue("Pop")
             }
         }
+        // Capture died mid-recording and recovery failed — stop pretending
+        // the mic is live.
+        recorder.onRuntimeFailure = { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self, self.isRecording else { return }
+                self.isRecording = false
+                self.recordingGeneration += 1
+                self.overlay.hide()
+                self.playCue("Basso")
+                self.state = .failed("Mic error: \(error.localizedDescription)")
+                self.scheduleFailureRecovery()
+            }
+        }
         recorder.deviceUID = Settings.inputDeviceUID
         observeSystemTransitions()
         registerLoginItemOnce()
+        // Bundle icon matches whichever listening theme is active; the
+        // make-app icon is only the classic-wave default.
+        ThemeIcon.apply(HudTheme.current)
+    }
+
+    /// Settings live in a window (see SettingsWindow.swift); these hooks let
+    /// changes there reach the live hotkey tap, recorder, and transcriber.
+    private func buildSettings() {
+        settingsModel = SettingsModel()
+        settingsModel.onHotkeyChange = { [weak self] key in
+            self?.hotkey.key = key
+            self?.refreshStatusUI()
+        }
+        settingsModel.onModelChange = { [weak self] in self?.loadModel() }
+        settingsModel.onMicChange = { [weak self] uid in self?.recorder.deviceUID = uid }
+        settingsModel.onCleanupToggle = { [weak self] in
+            if Settings.cleanupEnabled { self?.probeOllama() }
+        }
+        settingsModel.onThemeChange = { [weak self] in
+            guard let self else { return }
+            if !self.isRecording { self.overlay.preview() }
+            ThemeIcon.apply(HudTheme.current)
+        }
+        settingsController = SettingsPanelController(model: settingsModel)
     }
 
     /// Sleep or a fast-user-switch mid-hold means the key release will never
@@ -215,9 +254,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // A failed *switch* leaves the previous model loaded and
                 // serving — keep dictation alive on it while retries run.
                 if await transcriber.isLoaded {
+                    // No recomputeReadyState() here — it would flip straight
+                    // back to .idle and the banner would never appear.
                     modelLoaded = true
                     state = .failed("Couldn't load \(model) — still on previous model, retrying…")
-                    recomputeReadyState()
                 } else {
                     state = .failed("Model load failed: \(error.localizedDescription) — retrying…")
                 }
@@ -255,6 +295,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func probeOllama() {
         Task {
             ollamaReachable = await OllamaCleaner.isAvailable()
+            settingsModel?.ollamaReachable = ollamaReachable
             refreshStatusUI()
         }
     }
@@ -372,9 +413,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 // Keep the transcript reachable even if the paste goes
-                // wrong — "Recent Dictations" in the menu can re-copy it.
-                recentTranscripts.insert(text, at: 0)
+                // wrong — "Recent Dictations" in the menu and the settings
+                // window can re-copy it.
+                recentTranscripts.insert(RecentDictation(text: text), at: 0)
                 if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
+                settingsModel?.recentDictations = recentTranscripts
 
                 TextInjector.inject(text)
                 playCue("Bottle")
@@ -439,36 +482,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(lastErrorMenuItem)
         menu.addItem(.separator())
 
-        // Hotkey picker
-        let hotkeyMenu = NSMenu()
-        for key in HotkeyManager.Key.allCases {
-            let item = NSMenuItem(title: key.label, action: #selector(selectHotkey(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = key.rawValue
-            hotkeyMenu.addItem(item)
-        }
-        let hotkeyItem = NSMenuItem(title: "Hold to Talk", action: nil, keyEquivalent: "")
-        hotkeyItem.submenu = hotkeyMenu
-        menu.addItem(hotkeyItem)
-
-        // Whisper model picker
-        let modelMenu = NSMenu()
-        for model in Settings.whisperModels {
-            let item = NSMenuItem(title: model.label, action: #selector(selectModel(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = model.name
-            modelMenu.addItem(item)
-        }
-        let modelItem = NSMenuItem(title: "Whisper Model", action: nil, keyEquivalent: "")
-        modelItem.submenu = modelMenu
-        menu.addItem(modelItem)
-
-        // Microphone picker — repopulated each time the menu opens, since
-        // devices come and go.
-        microphoneMenuItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
-        microphoneMenuItem.submenu = NSMenu()
-        menu.addItem(microphoneMenuItem)
-
         // Safety nets: re-copy past transcripts, retry a failed one.
         recentMenuItem = NSMenuItem(title: "Recent Dictations", action: nil, keyEquivalent: "")
         recentMenuItem.submenu = NSMenu()
@@ -484,24 +497,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(retryMenuItem)
         menu.addItem(.separator())
 
-        // Ollama cleanup toggle
-        cleanupMenuItem = NSMenuItem(
-            title: "Clean Up with Ollama (\(Settings.ollamaModel))",
-            action: #selector(toggleCleanup),
-            keyEquivalent: ""
-        )
-        cleanupMenuItem.target = self
-        menu.addItem(cleanupMenuItem)
+        // Everything configurable lives in the settings window.
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
 
-        let soundItem = NSMenuItem(title: "Sound Cues", action: #selector(toggleSounds), keyEquivalent: "")
-        soundItem.target = self
-        menu.addItem(soundItem)
-
-        let loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
-        loginItem.target = self
-        menu.addItem(loginItem)
-
-        menu.addItem(.separator())
+        // Kept in the menu (not just Settings): it's the recovery path the
+        // hotkey-failure banner points at.
         let permissionsItem = NSMenuItem(
             title: "Open Accessibility Settings…",
             action: #selector(openAccessibilitySettings),
@@ -546,27 +548,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu actions
 
-    @objc private func selectHotkey(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String,
-              let key = HotkeyManager.Key(rawValue: raw) else { return }
-        Settings.hotkey = key
-        hotkey.key = key
-        refreshStatusUI()
-    }
-
-    @objc private func selectModel(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        // Re-picking the already-selected model is a manual "load it now" —
-        // the natural recovery gesture when the original load failed.
-        guard name != Settings.whisperModel || !modelLoaded else { return }
-        Settings.whisperModel = name
-        loadModel()
-    }
-
-    @objc private func selectMicrophone(_ sender: NSMenuItem) {
-        let uid = sender.representedObject as? String
-        Settings.inputDeviceUID = uid
-        recorder.deviceUID = uid
+    @objc private func openSettings() {
+        settingsController.show()
     }
 
     @objc private func retryFailedDictation() {
@@ -582,30 +565,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pasteboard.setString(text, forType: .string)
     }
 
-    @objc private func toggleCleanup() {
-        Settings.cleanupEnabled.toggle()
-        if Settings.cleanupEnabled { probeOllama() }
-    }
-
-    @objc private func toggleSounds() {
-        Settings.soundCues.toggle()
-    }
-
-    @objc private func toggleLoginItem() {
-        do {
-            if Self.loginAgent.status == .enabled {
-                try Self.loginAgent.unregister()
-            } else {
-                try Self.loginAgent.register()
-            }
-            // The user has decided — first-run auto-registration must not
-            // re-add it behind their back.
-            Settings.loginItemSetupDone = true
-        } catch {
-            NSLog("LocalFlow: login item toggle failed: %@", error.localizedDescription)
-        }
-    }
-
     @objc private func openAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
@@ -617,7 +576,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         probeOllama()
-        rebuildMicrophoneMenu()
         rebuildRecentDictationsMenu()
         retryMenuItem.isHidden = retrySamples == nil
         if let lastError {
@@ -627,38 +585,14 @@ extension AppDelegate: NSMenuDelegate {
         } else {
             lastErrorMenuItem.isHidden = true
         }
-        for item in menu.items {
-            if item === microphoneMenuItem { continue } // checkmarks set during rebuild
-            if item === recentMenuItem { continue }
-            switch item.action {
-            case #selector(toggleCleanup):
-                item.state = Settings.cleanupEnabled ? .on : .off
-                let suffix = Settings.cleanupEnabled && !ollamaReachable
-                    ? " — Ollama not running!"
-                    : ""
-                item.title = "Clean Up with Ollama (\(Settings.ollamaModel))\(suffix)"
-            case #selector(toggleSounds):
-                item.state = Settings.soundCues ? .on : .off
-            case #selector(toggleLoginItem):
-                item.state = Self.loginAgent.status == .enabled ? .on : .off
-            default:
-                break
-            }
-            if let submenu = item.submenu {
-                for sub in submenu.items {
-                    guard let raw = sub.representedObject as? String else { continue }
-                    let selected = raw == Settings.hotkey.rawValue || raw == Settings.whisperModel
-                    sub.state = selected ? .on : .off
-                }
-            }
-        }
     }
 
     private func rebuildRecentDictationsMenu() {
         guard let submenu = recentMenuItem.submenu else { return }
         submenu.removeAllItems()
         recentMenuItem.isEnabled = !recentTranscripts.isEmpty
-        for text in recentTranscripts {
+        for dictation in recentTranscripts {
+            let text = dictation.text
             let title = text.count > 45 ? String(text.prefix(45)) + "…" : text
             let item = NSMenuItem(title: title, action: #selector(copyRecentDictation(_:)), keyEquivalent: "")
             item.target = self
@@ -668,45 +602,4 @@ extension AppDelegate: NSMenuDelegate {
         }
     }
 
-    private func rebuildMicrophoneMenu() {
-        guard let submenu = microphoneMenuItem.submenu else { return }
-        submenu.removeAllItems()
-        let selectedUID = Settings.inputDeviceUID
-
-        // Name the device "System Default" currently resolves to.
-        var defaultTitle = "System Default"
-        if let defaultID = AudioDevices.defaultInputDeviceID(),
-           let name = AudioDevices.inputDevices().first(where: { $0.id == defaultID })?.name {
-            defaultTitle = "System Default (\(name))"
-        }
-        let defaultItem = NSMenuItem(title: defaultTitle, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
-        defaultItem.target = self
-        defaultItem.state = selectedUID == nil ? .on : .off
-        submenu.addItem(defaultItem)
-        submenu.addItem(.separator())
-
-        var selectedFound = selectedUID == nil
-        for device in AudioDevices.inputDevices() {
-            let item = NSMenuItem(title: device.name, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = device.uid
-            item.state = device.uid == selectedUID ? .on : .off
-            if device.uid == selectedUID { selectedFound = true }
-            submenu.addItem(item)
-        }
-
-        // Selected mic is unplugged: keep it listed (still checked) so the
-        // choice is visible and can be changed, and note the fallback.
-        if !selectedFound, let selectedUID {
-            let item = NSMenuItem(
-                title: "Saved mic not connected — using default",
-                action: #selector(selectMicrophone(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = selectedUID
-            item.state = .on
-            submenu.addItem(item)
-        }
-    }
 }

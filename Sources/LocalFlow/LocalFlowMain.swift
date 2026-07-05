@@ -68,8 +68,13 @@ struct LocalFlowMain {
 
                 if Settings.cleanupEnabled, await OllamaCleaner.isAvailable() {
                     stageStart = Date()
-                    text = try await OllamaCleaner.clean(text, model: Settings.ollamaModel)
-                    stderr.write(Data("ollama cleanup: \(elapsedMs(since: stageStart))ms (\(Settings.ollamaModel))\n".utf8))
+                    do {
+                        text = try await OllamaCleaner.clean(text, model: Settings.ollamaModel)
+                        stderr.write(Data("ollama cleanup: \(elapsedMs(since: stageStart))ms (\(Settings.ollamaModel))\n".utf8))
+                    } catch {
+                        // Ollama died mid-call — keep the raw transcript rather than lose it.
+                        stderr.write(Data("ollama cleanup failed, using raw transcript: \(error.localizedDescription)\n".utf8))
+                    }
                 }
 
                 print(text)

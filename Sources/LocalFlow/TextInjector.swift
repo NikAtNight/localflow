@@ -41,7 +41,9 @@ enum TextInjector {
         ourChangeCount = pasteboard.changeCount
         postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
 
-        // Give the frontmost app time to service the paste before restoring.
+        // Give the frontmost app time to service the paste before restoring —
+        // slow apps can take well over a second, and restoring too early
+        // pastes the user's old clipboard instead of the dictation.
         let work = DispatchWorkItem {
             restoreWork = nil
             let saved = savedItems
@@ -53,7 +55,7 @@ enum TextInjector {
             pasteboard.writeObjects(saved)
         }
         restoreWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
     // MARK: - Clipboard save/restore
@@ -84,25 +86,31 @@ enum TextInjector {
         up.post(tap: .cghidEventTap)
     }
 
+    // Serial so overlapping dictations type in order, off the main thread
+    // (the per-chunk sleeps would stall it; CGEvent posting is thread-safe).
+    private static let typingQueue = DispatchQueue(label: "LocalFlow.TextTyping", qos: .userInitiated)
+
     /// Types text as synthesized unicode keyboard events, in chunks (long
     /// strings on a single event get truncated by some apps).
     private static func typeString(_ text: String) {
-        let source = CGEventSource(stateID: .combinedSessionState)
         let characters = Array(text.utf16)
-        let chunkSize = 20
+        typingQueue.async {
+            let source = CGEventSource(stateID: .combinedSessionState)
+            let chunkSize = 20
 
-        var index = 0
-        while index < characters.count {
-            let chunk = Array(characters[index ..< min(index + chunkSize, characters.count)])
-            if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
-               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
-                down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
-                up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
-                down.post(tap: .cghidEventTap)
-                up.post(tap: .cghidEventTap)
+            var index = 0
+            while index < characters.count {
+                let chunk = Array(characters[index ..< min(index + chunkSize, characters.count)])
+                if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                   let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+                    down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                    up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+                    down.post(tap: .cghidEventTap)
+                    up.post(tap: .cghidEventTap)
+                }
+                index += chunkSize
+                usleep(8_000)
             }
-            index += chunkSize
-            usleep(8_000)
         }
     }
 }

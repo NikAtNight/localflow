@@ -28,11 +28,27 @@ final class AudioRecorder {
     /// buffer — drives the waveform overlay. Callee must hop to main itself.
     var onLevel: ((Float) -> Void)?
 
+    /// Called on the capture queue with 12 coarse band magnitudes (low
+    /// frequencies first, ~120 Hz – 3.8 kHz, log-spaced) per captured buffer.
+    /// Raw energies — the overlay normalizes them. Callee hops to main itself.
+    var onSpectrum: (([Float]) -> Void)?
+
+    /// Goertzel center frequencies: 12 log-spaced bands across the speech range.
+    private static let bandFrequencies: [Float] = {
+        (0..<12).map { 120 * pow(3800 / 120, Float($0) / 11) }
+    }()
+
     /// Called once per `start`, on the capture queue, when the first buffer
     /// actually arrives. Session start alone doesn't mean audio is flowing —
     /// a Bluetooth mic's hands-free profile can take a second (or a rebuild)
     /// to deliver anything, and the "speak now" cue must not lie.
     var onCaptureLive: (() -> Void)?
+
+    /// Called on the control queue when capture died mid-recording and could
+    /// not be recovered — without it the app looks like it's recording while
+    /// no audio flows. The session is already torn down when this fires.
+    /// Callee must hop to main itself.
+    var onRuntimeFailure: ((Error) -> Void)?
 
     /// UID of the microphone to record from; nil follows the system default.
     /// Takes effect at the next `start`. Written from the main thread (menu
@@ -98,14 +114,23 @@ final class AudioRecorder {
 
         // A Bluetooth mic's first activation can "start" successfully yet
         // never deliver a buffer; a single rebuild reliably unsticks it.
+        // Pinned to this start's session — a quick press→release→press would
+        // otherwise let the stale check tear down the next recording's mic.
+        let watchedSession = session
         controlQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self, self.session != nil else { return }
+            guard let self, let watchedSession, watchedSession === self.session else { return }
             self.lock.lock()
             let live = self.captureLive
             self.lock.unlock()
             guard !live else { return }
             NSLog("LocalFlow: capture started but no audio after 1.2s — rebuilding capture")
-            try? self.captureWithFallback()
+            do {
+                try self.captureWithFallback()
+            } catch {
+                NSLog("LocalFlow: capture rebuild failed: %@", error.localizedDescription)
+                self.tearDownSession()
+                self.onRuntimeFailure?(error)
+            }
         }
     }
 
@@ -197,6 +222,8 @@ final class AudioRecorder {
                 try self.captureWithFallback()
             } catch {
                 NSLog("LocalFlow: could not resume capture: %@", error.localizedDescription)
+                self.tearDownSession()
+                self.onRuntimeFailure?(error)
             }
         }
     }
@@ -230,6 +257,27 @@ final class AudioRecorder {
             let rms = (sum / Float(count)).squareRoot()
             // sqrt curve so quiet speech still moves the bars; ~0.2 RMS ≈ full scale
             onLevel(min(1, rms.squareRoot() * 2.2))
+        }
+
+        // Coarse spectrum for the pitch-aware HUD themes: one Goertzel filter
+        // per band over the tail of the buffer. 12 × ≤512 multiplies — cheap.
+        if let onSpectrum {
+            let n = min(count, 512)
+            let start = count - n
+            var bands = [Float](repeating: 0, count: Self.bandFrequencies.count)
+            for (bi, freq) in Self.bandFrequencies.enumerated() {
+                let omega = 2 * Float.pi * freq / Float(Self.sampleRate)
+                let coeff = 2 * cos(omega)
+                var s1: Float = 0, s2: Float = 0
+                for i in start..<count {
+                    let s0 = channel[0][i] + coeff * s1 - s2
+                    s2 = s1
+                    s1 = s0
+                }
+                let power = s1 * s1 + s2 * s2 - coeff * s1 * s2
+                bands[bi] = max(0, power).squareRoot() / Float(n)
+            }
+            onSpectrum(bands)
         }
     }
 }

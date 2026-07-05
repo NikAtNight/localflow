@@ -12,6 +12,7 @@ enum Settings {
         static let soundCues = "soundCues"
         static let inputDeviceUID = "inputDeviceUID"
         static let loginItemSetupDone = "loginItemSetupDone"
+        static let hudTheme = "hudTheme"
     }
 
     /// Whisper models available in the argmaxinc/whisperkit-coreml registry,
@@ -59,6 +60,12 @@ enum Settings {
     static var inputDeviceUID: String? {
         get { defaults.string(forKey: Key.inputDeviceUID) }
         set { defaults.set(newValue, forKey: Key.inputDeviceUID) }
+    }
+
+    /// Raw value of the HudTheme drawn while dictating; see HudThemes.swift.
+    static var hudTheme: String {
+        get { defaults.string(forKey: Key.hudTheme) ?? "classic" }
+        set { defaults.set(newValue, forKey: Key.hudTheme) }
     }
 
     /// True once start-at-login has been auto-registered (or the user has
