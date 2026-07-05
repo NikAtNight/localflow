@@ -14,14 +14,22 @@ enum TextInjector {
     // overlapping dictations.
     private static var savedItems: [NSPasteboardItem]?
     private static var restoreWork: DispatchWorkItem?
+    private static var pendingCompletion: ((Bool) -> Void)?
     private static var ourChangeCount = -1
 
-    static func inject(_ text: String) {
-        guard !text.isEmpty else { return }
+    /// `completion` (main queue) reports whether the paste is believed to
+    /// have landed: true when the restore window resolved with our text
+    /// still on the clipboard (or typing finished, in secure-input mode),
+    /// false when the paste couldn't be posted or the window was disturbed.
+    static func inject(_ text: String, completion: ((Bool) -> Void)? = nil) {
+        guard !text.isEmpty else {
+            completion?(false)
+            return
+        }
 
         if IsSecureEventInputEnabled() {
             // Password field or similar: avoid the clipboard entirely.
-            typeString(text)
+            typeString(text, completion: completion)
             return
         }
 
@@ -32,6 +40,12 @@ enum TextInjector {
         // the FIRST of the sequence — snapshotting now would capture the
         // previous dictation as "the user's clipboard" and lose the real one.
         restoreWork?.cancel()
+        // A superseded injection never reaches its restore work — resolve it
+        // now with the same signal the work item would have used.
+        if let pending = pendingCompletion {
+            pendingCompletion = nil
+            pending(pasteboard.changeCount == ourChangeCount)
+        }
         if savedItems == nil || pasteboard.changeCount != ourChangeCount {
             savedItems = snapshot(of: pasteboard)
         }
@@ -39,7 +53,17 @@ enum TextInjector {
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         ourChangeCount = pasteboard.changeCount
-        postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_V), flags: .maskCommand)
+        guard postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_V), flags: .maskCommand) else {
+            // No Cmd-V went out — put the user's clipboard back right away.
+            if let saved = savedItems {
+                savedItems = nil
+                pasteboard.clearContents()
+                pasteboard.writeObjects(saved)
+            }
+            completion?(false)
+            return
+        }
+        pendingCompletion = completion
 
         // Give the frontmost app time to service the paste before restoring —
         // slow apps can take well over a second, and restoring too early
@@ -48,11 +72,17 @@ enum TextInjector {
             restoreWork = nil
             let saved = savedItems
             savedItems = nil
+            let done = pendingCompletion
+            pendingCompletion = nil
             // changeCount moved = the user copied something themselves in
-            // the meantime — theirs wins over the restore.
-            guard pasteboard.changeCount == ourChangeCount, let saved else { return }
-            pasteboard.clearContents()
-            pasteboard.writeObjects(saved)
+            // the meantime — theirs wins over the restore, and whether the
+            // paste landed first is unknowable.
+            let undisturbed = pasteboard.changeCount == ourChangeCount
+            if undisturbed, let saved {
+                pasteboard.clearContents()
+                pasteboard.writeObjects(saved)
+            }
+            done?(undisturbed)
         }
         restoreWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
@@ -74,16 +104,17 @@ enum TextInjector {
 
     // MARK: - Synthesized events
 
-    private static func postKeystroke(virtualKey: CGKeyCode, flags: CGEventFlags) {
+    private static func postKeystroke(virtualKey: CGKeyCode, flags: CGEventFlags) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState)
         guard
             let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
             let up = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false)
-        else { return }
+        else { return false }
         down.flags = flags
         up.flags = flags
         down.post(tap: .cghidEventTap)
         up.post(tap: .cghidEventTap)
+        return true
     }
 
     // Serial so overlapping dictations type in order, off the main thread
@@ -92,7 +123,8 @@ enum TextInjector {
 
     /// Types text as synthesized unicode keyboard events, in chunks (long
     /// strings on a single event get truncated by some apps).
-    private static func typeString(_ text: String) {
+    /// `completion` runs on the main queue once every chunk has been posted.
+    private static func typeString(_ text: String, completion: ((Bool) -> Void)? = nil) {
         let characters = Array(text.utf16)
         typingQueue.async {
             let source = CGEventSource(stateID: .combinedSessionState)
@@ -110,6 +142,9 @@ enum TextInjector {
                 }
                 index += chunkSize
                 usleep(8_000)
+            }
+            if let completion {
+                DispatchQueue.main.async { completion(true) }
             }
         }
     }

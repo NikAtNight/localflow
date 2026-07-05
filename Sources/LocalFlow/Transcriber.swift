@@ -64,10 +64,16 @@ actor Transcriber {
         loadedModel = model
     }
 
-    func transcribe(samples: [Float]) async throws -> String {
+    /// `lowEnergy` marks audio whose RMS was near silence: Whisper reliably
+    /// invents filler for such clips, so canonical hallucination phrases are
+    /// treated as an empty transcript. Never applied to normal-energy audio —
+    /// people legitimately dictate "thank you".
+    func transcribe(samples: [Float], lowEnergy: Bool = false) async throws -> String {
         guard let whisperKit else { throw TranscriberError.notLoaded }
         let results = try await whisperKit.transcribe(audioArray: samples, decodeOptions: Self.decodingOptions)
-        return Self.finalize(results)
+        let text = Self.finalize(results)
+        if lowEnergy, Self.isCanonicalHallucination(text) { return "" }
+        return text
     }
 
     /// Transcribes an audio file (any AVFoundation-readable format).
@@ -86,6 +92,23 @@ actor Transcriber {
         return options
     }
 
+    /// The transcripts Whisper canonically hallucinates for (near-)silent
+    /// audio — trained-in YouTube outro artifacts. Whole-transcript match,
+    /// case- and punctuation-insensitive.
+    private static let hallucinationPhrases: Set<String> = [
+        "thank you", "thanks for watching", "thank you for watching",
+        "you", "bye", "thanks",
+    ]
+
+    static func isCanonicalHallucination(_ text: String) -> Bool {
+        let normalized = text
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return hallucinationPhrases.contains(normalized)
+    }
+
     private static func finalize(_ results: [TranscriptionResult]) -> String {
         let text = results
             .map(\.text)
@@ -97,7 +120,7 @@ actor Transcriber {
     /// Whisper sometimes emits bracketed markers like [BLANK_AUDIO] or (music).
     /// Only strip what looks like a marker — dictated text legitimately
     /// contains brackets and parentheses (e.g. "f(x)").
-    private static func stripSpecialTokens(from text: String) -> String {
+    static func stripSpecialTokens(from text: String) -> String {
         var result = text
         let patterns = [
             "\\[[A-Z_ ]+\\]",

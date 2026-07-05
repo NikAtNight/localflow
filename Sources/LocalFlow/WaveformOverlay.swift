@@ -1,8 +1,9 @@
 import AppKit
 
-/// Floating "listening" HUD shown while the hotkey is held: a non-activating,
-/// click-through panel at the bottom-center of the screen. The visual itself
-/// is whichever HudTheme the user picked — a frosted capsule for most themes,
+/// Floating "listening" HUD shown while the hotkey is held: a non-activating
+/// panel at the bottom-center of the screen, draggable to wherever the user
+/// wants it (the spot persists across launches). The visual itself is
+/// whichever HudTheme the user picked — a frosted capsule for most themes,
 /// borderless for the ones that draw straight over the desktop.
 final class WaveformOverlay {
     private let panel: NSPanel
@@ -10,6 +11,10 @@ final class WaveformOverlay {
     private var theme: HudTheme
     private var hideGeneration = 0
     private var previewTimer: Timer?
+    // Distinguishes the app's own present/layout moves from a user drag —
+    // only drags may persist the origin.
+    private var programmaticMove = false
+    private var moveObserver: NSObjectProtocol?
 
     init() {
         theme = HudTheme.current
@@ -23,20 +28,32 @@ final class WaveformOverlay {
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.level = .statusBar
-        panel.ignoresMouseEvents = true
+        // Draggable, and .nonactivatingPanel keeps the drag from stealing
+        // focus from the app being dictated into.
+        panel.ignoresMouseEvents = false
+        panel.isMovableByWindowBackground = true
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
 
         hudView = HudView(frame: NSRect(origin: .zero, size: theme.size),
                           renderer: theme.makeRenderer())
         applyTheme(theme)
+
+        moveObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didMoveNotification, object: panel, queue: .main
+        ) { [weak self] _ in
+            guard let self, !self.programmaticMove, self.panel.isVisible else { return }
+            Settings.hudOrigin = self.panel.frame.origin
+        }
     }
 
     private func applyTheme(_ newTheme: HudTheme) {
         hudView.stopAnimating() // the outgoing view's timer must not outlive it
         theme = newTheme
         let size = newTheme.size
+        programmaticMove = true
         panel.setContentSize(size)
+        programmaticMove = false
         let bounds = NSRect(origin: .zero, size: size)
 
         let container: NSView
@@ -101,10 +118,21 @@ final class WaveformOverlay {
             applyTheme(HudTheme.current)
         }
         hideGeneration += 1
-        guard let screen = NSScreen.main else { return }
-        let x = screen.visibleFrame.midX - panel.frame.width / 2
-        let y = screen.visibleFrame.minY + 64
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        let origin: NSPoint
+        if let saved = Settings.hudOrigin,
+           Self.isVisible(origin: saved, size: panel.frame.size,
+                          on: NSScreen.screens.map(\.visibleFrame)) {
+            origin = saved
+        } else {
+            // Default bottom-center — also the fallback when the saved spot
+            // is on a screen that is no longer connected.
+            guard let screen = NSScreen.main else { return }
+            origin = NSPoint(x: screen.visibleFrame.midX - panel.frame.width / 2,
+                             y: screen.visibleFrame.minY + 64)
+        }
+        programmaticMove = true
+        panel.setFrameOrigin(origin)
+        programmaticMove = false
 
         hudView.reset()
         hudView.startAnimating()
@@ -114,6 +142,14 @@ final class WaveformOverlay {
             context.duration = 0.15
             panel.animator().alphaValue = 1
         }
+    }
+
+    /// Whether a panel of `size` at `origin` still lands on any connected
+    /// screen — a position saved on a since-removed display must not leave
+    /// the HUD invisible and undraggable.
+    static func isVisible(origin: NSPoint, size: NSSize, on screenFrames: [NSRect]) -> Bool {
+        let rect = NSRect(origin: origin, size: size)
+        return screenFrames.contains { $0.intersects(rect) }
     }
 
     // MARK: - Menu preview

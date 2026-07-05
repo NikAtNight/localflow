@@ -131,7 +131,13 @@ final class SettingsPanelController {
             w.title = "LocalFlow Settings"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.isReleasedWhenClosed = false
-            w.center()
+            // The window is recreated per open, so the autosaved frame must
+            // be restored explicitly (and before the window is shown);
+            // center() only on the first-ever open, or it clobbers the restore.
+            w.setFrameAutosaveName("LocalFlowSettings")
+            if !w.setFrameUsingName("LocalFlowSettings") {
+                w.center()
+            }
             // Drop the window on close so the 16 animating previews stop.
             closeObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.willCloseNotification, object: w, queue: .main
@@ -159,29 +165,6 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            Section("Dictation") {
-                Picker("Hold to talk", selection: $model.hotkey) {
-                    ForEach(HotkeyManager.Key.allCases, id: \.self) { key in
-                        Text(key.label).tag(key)
-                    }
-                }
-                Picker("Whisper model", selection: $model.whisperModel) {
-                    ForEach(Settings.whisperModels, id: \.name) { entry in
-                        Text(entry.label).tag(entry.name)
-                    }
-                }
-                Picker("Microphone", selection: $model.micUID) {
-                    Text(model.systemDefaultName.map { "System Default (\($0))" } ?? "System Default")
-                        .tag(String?.none)
-                    ForEach(model.devices, id: \.uid) { device in
-                        Text(device.name).tag(Optional(device.uid))
-                    }
-                    if let uid = model.micUID, !model.devices.contains(where: { $0.uid == uid }) {
-                        Text("Saved mic (not connected)").tag(Optional(uid))
-                    }
-                }
-            }
-
             Section("After transcribing") {
                 Toggle("Clean up with Ollama (\(Settings.ollamaModel))", isOn: $model.cleanupEnabled)
                 if model.cleanupEnabled && !model.ollamaReachable {

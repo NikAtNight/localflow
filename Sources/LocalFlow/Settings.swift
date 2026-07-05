@@ -13,6 +13,7 @@ enum Settings {
         static let inputDeviceUID = "inputDeviceUID"
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
+        static let hudOrigin = "hudOrigin"
     }
 
     /// Whisper models available in the argmaxinc/whisperkit-coreml registry,
@@ -60,6 +61,25 @@ enum Settings {
     static var inputDeviceUID: String? {
         get { defaults.string(forKey: Key.inputDeviceUID) }
         set { defaults.set(newValue, forKey: Key.inputDeviceUID) }
+    }
+
+    /// Screen origin (global bottom-left coordinates) the user dragged the
+    /// recording HUD to; nil = default bottom-center placement.
+    static var hudOrigin: CGPoint? {
+        get {
+            let parts = (defaults.string(forKey: Key.hudOrigin) ?? "")
+                .split(separator: ",")
+                .compactMap { Double($0) }
+            guard parts.count == 2 else { return nil }
+            return CGPoint(x: parts[0], y: parts[1])
+        }
+        set {
+            if let origin = newValue {
+                defaults.set("\(origin.x),\(origin.y)", forKey: Key.hudOrigin)
+            } else {
+                defaults.removeObject(forKey: Key.hudOrigin)
+            }
+        }
     }
 
     /// Raw value of the HudTheme drawn while dictating; see HudThemes.swift.

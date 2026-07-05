@@ -16,6 +16,11 @@ let package = Package(
                 .product(name: "WhisperKit", package: "WhisperKit")
             ],
             path: "Sources/LocalFlow"
+        ),
+        .testTarget(
+            name: "LocalFlowTests",
+            dependencies: ["LocalFlow"],
+            path: "Tests/LocalFlowTests"
         )
     ]
 )

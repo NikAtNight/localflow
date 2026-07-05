@@ -24,6 +24,20 @@ final class AudioRecorder {
 
     static let sampleRate: Double = 16_000
 
+    /// RMS energy of a capture in dBFS (0 = full scale); -infinity for
+    /// empty or all-zero buffers. Used to tell silence from speech before
+    /// handing audio to Whisper.
+    static func rmsDBFS(of samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return -.infinity }
+        // Double accumulator: a 5-minute capture is ~5M squares and a Float
+        // running sum loses the small terms.
+        var sum = 0.0
+        for s in samples { sum += Double(s) * Double(s) }
+        let rms = (sum / Double(samples.count)).squareRoot()
+        guard rms > 0 else { return -.infinity }
+        return Float(20 * log10(rms))
+    }
+
     /// Called on the capture queue with a 0…1 loudness level per captured
     /// buffer — drives the waveform overlay. Callee must hop to main itself.
     var onLevel: ((Float) -> Void)?
@@ -71,6 +85,7 @@ final class AudioRecorder {
     private var runtimeObserver: NSObjectProtocol?
     private var samples: [Float] = []
     private var captureLive = false // guarded by `lock`
+    private var recordingGeneration = 0 // touched only on `controlQueue`
     private let lock = NSLock()
 
     // Session start/stop can block (mic hardware spin-up, TCC prompts) —
@@ -96,6 +111,7 @@ final class AudioRecorder {
     /// recorded since start.
     func stop(completion: @escaping ([Float]) -> Void) {
         controlQueue.async {
+            self.recordingGeneration += 1
             self.tearDownSession()
             self.lock.lock()
             let captured = self.samples
@@ -106,26 +122,40 @@ final class AudioRecorder {
     }
 
     private func startCapture() throws {
+        recordingGeneration += 1
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         captureLive = false
         lock.unlock()
         try captureWithFallback()
+        armNoAudioWatchdog(rebuildsLeft: 2)
+    }
 
-        // A Bluetooth mic's first activation can "start" successfully yet
-        // never deliver a buffer; a single rebuild reliably unsticks it.
-        // Pinned to this start's session — a quick press→release→press would
-        // otherwise let the stale check tear down the next recording's mic.
-        let watchedSession = session
+    /// A Bluetooth mic's first activation can "start" successfully yet never
+    /// deliver a buffer; a rebuild reliably unsticks it. Pinned to the
+    /// recording generation, not the session object — a quick press→release→
+    /// press can't have a stale check tear down the next recording's mic,
+    /// but a session replaced by error recovery stays watched (pinning the
+    /// object let a runtime-error resume in the first 1.2s escape the
+    /// watchdog entirely: silent session, no rebuild, "heard nothing").
+    private func armNoAudioWatchdog(rebuildsLeft: Int) {
+        let generation = recordingGeneration
         controlQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            guard let self, let watchedSession, watchedSession === self.session else { return }
+            guard let self, generation == self.recordingGeneration, self.session != nil else { return }
             self.lock.lock()
             let live = self.captureLive
             self.lock.unlock()
             guard !live else { return }
+            guard rebuildsLeft > 0 else {
+                NSLog("LocalFlow: still no audio after rebuilding capture — giving up")
+                self.tearDownSession()
+                self.onRuntimeFailure?(RecorderError.noInput)
+                return
+            }
             NSLog("LocalFlow: capture started but no audio after 1.2s — rebuilding capture")
             do {
                 try self.captureWithFallback()
+                self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft - 1)
             } catch {
                 NSLog("LocalFlow: capture rebuild failed: %@", error.localizedDescription)
                 self.tearDownSession()
@@ -220,6 +250,12 @@ final class AudioRecorder {
             NSLog("LocalFlow: capture session error mid-recording — resuming capture")
             do {
                 try self.captureWithFallback()
+                // An error before the first buffer means the replacement is
+                // just as suspect — keep it under the no-audio watchdog.
+                self.lock.lock()
+                let live = self.captureLive
+                self.lock.unlock()
+                if !live { self.armNoAudioWatchdog(rebuildsLeft: 1) }
             } catch {
                 NSLog("LocalFlow: could not resume capture: %@", error.localizedDescription)
                 self.tearDownSession()

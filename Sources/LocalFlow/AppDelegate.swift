@@ -16,6 +16,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusMenuItem: NSMenuItem!
     private var recentMenuItem: NSMenuItem!
     private var retryMenuItem: NSMenuItem!
+    // Quick-action submenus — the three most-changed settings, mirrored out
+    // of the settings window so they're one click away.
+    private var hotkeyMenuItem: NSMenuItem!
+    private var modelMenuItem: NSMenuItem!
+    private var micMenuItem: NSMenuItem!
     private var settingsModel: SettingsModel!
     private var settingsController: SettingsPanelController!
 
@@ -237,10 +242,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func loadModel() {
         modelLoadGeneration += 1
         let generation = modelLoadGeneration
-        modelLoaded = false
         state = .loadingModel
         let model = Settings.whisperModel
         Task {
+            // Only gate the hotkey when nothing can transcribe: during a
+            // switch or retry the previous model keeps serving, and clearing
+            // `modelLoaded` would make dictation look dead for the attempt.
+            if !(await transcriber.isLoaded) {
+                guard generation == modelLoadGeneration else { return }
+                modelLoaded = false
+            }
             do {
                 try await transcriber.load(model: model)
                 guard generation == modelLoadGeneration else { return } // superseded
@@ -364,16 +375,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // An accidental hotkey brush captures a sliver of near-silence, and
+    // Whisper hallucinates text for it ("Thank you.") that gets pasted into
+    // the focused app — gate on duration and energy before transcribing.
+    private static let minDictationSeconds: TimeInterval = 0.4
+    private static let silenceFloorDBFS: Float = -55
+    // Above the silence floor but still too quiet to trust: transcribe, but
+    // let the transcriber drop canonical hallucination phrases.
+    private static let quietAudioDBFS: Float = -40
+
     private func process(samples: [Float], releasedAt: Date) {
-        // Ignore taps shorter than ~0.3s of audio — accidental presses.
-        guard samples.count > Int(AudioRecorder.sampleRate * 0.3) else {
-            if !isRecording {
-                if case .failed = state {
-                    // let the banner linger; the recovery timer clears it
-                } else {
-                    state = restingState
-                }
-            }
+        let duration = Double(samples.count) / AudioRecorder.sampleRate
+        let dbfs = AudioRecorder.rmsDBFS(of: samples)
+        guard duration >= Self.minDictationSeconds, dbfs > Self.silenceFloorDBFS else {
+            NSLog("LocalFlow: skipping transcription — %.2fs at %.0f dBFS is too short or silent",
+                  duration, dbfs)
+            reportHeardNothing()
             return
         }
 
@@ -384,15 +401,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Task {
             do {
-                let raw = try await transcriber.transcribe(samples: samples)
+                let raw = try await transcriber.transcribe(samples: samples,
+                                                           lowEnergy: dbfs < Self.quietAudioDBFS)
                 guard !raw.isEmpty else {
                     // Muted mic, wrong input, silence: without a cue the
                     // user only finds out nothing was pasted much later.
-                    NSLog("LocalFlow: transcription produced no text (%.1fs of audio)",
-                          Double(samples.count) / AudioRecorder.sampleRate)
-                    playCue("Basso")
-                    state = .failed("Heard nothing — is the right microphone selected?")
-                    scheduleFailureRecovery()
+                    NSLog("LocalFlow: transcription produced no text (%.1fs of audio)", duration)
+                    reportHeardNothing()
                     finishProcessing()
                     return
                 }
@@ -419,16 +434,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
                 settingsModel?.recentDictations = recentTranscripts
 
-                TextInjector.inject(text)
-                playCue("Bottle")
-                lastError = nil
+                // The success cue waits for the injector's verdict — hearing
+                // it while nothing was pasted is worse than hearing it late.
+                TextInjector.inject(text) { [weak self] landed in
+                    guard let self else { return }
+                    if landed {
+                        self.playCue("Bottle")
+                        self.lastError = nil
+                    } else {
+                        NSLog("LocalFlow: paste may not have landed — transcript kept in Recent Dictations")
+                        self.playCue("Basso")
+                        self.state = .failed("Paste may not have landed — see Recent Dictations")
+                        self.scheduleFailureRecovery()
+                    }
+                }
 
                 // The metric the plan says to watch: hotkey-release → pasted text.
                 let ms = Int(Date().timeIntervalSince(releasedAt) * 1000)
                 lastLatencyMs = ms
                 NSLog("LocalFlow: end-to-end %dms (%.1fs audio, cleanup=%@) — \"%@\"",
-                      ms, Double(samples.count) / AudioRecorder.sampleRate,
-                      cleanupWanted ? "on" : "off", text)
+                      ms, duration, cleanupWanted ? "on" : "off", text)
                 finishProcessing()
             } catch {
                 processingCount -= 1
@@ -449,6 +474,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard processingCount == 0, !isRecording else { return }
         if case .failed = state { return } // let a failure message linger
         state = restingState
+    }
+
+    /// Nothing worth pasting was captured (too short, silence, or an empty
+    /// transcript) — one cue/banner path for all of them.
+    private func reportHeardNothing() {
+        playCue("Basso")
+        state = .failed("Heard nothing — is the right microphone selected?")
+        scheduleFailureRecovery()
     }
 
     /// Show a failure message briefly, then return to idle. The hotkey no
@@ -495,6 +528,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         retryMenuItem.target = self
         retryMenuItem.isHidden = true
         menu.addItem(retryMenuItem)
+        menu.addItem(.separator())
+
+        // Quick actions: the settings people flip most often, applied through
+        // the SAME live paths the settings window uses (SettingsModel setters
+        // persist and fire the AppDelegate hooks). Checkmarks and the mic list
+        // are refreshed in menuWillOpen.
+        hotkeyMenuItem = NSMenuItem(title: "Hold to Talk", action: nil, keyEquivalent: "")
+        let hotkeyMenu = NSMenu()
+        for key in HotkeyManager.Key.allCases {
+            let item = NSMenuItem(title: key.label, action: #selector(selectHotkey(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = key
+            hotkeyMenu.addItem(item)
+        }
+        hotkeyMenuItem.submenu = hotkeyMenu
+        menu.addItem(hotkeyMenuItem)
+
+        modelMenuItem = NSMenuItem(title: "Whisper Model", action: nil, keyEquivalent: "")
+        let modelMenu = NSMenu()
+        for entry in Settings.whisperModels {
+            let item = NSMenuItem(title: entry.label, action: #selector(selectWhisperModel(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = entry.name
+            modelMenu.addItem(item)
+        }
+        modelMenuItem.submenu = modelMenu
+        menu.addItem(modelMenuItem)
+
+        // Rebuilt fresh each open so plugging/unplugging a mic is reflected.
+        micMenuItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        micMenuItem.submenu = NSMenu()
+        menu.addItem(micMenuItem)
         menu.addItem(.separator())
 
         // Everything configurable lives in the settings window.
@@ -569,6 +634,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
     }
+
+    // Quick-action selections route through SettingsModel so persistence and
+    // the live-apply hooks are shared with the settings window — no duplicated
+    // apply logic.
+
+    @objc private func selectHotkey(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? HotkeyManager.Key else { return }
+        settingsModel.hotkey = key
+    }
+
+    @objc private func selectWhisperModel(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        settingsModel.whisperModel = name
+    }
+
+    @objc private func selectMicrophone(_ sender: NSMenuItem) {
+        // A nil representedObject is the "System Default" row.
+        settingsModel.micUID = sender.representedObject as? String
+    }
 }
 
 // MARK: - Menu state (checkmarks reflect current settings when menu opens)
@@ -577,6 +661,8 @@ extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         probeOllama()
         rebuildRecentDictationsMenu()
+        rebuildMicrophoneMenu()
+        refreshQuickActionChecks()
         retryMenuItem.isHidden = retrySamples == nil
         if let lastError {
             let ago = RelativeDateTimeFormatter().localizedString(for: lastError.at, relativeTo: Date())
@@ -598,6 +684,56 @@ extension AppDelegate: NSMenuDelegate {
             item.target = self
             item.representedObject = text
             item.toolTip = "Copy to clipboard"
+            submenu.addItem(item)
+        }
+    }
+
+    /// Checkmark the currently-selected hotkey and model. Both submenus are
+    /// static, so only the `state` needs refreshing when the menu opens.
+    private func refreshQuickActionChecks() {
+        for item in hotkeyMenuItem.submenu?.items ?? [] {
+            item.state = (item.representedObject as? HotkeyManager.Key) == settingsModel.hotkey ? .on : .off
+        }
+        for item in modelMenuItem.submenu?.items ?? [] {
+            item.state = (item.representedObject as? String) == settingsModel.whisperModel ? .on : .off
+        }
+    }
+
+    /// Rebuilt each open so device plug/unplug is reflected. Mirrors the
+    /// settings picker: "System Default" (named when resolvable) plus every
+    /// live input device, and a placeholder row for a saved-but-absent mic so
+    /// its checkmark isn't orphaned.
+    private func rebuildMicrophoneMenu() {
+        guard let submenu = micMenuItem.submenu else { return }
+        submenu.removeAllItems()
+        let devices = AudioDevices.inputDevices()
+        let currentUID = settingsModel.micUID
+
+        let defaultName = AudioDevices.defaultInputDeviceID().flatMap { id in
+            devices.first(where: { $0.id == id })?.name
+        }
+        let defaultItem = NSMenuItem(
+            title: defaultName.map { "System Default (\($0))" } ?? "System Default",
+            action: #selector(selectMicrophone(_:)), keyEquivalent: ""
+        )
+        defaultItem.target = self
+        defaultItem.representedObject = nil
+        defaultItem.state = currentUID == nil ? .on : .off
+        submenu.addItem(defaultItem)
+
+        for device in devices {
+            let item = NSMenuItem(title: device.name, action: #selector(selectMicrophone(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = device.uid
+            item.state = currentUID == device.uid ? .on : .off
+            submenu.addItem(item)
+        }
+
+        if let uid = currentUID, !devices.contains(where: { $0.uid == uid }) {
+            let item = NSMenuItem(title: "Saved mic (not connected)", action: #selector(selectMicrophone(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = uid
+            item.state = .on
             submenu.addItem(item)
         }
     }
