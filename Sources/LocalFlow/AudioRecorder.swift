@@ -85,6 +85,7 @@ final class AudioRecorder {
     private var runtimeObserver: NSObjectProtocol?
     private var samples: [Float] = []
     private var captureLive = false // guarded by `lock`
+    private var buffersThisSession = 0 // guarded by `lock`
     private var recordingGeneration = 0 // touched only on `controlQueue`
     private let lock = NSLock()
 
@@ -126,6 +127,7 @@ final class AudioRecorder {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         captureLive = false
+        buffersThisSession = 0
         lock.unlock()
         try captureWithFallback()
         armNoAudioWatchdog(rebuildsLeft: 2)
@@ -196,6 +198,11 @@ final class AudioRecorder {
     /// can rebuild without discarding what was already recorded.
     private func beginCapture(pinning uid: String?) throws {
         tearDownSession()
+        // Stray buffers from a torn-down session must not count toward the
+        // fresh session's sustained-delivery threshold.
+        lock.lock()
+        buffersThisSession = 0
+        lock.unlock()
 
         var device: AVCaptureDevice?
         if let uid {
@@ -282,10 +289,19 @@ final class AudioRecorder {
 
         lock.lock()
         let wasLive = captureLive
-        captureLive = true
+        // A Bluetooth mic mid-A2DP→HFP negotiation can emit a spurious
+        // buffer (or a few) before the real stream stabilizes — a single
+        // buffer must not declare capture live (it flashed the HUD's "talk
+        // now" and disarmed the no-audio watchdog while the mic was still
+        // seconds from working). Live = sustained delivery.
+        if !wasLive {
+            buffersThisSession += 1
+            if buffersThisSession >= 3 { captureLive = true }
+        }
+        let nowLive = captureLive
         samples.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: count))
         lock.unlock()
-        if !wasLive { onCaptureLive?() }
+        if !wasLive && nowLive { onCaptureLive?() }
 
         if let onLevel {
             var sum: Float = 0

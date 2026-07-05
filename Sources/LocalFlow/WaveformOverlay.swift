@@ -305,19 +305,36 @@ private final class HudView: NSView {
             let breath = 0.5 + 0.5 * sin(time * 3.0)
             let fade = min(1, max(0, (time - phaseStart - 0.18) / 0.25))
             if fade > 0 {
-                let pulse = 0.35 + 0.45 * breath
+                drawWaitBackdrop(in: ctx, alpha: fade)
+                let pulse = 0.55 + 0.4 * breath
                 drawDots(in: ctx, alphas: [CGFloat](repeating: pulse * fade, count: 3))
             }
         case .processing:
             let fade = min(1, max(0, (time - phaseStart) / 0.2))
+            drawWaitBackdrop(in: ctx, alpha: fade)
             // Left-to-right chase: indeterminate "working", distinct from
             // the warming state's in-unison pulse.
             let alphas = (0..<3).map { i -> CGFloat in
                 let wave = max(0, sin(time * 5.0 - CGFloat(i) * 1.1))
-                return (0.25 + 0.6 * wave) * fade
+                return (0.4 + 0.55 * wave) * fade
             }
             drawDots(in: ctx, alphas: alphas)
         }
+    }
+
+    /// Dark capsule behind the waiting dots. The waiting states hide the
+    /// theme, and several themes draw their own background — without this
+    /// the dots sit directly on the desktop and can disappear against it.
+    private func drawWaitBackdrop(in ctx: CGContext, alpha: CGFloat) {
+        let capsule = CGRect(x: bounds.midX - 48, y: bounds.midY - 16,
+                             width: 96, height: 32)
+        let path = CGPath(roundedRect: capsule, cornerWidth: 16,
+                          cornerHeight: 16, transform: nil)
+        ctx.saveGState()
+        ctx.setFillColor(NSColor.black.withAlphaComponent(0.55 * alpha).cgColor)
+        ctx.addPath(path)
+        ctx.fillPath()
+        ctx.restoreGState()
     }
 
     private func renderTheme(in ctx: CGContext) {
@@ -329,8 +346,8 @@ private final class HudView: NSView {
     /// vocabulary for both waiting states. The soft shadow keeps them
     /// readable when a bare theme puts them straight over a light desktop.
     private func drawDots(in ctx: CGContext, alphas: [CGFloat]) {
-        let radius: CGFloat = 3
-        let spacing: CGFloat = 14
+        let radius: CGFloat = 4
+        let spacing: CGFloat = 17
         ctx.saveGState()
         ctx.setShadow(offset: .zero, blur: 4,
                       color: NSColor.black.withAlphaComponent(0.5).cgColor)
