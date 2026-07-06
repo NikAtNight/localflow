@@ -107,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         recorder.deviceUID = Settings.inputDeviceUID
+        recorder.keepWarm = Settings.keepMicWarm
         observeSystemTransitions()
         registerLoginItemOnce()
         // Bundle icon matches whichever listening theme is active; the
@@ -123,7 +124,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refreshStatusUI()
         }
         settingsModel.onModelChange = { [weak self] in self?.loadModel() }
-        settingsModel.onMicChange = { [weak self] uid in self?.recorder.deviceUID = uid }
+        settingsModel.onMicChange = { [weak self] uid in
+            self?.recorder.deviceUID = uid
+            // A warm session on the old mic must not answer the next press.
+            self?.recorder.releaseWarmSession()
+        }
+        settingsModel.onKeepWarmChange = { [weak self] in
+            self?.recorder.keepWarm = Settings.keepMicWarm
+            if !Settings.keepMicWarm { self?.recorder.releaseWarmSession() }
+        }
         settingsModel.onCleanupToggle = { [weak self] in
             if Settings.cleanupEnabled { self?.probeOllama() }
         }
@@ -156,13 +165,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// would be worse than losing a dictation the user watched get cut off.
     private func abortRecording(reason: String) {
         hotkey.cancelHold()
-        guard isRecording else { return }
-        DiagLog.log("%@ while recording — discarding the recording", reason)
-        isRecording = false
-        recordingGeneration += 1
-        overlay.hide()
-        recorder.stop { _ in }
-        state = restingState
+        if isRecording {
+            DiagLog.log("%@ while recording — discarding the recording", reason)
+            isRecording = false
+            recordingGeneration += 1
+            overlay.hide()
+            recorder.stop { _ in }
+            state = restingState
+        }
+        // Sleep must not carry an open mic through the nap — release any
+        // warm session too (queued after stop, so it sees the idle state).
+        recorder.releaseWarmSession()
     }
 
     /// Login is handled by a LaunchAgent rather than a plain login item so

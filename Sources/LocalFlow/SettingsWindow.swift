@@ -20,6 +20,7 @@ final class SettingsModel: ObservableObject {
     var onModelChange: (() -> Void)?
     var onMicChange: ((String?) -> Void)?
     var onCleanupToggle: (() -> Void)?
+    var onKeepWarmChange: (() -> Void)?
     var onThemeChange: (() -> Void)?
 
     private let loginAgent = SMAppService.agent(plistName: "app.talix.localflow.plist")
@@ -66,6 +67,14 @@ final class SettingsModel: ObservableObject {
 
     @Published var soundCues: Bool = Settings.soundCues {
         didSet { Settings.soundCues = soundCues }
+    }
+
+    @Published var keepMicWarm: Bool = Settings.keepMicWarm {
+        didSet {
+            guard oldValue != keepMicWarm else { return }
+            Settings.keepMicWarm = keepMicWarm
+            onKeepWarmChange?()
+        }
     }
 
     private var suppressLoginSideEffect = false
@@ -174,6 +183,14 @@ struct SettingsView: View {
                 }
                 Toggle("Sound cues", isOn: $model.soundCues)
                 Toggle("Start at login", isOn: $model.startAtLogin)
+            }
+
+            Section {
+                Toggle("Keep microphone warm between dictations", isOn: $model.keepMicWarm)
+            } footer: {
+                Text("Holds the mic open for 2 minutes after each dictation so the next press is live instantly. While warm, the mic-in-use indicator stays on and Bluetooth headphones stay in call-quality audio.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

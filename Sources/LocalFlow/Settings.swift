@@ -10,6 +10,7 @@ enum Settings {
         static let cleanupEnabled = "cleanupEnabled"
         static let ollamaModel = "ollamaModel"
         static let soundCues = "soundCues"
+        static let keepMicWarm = "keepMicWarm"
         static let inputDeviceUID = "inputDeviceUID"
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
@@ -55,6 +56,15 @@ enum Settings {
     static var soundCues: Bool {
         get { defaults.object(forKey: Key.soundCues) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.soundCues) }
+    }
+
+    /// Keep the capture session open for a while after each dictation so the
+    /// next press is live immediately (a cold Bluetooth mic takes ~2s to
+    /// wake). Costs: the mic-in-use indicator stays on through the window,
+    /// and Bluetooth headphones stay in call-quality audio until it expires.
+    static var keepMicWarm: Bool {
+        get { defaults.object(forKey: Key.keepMicWarm) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.keepMicWarm) }
     }
 
     /// CoreAudio device UID of the microphone to record from; nil = system default.

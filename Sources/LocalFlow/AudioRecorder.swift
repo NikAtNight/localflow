@@ -79,6 +79,18 @@ final class AudioRecorder {
     }
     private var _deviceUID: String?
 
+    /// Keep the session running for `warmWindowSeconds` after `stop` so the
+    /// next `start` skips device spin-up (a cold AirPods mic takes ~1.8s to
+    /// deliver audible audio; a warm one is live in one buffer). Written
+    /// from the main thread, read on the control queue — hence the lock.
+    var keepWarm: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _keepWarm }
+        set { lock.lock(); defer { lock.unlock() }; _keepWarm = newValue }
+    }
+    private var _keepWarm = false
+
+    private static let warmWindowSeconds: TimeInterval = 120
+
     private static let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: AudioRecorder.sampleRate,
@@ -90,6 +102,9 @@ final class AudioRecorder {
     private var forwarder: SampleForwarder?
     private var runtimeObserver: NSObjectProtocol?
     private var samples: [Float] = []
+    private var sessionDeviceUID: String? // touched only on `controlQueue`
+    private var warmTeardown: DispatchWorkItem? // touched only on `controlQueue`
+    private var recordingActive = false // guarded by `lock`
     private var captureLive = false // guarded by `lock`
     private var buffersThisSession = 0 // guarded by `lock`
     private var sessionEpoch = Date() // guarded by `lock`
@@ -118,20 +133,62 @@ final class AudioRecorder {
     }
 
     /// Stops capture; `completion` runs on the main queue with everything
-    /// recorded since start.
+    /// recorded since start. With `keepWarm`, a session that reached live
+    /// audio stays running (discarding buffers) for `warmWindowSeconds` so
+    /// the next start is instant; a session that never went live is on a
+    /// suspect route and is torn down as before.
     func stop(completion: @escaping ([Float]) -> Void) {
         controlQueue.async {
             self.recordingGeneration += 1
-            self.tearDownSession()
             self.lock.lock()
             let captured = self.samples
             self.samples = []
+            let wasLive = self.captureLive
+            let warmWanted = self._keepWarm
+            self.recordingActive = false
             self.lock.unlock()
+            if warmWanted, wasLive, self.session != nil {
+                self.scheduleWarmTeardown()
+            } else {
+                self.tearDownSession()
+            }
             DispatchQueue.main.async { completion(captured) }
         }
     }
 
+    /// Releases a warm (idle) session immediately. Device switches, system
+    /// sleep, and turning keep-warm off must not hold the old mic open —
+    /// on AirPods a warm session pins call-quality audio the whole window.
+    /// No-op while a recording is in flight or nothing is warm.
+    func releaseWarmSession() {
+        controlQueue.async {
+            self.lock.lock()
+            let active = self.recordingActive
+            self.lock.unlock()
+            guard !active, self.session != nil else { return }
+            DiagLog.log("releasing warm mic session (%@)", self.sessionDeviceUID ?? "?")
+            self.warmTeardown?.cancel()
+            self.warmTeardown = nil
+            self.tearDownSession()
+        }
+    }
+
+    private func scheduleWarmTeardown() {
+        warmTeardown?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            DiagLog.log("warm mic window expired — releasing %@", self.sessionDeviceUID ?? "?")
+            self.warmTeardown = nil
+            self.tearDownSession()
+        }
+        warmTeardown = item
+        controlQueue.asyncAfter(deadline: .now() + Self.warmWindowSeconds, execute: item)
+        DiagLog.log("[diag] keeping mic warm for %.0fs", Self.warmWindowSeconds)
+    }
+
     private func startCapture() throws {
+        warmTeardown?.cancel()
+        warmTeardown = nil
         recordingGeneration += 1
         lock.lock()
         samples.removeAll(keepingCapacity: true)
@@ -139,9 +196,27 @@ final class AudioRecorder {
         buffersThisSession = 0
         levelWindowSecond = 0
         peakDBFSWindow = -.infinity
+        recordingActive = true
+        sessionEpoch = Date()
         lock.unlock()
+        // A warm session on the right device skips spin-up entirely — the
+        // next audible buffer (one is usually already in flight) re-fires
+        // onCaptureLive. Wrong device (setting changed, default moved, a
+        // fallback mic was pinned last time) rebuilds from scratch.
+        if let session, session.isRunning, sessionDeviceUID == currentWantedDeviceUID() {
+            DiagLog.log("[diag] reusing warm capture session on %@", sessionDeviceUID ?? "?")
+            armNoAudioWatchdog(rebuildsLeft: 2)
+            return
+        }
         try captureWithFallback()
         armNoAudioWatchdog(rebuildsLeft: 2)
+    }
+
+    /// The device a fresh capture would land on right now: the selected mic
+    /// when it's present, otherwise the current system default.
+    private func currentWantedDeviceUID() -> String? {
+        if let uid = deviceUID, AVCaptureDevice(uniqueID: uid) != nil { return uid }
+        return AVCaptureDevice.default(for: .audio)?.uniqueID
     }
 
     /// Watches a started session until audible audio arrives. Two distinct
@@ -283,6 +358,7 @@ final class AudioRecorder {
         }
         self.session = session
         self.forwarder = forwarder
+        sessionDeviceUID = device.uniqueID
         lock.lock()
         sessionEpoch = Date()
         lock.unlock()
@@ -296,6 +372,19 @@ final class AudioRecorder {
     private func handleRuntimeError(of errored: AVCaptureSession?) {
         controlQueue.async {
             guard let errored, errored === self.session else { return }
+            self.lock.lock()
+            let active = self.recordingActive
+            self.lock.unlock()
+            // A warm idle session that errors (device yanked, media services
+            // reset) isn't worth resuming — just let the mic go; the next
+            // press cold-starts on whatever device is right then.
+            guard active else {
+                DiagLog.log("warm session error while idle — releasing mic")
+                self.warmTeardown?.cancel()
+                self.warmTeardown = nil
+                self.tearDownSession()
+                return
+            }
             DiagLog.log("capture session error mid-recording — resuming capture")
             do {
                 try self.captureWithFallback()
@@ -322,6 +411,7 @@ final class AudioRecorder {
         session.stopRunning()
         self.session = nil
         forwarder = nil
+        sessionDeviceUID = nil
     }
 
     private func append(_ converted: AVAudioPCMBuffer) {
@@ -330,6 +420,13 @@ final class AudioRecorder {
         guard count > 0 else { return }
 
         lock.lock()
+        // A warm idle session keeps delivering buffers; none of them are
+        // part of a recording — no accumulation, no HUD levels, no
+        // capture-live transitions.
+        guard recordingActive else {
+            lock.unlock()
+            return
+        }
         let wasLive = captureLive
         // A Bluetooth mic mid-A2DP→HFP negotiation can emit a spurious
         // buffer (or a few) before the real stream stabilizes — a single

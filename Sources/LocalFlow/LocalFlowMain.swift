@@ -94,13 +94,16 @@ struct LocalFlowMain {
     ///   LocalFlow --record-test
     /// Runs three consecutive ~1.5s captures through the exact AudioRecorder
     /// pipeline the hotkey uses (device selection, Bluetooth avoidance,
-    /// format resolution, fallback) — consecutive, because engine teardown
-    /// residue only bites the SECOND capture in a process, exactly like a
-    /// user's second hotkey press.
+    /// format resolution, fallback) — consecutive, because the second
+    /// capture in a process behaves differently from the first, exactly
+    /// like a user's second hotkey press: with keep-warm on it must reuse
+    /// the warm session (near-zero start), without it it must survive
+    /// teardown residue.
     private static func recordTest(deviceUID: String?) {
         let stderr = FileHandle.standardError
         let recorder = AudioRecorder()
         recorder.deviceUID = deviceUID ?? Settings.inputDeviceUID
+        recorder.keepWarm = Settings.keepMicWarm
         var failures = 0
 
         for round in 1...3 {
