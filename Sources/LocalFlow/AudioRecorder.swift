@@ -14,10 +14,12 @@ import CoreMedia
 final class AudioRecorder {
     enum RecorderError: Error, LocalizedError {
         case noInput
+        case noSignal
 
         var errorDescription: String? {
             switch self {
             case .noInput: return "No microphone input available."
+            case .noSignal: return "Microphone connected but delivering silence."
             }
         }
     }
@@ -52,11 +54,15 @@ final class AudioRecorder {
         (0..<12).map { 120 * pow(3800 / 120, Float($0) / 11) }
     }()
 
-    /// Called once per `start`, on the capture queue, when the first buffer
-    /// actually arrives. Session start alone doesn't mean audio is flowing —
-    /// a Bluetooth mic's hands-free profile can take a second (or a rebuild)
-    /// to deliver anything, and the "speak now" cue must not lie.
+    /// Called once per `start`, on the capture queue, when the first AUDIBLE
+    /// buffer arrives. Neither session start nor buffer arrival means the
+    /// mic is hearing — AirPods stream digital zeros for seconds while
+    /// their mic path spins up — and the "speak now" cue must not lie.
     var onCaptureLive: (() -> Void)?
+
+    /// RMS floor separating "mic not actually on yet" (exact zeros, -inf)
+    /// from a live mic's noise floor (rarely below -70 dBFS).
+    static let digitalSilenceDBFS: Float = -80
 
     /// Called on the control queue when capture died mid-recording and could
     /// not be recovered — without it the app looks like it's recording while
@@ -86,6 +92,9 @@ final class AudioRecorder {
     private var samples: [Float] = []
     private var captureLive = false // guarded by `lock`
     private var buffersThisSession = 0 // guarded by `lock`
+    private var sessionEpoch = Date() // guarded by `lock`
+    private var levelWindowSecond = 0 // guarded by `lock`
+    private var peakDBFSWindow: Float = -.infinity // guarded by `lock`
     private var recordingGeneration = 0 // touched only on `controlQueue`
     private let lock = NSLock()
 
@@ -128,36 +137,63 @@ final class AudioRecorder {
         samples.removeAll(keepingCapacity: true)
         captureLive = false
         buffersThisSession = 0
+        levelWindowSecond = 0
+        peakDBFSWindow = -.infinity
         lock.unlock()
         try captureWithFallback()
         armNoAudioWatchdog(rebuildsLeft: 2)
     }
 
-    /// A Bluetooth mic's first activation can "start" successfully yet never
-    /// deliver a buffer; a rebuild reliably unsticks it. Pinned to the
-    /// recording generation, not the session object — a quick press→release→
-    /// press can't have a stale check tear down the next recording's mic,
-    /// but a session replaced by error recovery stays watched (pinning the
-    /// object let a runtime-error resume in the first 1.2s escape the
-    /// watchdog entirely: silent session, no rebuild, "heard nothing").
-    private func armNoAudioWatchdog(rebuildsLeft: Int) {
+    /// Watches a started session until audible audio arrives. Two distinct
+    /// stalls need opposite treatment:
+    /// - No buffers at all: the session is stuck (classic first-activation
+    ///   Bluetooth failure) — a rebuild reliably unsticks it.
+    /// - Buffers flowing but all digital zeros: the AirPods mic path is
+    ///   still spinning up behind a healthy HFP stream. Rebuilding thrashes
+    ///   a working session; wait it out, with one late rebuild kick and a
+    ///   hard stop so a genuinely dead route still surfaces as an error.
+    /// Pinned to the recording generation, not the session object — a quick
+    /// press→release→press can't have a stale check tear down the next
+    /// recording's mic, but a session replaced by error recovery stays
+    /// watched.
+    private func armNoAudioWatchdog(rebuildsLeft: Int, checks: Int = 0) {
         let generation = recordingGeneration
         controlQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             guard let self, generation == self.recordingGeneration, self.session != nil else { return }
             self.lock.lock()
             let live = self.captureLive
+            let buffers = self.buffersThisSession
             self.lock.unlock()
             guard !live else { return }
+
+            // buffers == 0: stuck session, rebuild is the known fix. Silent
+            // buffers get NO rebuild — measured AirPods wakes take 1.3-1.8s
+            // and occasionally longer, and a rebuild mid-wake restarts the
+            // whole zero cycle (or fails outright: "no microphone input").
+            // Wait it out; only a route silent for ~10s is declared dead.
+            if buffers > 0 {
+                guard checks < 8 else {
+                    NSLog("LocalFlow: buffers flowing but silent for ~10s — giving up")
+                    self.tearDownSession()
+                    self.onRuntimeFailure?(RecorderError.noSignal)
+                    return
+                }
+                NSLog("LocalFlow: [diag] %d buffers, all silent — waiting for mic to wake", buffers)
+                self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft, checks: checks + 1)
+                return
+            }
+
             guard rebuildsLeft > 0 else {
                 NSLog("LocalFlow: still no audio after rebuilding capture — giving up")
                 self.tearDownSession()
                 self.onRuntimeFailure?(RecorderError.noInput)
                 return
             }
-            NSLog("LocalFlow: capture started but no audio after 1.2s — rebuilding capture")
+            NSLog("LocalFlow: no usable audio after %.1fs (%d buffers) — rebuilding capture",
+                  1.2 * Double(checks + 1), buffers)
             do {
                 try self.captureWithFallback()
-                self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft - 1)
+                self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft - 1, checks: checks + 1)
             } catch {
                 NSLog("LocalFlow: capture rebuild failed: %@", error.localizedDescription)
                 self.tearDownSession()
@@ -239,6 +275,7 @@ final class AudioRecorder {
             self?.handleRuntimeError(of: note.object as? AVCaptureSession)
         }
 
+        let startBegan = Date()
         session.startRunning()
         guard session.isRunning else {
             tearDownSession()
@@ -246,6 +283,11 @@ final class AudioRecorder {
         }
         self.session = session
         self.forwarder = forwarder
+        lock.lock()
+        sessionEpoch = Date()
+        lock.unlock()
+        NSLog("LocalFlow: [diag] capture running on %@ (startRunning blocked %.0fms)",
+              device.localizedName, Date().timeIntervalSince(startBegan) * 1000)
     }
 
     /// The session hit a runtime error (device yanked, media services
@@ -294,14 +336,43 @@ final class AudioRecorder {
         // buffer must not declare capture live (it flashed the HUD's "talk
         // now" and disarmed the no-audio watchdog while the mic was still
         // seconds from working). Live = sustained delivery.
-        if !wasLive {
-            buffersThisSession += 1
-            if buffersThisSession >= 3 { captureLive = true }
-        }
+        buffersThisSession += 1
+        // Live = audible signal, not buffer arrival. AirPods bring the HFP
+        // stream up within ~300ms but deliver exact digital zeros for
+        // seconds while the mic path itself spins up — a live microphone
+        // always carries a noise floor, so -inf/-80 dBFS means "connected
+        // but not hearing yet" and must not cue the user to speak.
+        let dbfs = Self.rmsDBFS(of: Array(UnsafeBufferPointer(start: channel[0], count: count)))
+        if !wasLive && dbfs > Self.digitalSilenceDBFS { captureLive = true }
         let nowLive = captureLive
+        let bufferIndex = buffersThisSession
+        let epoch = sessionEpoch
         samples.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: count))
+        // Per-second peak trace: shows whether speech ever reaches usable
+        // levels after the mic wakes (AirPods AGC/noise-gate diagnosis).
+        peakDBFSWindow = max(peakDBFSWindow, dbfs)
+        var completedSecond = -1
+        var completedPeak: Float = -.infinity
+        let second = Int(Date().timeIntervalSince(epoch))
+        if second > levelWindowSecond {
+            completedSecond = levelWindowSecond
+            completedPeak = peakDBFSWindow
+            levelWindowSecond = second
+            peakDBFSWindow = -.infinity
+        }
         lock.unlock()
-        if !wasLive && nowLive { onCaptureLive?() }
+        if completedSecond >= 0 && completedSecond < 20 {
+            NSLog("LocalFlow: [diag] level s%d peak %.1f dBFS", completedSecond, completedPeak)
+        }
+        if bufferIndex <= 5 {
+            NSLog("LocalFlow: [diag] buffer %d at +%.0fms frames=%d %.1f dBFS",
+                  bufferIndex, Date().timeIntervalSince(epoch) * 1000, count, dbfs)
+        }
+        if !wasLive && nowLive {
+            NSLog("LocalFlow: [diag] first audible buffer (%d) at +%.0fms, %.1f dBFS",
+                  bufferIndex, Date().timeIntervalSince(epoch) * 1000, dbfs)
+            onCaptureLive?()
+        }
 
         if let onLevel {
             var sum: Float = 0

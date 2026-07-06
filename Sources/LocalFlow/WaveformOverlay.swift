@@ -220,6 +220,7 @@ private final class HudView: NSView {
     private var frameLevel: CGFloat = 0
     private var frameSpectrum = [CGFloat](repeating: 0, count: 12)
     private var agcReference: CGFloat = 0.0035
+    private var agcLevelReference: CGFloat = 0.4
     private var time: CGFloat = 0
     private var timer: Timer?
 
@@ -232,7 +233,12 @@ private final class HudView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     func ingest(level: Float) {
-        latchedLevel = max(latchedLevel, CGFloat(level))
+        // Same slow-decay AGC idea as the spectrum path: a Bluetooth HFP mic
+        // runs far quieter than a wired one, and a fixed scale leaves the
+        // bars barely tracking speech. The floor keeps the room's noise
+        // floor from being amplified into apparent speech.
+        agcLevelReference = max(agcLevelReference * 0.995, CGFloat(level), 0.4)
+        latchedLevel = max(latchedLevel, min(1, CGFloat(level) / agcLevelReference * 0.95))
     }
 
     func ingest(spectrum: [Float]) {

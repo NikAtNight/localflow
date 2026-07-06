@@ -72,6 +72,14 @@ actor Transcriber {
         guard let whisperKit else { throw TranscriberError.notLoaded }
         let results = try await whisperKit.transcribe(audioArray: samples, decodeOptions: Self.decodingOptions)
         let text = Self.finalize(results)
+        if text.isEmpty || (lowEnergy && Self.isCanonicalHallucination(text)) {
+            // A healthy-audio dictation has produced an empty transcript in
+            // the field; the raw hypothesis tells whether Whisper returned
+            // nothing or post-processing ate a real result.
+            let raw = results.map(\.text).joined(separator: " ")
+            NSLog("LocalFlow: [diag] empty transcript: raw=\"%@\" segments=%d lowEnergy=%d",
+                  String(raw.prefix(160)), results.count, lowEnergy ? 1 : 0)
+        }
         if lowEnergy, Self.isCanonicalHallucination(text) { return "" }
         return text
     }
