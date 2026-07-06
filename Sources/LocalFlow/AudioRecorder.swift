@@ -173,29 +173,29 @@ final class AudioRecorder {
             // Wait it out; only a route silent for ~10s is declared dead.
             if buffers > 0 {
                 guard checks < 8 else {
-                    NSLog("LocalFlow: buffers flowing but silent for ~10s — giving up")
+                    DiagLog.log("buffers flowing but silent for ~10s — giving up")
                     self.tearDownSession()
                     self.onRuntimeFailure?(RecorderError.noSignal)
                     return
                 }
-                NSLog("LocalFlow: [diag] %d buffers, all silent — waiting for mic to wake", buffers)
+                DiagLog.log("[diag] %d buffers, all silent — waiting for mic to wake", buffers)
                 self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft, checks: checks + 1)
                 return
             }
 
             guard rebuildsLeft > 0 else {
-                NSLog("LocalFlow: still no audio after rebuilding capture — giving up")
+                DiagLog.log("still no audio after rebuilding capture — giving up")
                 self.tearDownSession()
                 self.onRuntimeFailure?(RecorderError.noInput)
                 return
             }
-            NSLog("LocalFlow: no usable audio after %.1fs (%d buffers) — rebuilding capture",
+            DiagLog.log("no usable audio after %.1fs (%d buffers) — rebuilding capture",
                   1.2 * Double(checks + 1), buffers)
             do {
                 try self.captureWithFallback()
                 self.armNoAudioWatchdog(rebuildsLeft: rebuildsLeft - 1, checks: checks + 1)
             } catch {
-                NSLog("LocalFlow: capture rebuild failed: %@", error.localizedDescription)
+                DiagLog.log("capture rebuild failed: %@", error.localizedDescription)
                 self.tearDownSession()
                 self.onRuntimeFailure?(error)
             }
@@ -211,7 +211,7 @@ final class AudioRecorder {
         do {
             try beginCapture(pinning: preferred)
         } catch {
-            NSLog("LocalFlow: capture start failed (%@) — retrying once",
+            DiagLog.log("capture start failed (%@) — retrying once",
                   error.localizedDescription)
             usleep(300_000)
             do {
@@ -222,7 +222,7 @@ final class AudioRecorder {
                     ? AudioDevices.defaultInputDeviceID() == builtIn?.id
                     : preferred == builtIn?.uid
                 guard let builtIn, !attemptedBuiltIn else { throw error }
-                NSLog("LocalFlow: mic failed to start (%@) — falling back to %@",
+                DiagLog.log("mic failed to start (%@) — falling back to %@",
                       error.localizedDescription, builtIn.name)
                 try beginCapture(pinning: builtIn.uid)
             }
@@ -245,7 +245,7 @@ final class AudioRecorder {
             // AVCaptureDevice uniqueIDs are the CoreAudio device UIDs.
             device = AVCaptureDevice(uniqueID: uid)
             if device == nil {
-                NSLog("LocalFlow: selected microphone (%@) not available — using system default", uid)
+                DiagLog.log("selected microphone (%@) not available — using system default", uid)
             }
         }
         guard let device = device ?? AVCaptureDevice.default(for: .audio) else {
@@ -286,7 +286,7 @@ final class AudioRecorder {
         lock.lock()
         sessionEpoch = Date()
         lock.unlock()
-        NSLog("LocalFlow: [diag] capture running on %@ (startRunning blocked %.0fms)",
+        DiagLog.log("[diag] capture running on %@ (startRunning blocked %.0fms)",
               device.localizedName, Date().timeIntervalSince(startBegan) * 1000)
     }
 
@@ -296,7 +296,7 @@ final class AudioRecorder {
     private func handleRuntimeError(of errored: AVCaptureSession?) {
         controlQueue.async {
             guard let errored, errored === self.session else { return }
-            NSLog("LocalFlow: capture session error mid-recording — resuming capture")
+            DiagLog.log("capture session error mid-recording — resuming capture")
             do {
                 try self.captureWithFallback()
                 // An error before the first buffer means the replacement is
@@ -306,7 +306,7 @@ final class AudioRecorder {
                 self.lock.unlock()
                 if !live { self.armNoAudioWatchdog(rebuildsLeft: 1) }
             } catch {
-                NSLog("LocalFlow: could not resume capture: %@", error.localizedDescription)
+                DiagLog.log("could not resume capture: %@", error.localizedDescription)
                 self.tearDownSession()
                 self.onRuntimeFailure?(error)
             }
@@ -362,14 +362,14 @@ final class AudioRecorder {
         }
         lock.unlock()
         if completedSecond >= 0 && completedSecond < 20 {
-            NSLog("LocalFlow: [diag] level s%d peak %.1f dBFS", completedSecond, completedPeak)
+            DiagLog.log("[diag] level s%d peak %.1f dBFS", completedSecond, completedPeak)
         }
         if bufferIndex <= 5 {
-            NSLog("LocalFlow: [diag] buffer %d at +%.0fms frames=%d %.1f dBFS",
+            DiagLog.log("[diag] buffer %d at +%.0fms frames=%d %.1f dBFS",
                   bufferIndex, Date().timeIntervalSince(epoch) * 1000, count, dbfs)
         }
         if !wasLive && nowLive {
-            NSLog("LocalFlow: [diag] first audible buffer (%d) at +%.0fms, %.1f dBFS",
+            DiagLog.log("[diag] first audible buffer (%d) at +%.0fms, %.1f dBFS",
                   bufferIndex, Date().timeIntervalSince(epoch) * 1000, dbfs)
             onCaptureLive?()
         }

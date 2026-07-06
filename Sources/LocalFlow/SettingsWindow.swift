@@ -81,7 +81,7 @@ final class SettingsModel: ObservableObject {
                 }
                 Settings.loginItemSetupDone = true
             } catch {
-                NSLog("LocalFlow: login item toggle failed: %@", error.localizedDescription)
+                DiagLog.log("login item toggle failed: %@", error.localizedDescription)
             }
         }
     }

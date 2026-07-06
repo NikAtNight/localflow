@@ -143,12 +143,12 @@ final class HotkeyManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             guard let self, generation == self.startGeneration else { return }
             if self.probeSeen {
-                NSLog("LocalFlow: event tap verified (%@)",
+                DiagLog.log("event tap verified (%@)",
                       option == .listenOnly ? "listen-only" : "active")
                 self.startWatchdog()
                 completion(true)
             } else {
-                NSLog("LocalFlow: event tap created (%@) but probe not delivered — stale permission? Trying next option",
+                DiagLog.log("event tap created (%@) but probe not delivered — stale permission? Trying next option",
                       option == .listenOnly ? "listen-only" : "active")
                 self.stop()
                 self.tryStart(options: remaining, completion: completion)
@@ -240,7 +240,7 @@ final class HotkeyManager {
         // Catches a disable where the disable event itself never reached the
         // callback (the in-callback re-enable can't run if nothing arrives).
         if !CGEvent.tapIsEnabled(tap: tap) {
-            NSLog("LocalFlow: event tap found disabled — re-enabling")
+            DiagLog.log("event tap found disabled — re-enabling")
             CGEvent.tapEnable(tap: tap, enable: true)
         }
         // Secure input (a focused password field) legitimately suppresses
@@ -257,7 +257,7 @@ final class HotkeyManager {
                 return
             }
             self.missedProbes += 1
-            NSLog("LocalFlow: hotkey health probe missed (%d/2)", self.missedProbes)
+            DiagLog.log("hotkey health probe missed (%d/2)", self.missedProbes)
             guard self.missedProbes >= 2 else { return }
             self.missedProbes = 0
             self.onTapDied?()
@@ -310,7 +310,7 @@ final class HotkeyManager {
     private func handle(type: CGEventType, event: CGEvent) -> Bool {
         // macOS disables taps that stall; re-enable and carry on.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            NSLog("LocalFlow: event tap disabled by system (%d) — re-enabling", type.rawValue)
+            DiagLog.log("event tap disabled by system (%d) — re-enabling", type.rawValue)
             if let threadTap { CGEvent.tapEnable(tap: threadTap, enable: true) }
             return false
         }
@@ -325,7 +325,7 @@ final class HotkeyManager {
 
         // Only fires for the push-to-talk key itself — a few lines per
         // dictation, and the exact evidence needed when detection misfires.
-        NSLog("LocalFlow: hotkey flagsChanged keycode=%d flags=0x%llx isDown=%d",
+        DiagLog.log("hotkey flagsChanged keycode=%d flags=0x%llx isDown=%d",
               keyCode, event.flags.rawValue, isDown ? 1 : 0)
 
         let pressed: Bool

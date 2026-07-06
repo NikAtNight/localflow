@@ -37,9 +37,9 @@ actor Transcriber {
             do {
                 try fm.createDirectory(at: new.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try fm.moveItem(at: old, to: new)
-                NSLog("LocalFlow: moved model cache out of ~/Documents to %@", new.path)
+                DiagLog.log("moved model cache out of ~/Documents to %@", new.path)
             } catch {
-                NSLog("LocalFlow: model cache migration failed (%@) — will download fresh", error.localizedDescription)
+                DiagLog.log("model cache migration failed (%@) — will download fresh", error.localizedDescription)
             }
         }
         return base
@@ -77,7 +77,7 @@ actor Transcriber {
             // the field; the raw hypothesis tells whether Whisper returned
             // nothing or post-processing ate a real result.
             let raw = results.map(\.text).joined(separator: " ")
-            NSLog("LocalFlow: [diag] empty transcript: raw=\"%@\" segments=%d lowEnergy=%d",
+            DiagLog.log("[diag] empty transcript: raw=\"%@\" segments=%d lowEnergy=%d",
                   String(raw.prefix(160)), results.count, lowEnergy ? 1 : 0)
         }
         if lowEnergy, Self.isCanonicalHallucination(text) { return "" }

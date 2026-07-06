@@ -73,6 +73,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DiagLog.startSession()
         buildSettings()
         buildStatusItem()
         requestPermissions()
@@ -156,7 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func abortRecording(reason: String) {
         hotkey.cancelHold()
         guard isRecording else { return }
-        NSLog("LocalFlow: %@ while recording — discarding the recording", reason)
+        DiagLog.log("%@ while recording — discarding the recording", reason)
         isRecording = false
         recordingGeneration += 1
         overlay.hide()
@@ -183,9 +184,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try Self.loginAgent.register()
             Settings.loginItemSetupDone = true
-            NSLog("LocalFlow: registered login agent (relaunches after a crash)")
+            DiagLog.log("registered login agent (relaunches after a crash)")
         } catch {
-            NSLog("LocalFlow: login agent registration failed: %@", error.localizedDescription)
+            DiagLog.log("login agent registration failed: %@", error.localizedDescription)
         }
     }
 
@@ -194,12 +195,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func requestPermissions() {
         AVCaptureDevice.requestAccess(for: .audio) { granted in
             if !granted {
-                NSLog("LocalFlow: microphone access denied — grant it in System Settings → Privacy & Security → Microphone")
+                DiagLog.log("microphone access denied — grant it in System Settings → Privacy & Security → Microphone")
             }
         }
         let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
         if !AXIsProcessTrustedWithOptions(options) {
-            NSLog("LocalFlow: Accessibility not yet granted — hotkey and paste need it (System Settings → Privacy & Security → Accessibility)")
+            DiagLog.log("Accessibility not yet granted — hotkey and paste need it (System Settings → Privacy & Security → Accessibility)")
         }
     }
 
@@ -214,7 +215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The watchdog found the tap dead. A release can't arrive through a
     /// dead tap, so end any recording in progress, then rebuild the tap.
     private func hotkeyTapDied() {
-        NSLog("LocalFlow: hotkey tap stopped delivering events — rebuilding it")
+        DiagLog.log("hotkey tap stopped delivering events — rebuilding it")
         if isRecording { hotkeyReleased() }
         hotkeyActive = false
         attemptHotkeyStart()
@@ -228,7 +229,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             if verified {
                 self.hotkeyActive = true
-                NSLog("LocalFlow: hotkey tap active (%@)", self.hotkey.key.label)
+                DiagLog.log("hotkey tap active (%@)", self.hotkey.key.label)
                 self.recomputeReadyState()
             } else {
                 self.hotkeyActive = false
@@ -256,13 +257,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await transcriber.load(model: model)
                 guard generation == modelLoadGeneration else { return } // superseded
-                NSLog("LocalFlow: model %@ loaded — ready", model)
+                DiagLog.log("model %@ loaded — ready", model)
                 modelRetryDelay = 5
                 modelLoaded = true
                 recomputeReadyState()
             } catch {
                 guard generation == modelLoadGeneration else { return }
-                NSLog("LocalFlow: model load failed: %@", error.localizedDescription)
+                DiagLog.log("model load failed: %@", error.localizedDescription)
                 // A failed *switch* leaves the previous model loaded and
                 // serving — keep dictation alive on it while retries run.
                 if await transcriber.isLoaded {
@@ -284,7 +285,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func scheduleModelRetry(generation: Int) {
         let delay = modelRetryDelay
         modelRetryDelay = min(modelRetryDelay * 2, 60)
-        NSLog("LocalFlow: retrying model load in %.0fs", delay)
+        DiagLog.log("retrying model load in %.0fs", delay)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, generation == self.modelLoadGeneration else { return }
             self.loadModel()
@@ -318,7 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Gate only on the model and an active recording — never on the UI
         // state. Pressing while a previous dictation is still transcribing
         // (or after a transient mic error) must start a new recording.
-        NSLog("LocalFlow: hotkey pressed (modelLoaded=%d recording=%d)", modelLoaded ? 1 : 0, isRecording ? 1 : 0)
+        DiagLog.log("hotkey pressed (modelLoaded=%d recording=%d)", modelLoaded ? 1 : 0, isRecording ? 1 : 0)
         guard modelLoaded, !isRecording else {
             // The model recompiles for minutes after every binary change —
             // a press during that window must never be silently swallowed.
@@ -329,6 +330,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // every dictation would "succeed" with nothing to show. Fail loudly.
         let micAuth = AVCaptureDevice.authorizationStatus(for: .audio)
         if micAuth == .denied || micAuth == .restricted {
+            // This early-out was silent in the logs once — presses that
+            // "did nothing" with no trace. Never again.
+            DiagLog.log("hotkey press refused: microphone authorization is %d", micAuth.rawValue)
             playCue("Basso")
             state = .failed("Microphone access denied — enable it in System Settings → Privacy & Security → Microphone")
             scheduleFailureRecovery()
@@ -358,7 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // dictation): cap the recording rather than run an open mic.
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxRecordingSeconds) { [weak self] in
             guard let self, self.isRecording, generation == self.recordingGeneration else { return }
-            NSLog("LocalFlow: recording reached the %.0fs cap — stopping", Self.maxRecordingSeconds)
+            DiagLog.log("recording reached the %.0fs cap — stopping", Self.maxRecordingSeconds)
             self.hotkeyReleased()
         }
     }
@@ -366,7 +370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let maxRecordingSeconds: TimeInterval = 300
 
     private func hotkeyReleased() {
-        NSLog("LocalFlow: hotkey released (recording=%d)", isRecording ? 1 : 0)
+        DiagLog.log("hotkey released (recording=%d)", isRecording ? 1 : 0)
         guard isRecording else { return }
         isRecording = false
         // The HUD stays up as a loading state until this dictation resolves;
@@ -402,7 +406,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let duration = Double(samples.count) / AudioRecorder.sampleRate
         let dbfs = AudioRecorder.rmsDBFS(of: samples)
         guard duration >= Self.minDictationSeconds, dbfs > Self.silenceFloorDBFS else {
-            NSLog("LocalFlow: skipping transcription — %.2fs at %.0f dBFS is too short or silent",
+            DiagLog.log("skipping transcription — %.2fs at %.0f dBFS is too short or silent",
                   duration, dbfs)
             reportHeardNothing()
             dismissHud(hudGeneration)
@@ -421,7 +425,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard !raw.isEmpty else {
                     // Muted mic, wrong input, silence: without a cue the
                     // user only finds out nothing was pasted much later.
-                    NSLog("LocalFlow: transcription produced no text (%.1fs of audio)", duration)
+                    DiagLog.log("transcription produced no text (%.1fs of audio)", duration)
                     reportHeardNothing()
                     dismissHud(hudGeneration)
                     finishProcessing()
@@ -435,11 +439,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         do {
                             text = try await OllamaCleaner.clean(raw, model: ollamaModel)
                         } catch {
-                            NSLog("LocalFlow: Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
+                            DiagLog.log("Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
                         }
                     } else {
                         ollamaReachable = false
-                        NSLog("LocalFlow: Ollama not reachable — pasting raw transcript")
+                        DiagLog.log("Ollama not reachable — pasting raw transcript")
                     }
                 }
 
@@ -458,7 +462,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.playCue("Bottle")
                         self.lastError = nil
                     } else {
-                        NSLog("LocalFlow: paste may not have landed — transcript kept in Recent Dictations")
+                        DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
                         self.playCue("Basso")
                         self.state = .failed("Paste may not have landed — see Recent Dictations")
                         self.scheduleFailureRecovery()
@@ -472,7 +476,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // The metric the plan says to watch: hotkey-release → pasted text.
                 let ms = Int(Date().timeIntervalSince(releasedAt) * 1000)
                 lastLatencyMs = ms
-                NSLog("LocalFlow: end-to-end %dms (%.1fs audio, cleanup=%@) — \"%@\"",
+                DiagLog.log("end-to-end %dms (%.1fs audio, cleanup=%@) — \"%@\"",
                       ms, duration, cleanupWanted ? "on" : "off", text)
                 finishProcessing()
             } catch {

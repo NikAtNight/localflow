@@ -58,7 +58,7 @@ enum ThemeIcon {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? HudTheme.classic.rawValue
         guard baked != theme.rawValue else { return }
         guard FileManager.default.isWritableFile(atPath: resources) else {
-            NSLog("LocalFlow: bundle not writable — Launchpad icon left as-is")
+            DiagLog.log("bundle not writable — Launchpad icon left as-is")
             return
         }
         guard writeIcns(image, to: resources + "/AppIcon.icns") else { return }
@@ -67,7 +67,7 @@ enum ThemeIcon {
         // Nudge LaunchServices/iconservices to pick the new icon up.
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: bundlePath)
         _ = run(lsregister, ["-f", bundlePath])
-        NSLog("LocalFlow: bundle icon rebaked for theme %@", theme.rawValue)
+        DiagLog.log("bundle icon rebaked for theme %@", theme.rawValue)
     }
 
     /// Same signing scheme as make-app.sh: the stable self-signed identity if
@@ -90,7 +90,7 @@ enum ThemeIcon {
             ])
         }
         if result.0 != 0 {
-            NSLog("LocalFlow: re-sign after icon rebake failed: %@", result.1)
+            DiagLog.log("re-sign after icon rebake failed: %@", result.1)
         }
     }
 
@@ -123,7 +123,7 @@ enum ThemeIcon {
         }
         let (status, output) = run("/usr/bin/iconutil", ["-c", "icns", "-o", icnsPath, iconset.path])
         if status != 0 {
-            NSLog("LocalFlow: iconutil failed: %@", output)
+            DiagLog.log("iconutil failed: %@", output)
             return false
         }
         return true
