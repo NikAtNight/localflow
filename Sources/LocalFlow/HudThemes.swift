@@ -224,15 +224,77 @@ func hudRadialGlow(_ ctx: CGContext, center: CGPoint, radius: CGFloat,
                            endCenter: center, endRadius: radius, options: [])
 }
 
-/// Weighted average band index, 0…1 — a cheap "how high is the voice" signal.
-func hudCentroid(_ spectrum: [CGFloat]) -> CGFloat {
-    var num: CGFloat = 0, den: CGFloat = 0
-    for (i, e) in spectrum.enumerated() {
-        num += CGFloat(i) * e
-        den += e
+/// Per-frame voice features derived from the 12-band spectrum — the shared
+/// vocabulary every pitch-reactive renderer keys off instead of timers or
+/// dice. `centroid` is the energy-weighted mean band, 0…1 (0 = low-pitched,
+/// 1 = high-pitched/bright); `low`/`mid`/`high` are the summed energies of
+/// the bottom, middle, and top four bands. Twelve bands — trivially cheap.
+///
+/// `onset` is a real syllable detector, not a level threshold. A fixed
+/// crossing goes blind during fast speech (the level never dips between
+/// syllables, so a whole phrase fires once); instead each frame sums the
+/// rectified spectral flux — the positive band-to-band deltas since the
+/// previous frame — which spikes on every re-articulation even when overall
+/// loudness stays high. An onset fires when flux clears an adaptive gate: a
+/// fast-decaying peak envelope of recent flux (≈98% gone per second) times a
+/// margin, plus an absolute floor so a quiet room stays silent, with a short
+/// refractory so fast speech reads as one ping per syllable, not a smear.
+/// Stateful — one instance per renderer, `reset()` alongside the renderer.
+struct VoiceFeatures {
+    private(set) var centroid: CGFloat = 0.5
+    private(set) var low: CGFloat = 0
+    private(set) var mid: CGFloat = 0
+    private(set) var high: CGFloat = 0
+    private(set) var onset = false
+    /// How hard the syllable hit, 0…1: how far the flux spike cleared its
+    /// adaptive gate (flux at 4× the gate saturates to 1). Every
+    /// emission-driven theme sizes AND paces its emission from this — a weak
+    /// onset spawns a small, slow-radiating emission, a strong one a big,
+    /// quick one — so the same voice reads the same across themes. Only
+    /// meaningful on frames where `onset` is true; zero otherwise.
+    private(set) var onsetStrength: CGFloat = 0
+
+    private var previousBands = [CGFloat](repeating: 0, count: 12)
+    private var fluxEnvelope: CGFloat = 0
+    private var lastOnset: CGFloat = -9
+
+    mutating func reset() { self = VoiceFeatures() }
+
+    /// Call once per frame, before reading any feature.
+    mutating func update(t: CGFloat, dt: CGFloat, level: CGFloat, spectrum: [CGFloat]) {
+        var num: CGFloat = 0, den: CGFloat = 0
+        var lo: CGFloat = 0, mi: CGFloat = 0, hi: CGFloat = 0
+        var flux: CGFloat = 0
+        for (i, e) in spectrum.enumerated() {
+            num += CGFloat(i) * e
+            den += e
+            if i < 4 { lo += e } else if i < 8 { mi += e } else { hi += e }
+            if i < previousBands.count {
+                flux += max(0, e - previousBands[i])
+                previousBands[i] = e
+            }
+        }
+        low = lo; mid = mi; high = hi
+        centroid = den > 0.001 && spectrum.count > 1
+            ? num / den / CGFloat(spectrum.count - 1)
+            : 0.5
+
+        // Gate against the pre-update envelope so a syllable only has to beat
+        // the *recent* flux, then fold the current flux back in.
+        fluxEnvelope *= pow(0.02, dt)
+        let gate = max(0.15, fluxEnvelope * 1.4)
+        onset = t - lastOnset > 0.1 && level > 0.15 && flux > gate
+        if onset {
+            lastOnset = t
+            // Ratio above the gate, so mid-speech re-articulations (which
+            // fight a raised envelope) still span the range instead of every
+            // first-word attack pinning strength at 1.
+            onsetStrength = min(1, (flux / gate - 1) / 3)
+        } else {
+            onsetStrength = 0
+        }
+        fluxEnvelope = max(fluxEnvelope, flux)
     }
-    guard den > 0.001, spectrum.count > 1 else { return 0.5 }
-    return num / den / CGFloat(spectrum.count - 1)
 }
 
 // MARK: - Classic (the original organic wave)
@@ -491,32 +553,46 @@ final class BolideRenderer: HudRenderer {
     }
     private var particles: [Particle] = []
     private var smoothed: CGFloat = 0
+    private var emitCarry: CGFloat = 0
+    private var voice = VoiceFeatures()
     private let cool = HudRamp([(0, "#FFF7E8"), (0.22, "#FFC46B"), (0.5, "#FF6B5E"), (0.78, "#8B6BFF"), (1, "#3D4E8C")])
 
     func reset() {
         particles = []
         smoothed = 0
+        emitCarry = 0
+        voice.reset()
     }
 
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
                 level: CGFloat, spectrum: [CGFloat]) {
         smoothed += (level - smoothed) * (level > smoothed ? 0.5 : 0.06)
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
         let headX = bounds.width - 64
         let headY = bounds.height / 2
 
+        // Emission IS the voice: the stream rides the level, each syllable
+        // onset kicks out a burst sized and paced by how hard it hit (a soft
+        // onset sheds a few slow embers, a sharp one blasts fast sparks), and
+        // idle is a constant faint drip (steady, never random, so it can't
+        // read as speech). Pitch is a light accent on spark speed/chunkiness;
+        // the scatter is just spray around a voice-driven emission point.
         let idle = level < 0.05
-        let births = idle
-            ? (CGFloat.random(in: 0...1) < 0.12 ? 1 : 0)
-            : Int((level * 16 * dt * 60).rounded())
+        emitCarry += (idle ? 3.5 : level * 16 * 60) * dt
+        var births = Int(emitCarry)
+        emitCarry -= CGFloat(births)
+        if voice.onset { births += 3 + Int(voice.onsetStrength * 16) }
+        let kick = voice.onset ? 0.75 + voice.onsetStrength * 0.7 : 1
+        let pitch = voice.centroid
         for _ in 0..<births where particles.count < 650 {
             particles.append(Particle(
                 x: headX + CGFloat.random(in: -3...3),
                 y: headY + CGFloat.random(in: -7...7) * (0.3 + level),
-                vx: -(50 + CGFloat.random(in: 0...330) * (0.25 + level)),
+                vx: -(50 + CGFloat.random(in: 0...330) * (0.25 + level) * (0.85 + 0.3 * pitch)) * kick,
                 vy: CGFloat.random(in: -35...35) * (0.2 + level),
                 life: 0.9 + CGFloat.random(in: 0...0.7),
                 age: 0,
-                radius: 0.9 + CGFloat.random(in: 0...2.1) * (0.4 + level)
+                radius: (0.9 + CGFloat.random(in: 0...2.1) * (0.4 + level)) * (1.15 - 0.3 * pitch) * kick
             ))
         }
 
@@ -646,15 +722,20 @@ final class TickerRenderer: HudRenderer {
     private let maxSamples = 600
     private var phase: CGFloat = 0
     private let speed: CGFloat = 2.1
+    private var voice = VoiceFeatures()
 
     func reset() {
         samples = []
         phase = 0
+        voice.reset()
     }
 
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
                 level: CGFloat, spectrum: [CGFloat]) {
-        phase += dt * (26 + 110 * level)
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        // The pen draws the voice's actual waveform character: oscillation
+        // frequency tracks the pitch (centroid), excursion tracks loudness.
+        phase += dt * (18 + 130 * voice.centroid)
         var s = level * sin(phase) * (0.72 + 0.28 * sin(phase * 0.31))
         if level < 0.05 { s = 0.012 * sin(t * 6) }
         samples.insert(s, at: 0)
@@ -736,34 +817,37 @@ final class TickerRenderer: HudRenderer {
 
 final class ConstellationRenderer: HudRenderer {
     private struct Star {
-        var x, y, brightness, twinkle: CGFloat
+        var x, y, brightness: CGFloat
+        var band: Int // the spectrum band the syllable lived in — its pulse source
         var phrase: Int
     }
     private var stars: [Star] = []
     private var phrase = 0
     private var lastOnset: CGFloat = -9
-    private var previousLevel: CGFloat = 0
+    private var voice = VoiceFeatures()
 
     func reset() {
         stars = []
         phrase = 0
         lastOnset = -9
-        previousLevel = 0
+        voice.reset()
     }
 
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
                 level: CGFloat, spectrum: [CGFloat]) {
         let speed: CGFloat = 34
-        let onset = level > 0.32 && previousLevel <= 0.32 && t - lastOnset > 0.11
-        previousLevel = level
-        if onset {
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        if voice.onset {
             if t - lastOnset > 0.55 { phrase += 1 } // a real pause starts a new constellation
-            let c = hudCentroid(spectrum)
+            // Star magnitude is the syllable's attack: a soft onset is a dim
+            // pinprick, a hard one a bright flaring star. Pitch sets where in
+            // the sky it lands (and which band relights it later).
+            let c = voice.centroid
             stars.append(Star(
                 x: bounds.width - 44,
                 y: bounds.height * 0.80 - c * bounds.height * 0.58 + CGFloat.random(in: -3...3),
-                brightness: min(1, level * 1.4),
-                twinkle: CGFloat.random(in: 0...6),
+                brightness: 0.3 + voice.onsetStrength * 0.7,
+                band: max(0, min(spectrum.count - 1, Int(c * CGFloat(spectrum.count)))),
                 phrase: phrase
             ))
             lastOnset = t
@@ -792,9 +876,12 @@ final class ConstellationRenderer: HudRenderer {
             ctx.strokePath()
         }
 
-        // Stars.
+        // Stars. Each one shimmers with the live energy of the band its
+        // syllable lived in — speaking in a star's register relights it,
+        // instead of every star twinkling on a uniform clock.
         for star in stars {
-            let twinkle = 0.75 + 0.25 * sin(t * 5 + star.twinkle)
+            let energy = star.band < spectrum.count ? spectrum[star.band] : 0
+            let twinkle = 0.68 + 0.32 * min(1, energy)
             let R = (1 + star.brightness * 2.2) * twinkle
             hudRadialGlow(ctx, center: CGPoint(x: star.x, y: star.y), radius: R * 3, stops: [
                 (0.0, HudColor("#FFEFC4").cg(0.9 * twinkle)),
@@ -828,6 +915,7 @@ final class LoomRenderer: HudRenderer {
     private var picks: [Pick] = []
     private var accumulator: CGFloat = 0
     private var smoothed: CGFloat = 0
+    private var voice = VoiceFeatures()
     private let threads = ["#E85D4A", "#F2B94B", "#3FBF8F", "#4C6EE6"].map { HudColor($0) }
     private let linen = HudColor("#E8DFC8")
 
@@ -835,18 +923,21 @@ final class LoomRenderer: HudRenderer {
         picks = []
         accumulator = 0
         smoothed = 0
+        voice.reset()
     }
 
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
                 level: CGFloat, spectrum: [CGFloat]) {
         smoothed += (level - smoothed) * 0.35
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
         let pickWidth: CGFloat = 5
         accumulator += dt * 60
         if accumulator >= 2 {
             accumulator -= 2
-            let c = hudCentroid(spectrum)
-            let jitter = CGFloat.random(in: -0.35...0.35)
-            let colorIndex = max(0, min(3, Int(c * 4 + jitter)))
+            // Thread color is the voice's register: centroid picks the shade,
+            // sibilant high-band energy pushes it a step brighter — no dice.
+            let c = voice.centroid + min(0.24, voice.high * 0.12)
+            let colorIndex = max(0, min(3, Int(c * 4)))
             picks.insert(Pick(
                 rows: smoothed < 0.05 ? 1 : 1 + Int((smoothed * 9).rounded()),
                 colorIndex: colorIndex,
@@ -907,30 +998,44 @@ final class VaporRenderer: HudRenderer {
     }
     private var puffs: [Puff] = []
     private var smoothed: CGFloat = 0
+    private var emitCarry: CGFloat = 0
+    private var voice = VoiceFeatures()
     private let mint = HudColor("#A8F0DC")
     private let lavender = HudColor("#C9B8FF")
 
     func reset() {
         puffs = []
         smoothed = 0
+        emitCarry = 0
+        voice.reset()
     }
 
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
                 level: CGFloat, spectrum: [CGFloat]) {
         smoothed += (level - smoothed) * 0.25
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
         let ex = bounds.width - 56
         let ey = bounds.height * 0.56
+        // Breath is continuous, so the plume rides the level; each syllable
+        // onset exhales a cluster sized and paced by how hard it hit (a soft
+        // onset drifts out a small slow puff, a sharp one blows a big quick
+        // one), and idle is a steady faint wisp (constant rate — texture, not
+        // fake speech). Pitch is a light accent on puff size/speed; the
+        // scatter is spray around the voice-driven mouth point.
         let idle = level < 0.05
-        let births = idle
-            ? (CGFloat.random(in: 0...1) < 0.035 ? 1 : 0)
-            : Int((smoothed * 7 * dt * 60).rounded())
+        emitCarry += (idle ? 1.0 : smoothed * 7 * 60) * dt
+        var births = Int(emitCarry)
+        emitCarry -= CGFloat(births)
+        if voice.onset { births += 2 + Int(voice.onsetStrength * 6) }
+        let kick = voice.onset ? 0.75 + voice.onsetStrength * 0.7 : 1
+        let pitch = voice.centroid
         for _ in 0..<births where puffs.count < 140 {
             puffs.append(Puff(
                 x: ex + CGFloat.random(in: -4...4),
                 y: ey + CGFloat.random(in: -5...5),
-                vx: -(16 + CGFloat.random(in: 0...74) * (0.3 + smoothed)),
+                vx: -(16 + CGFloat.random(in: 0...74) * (0.3 + smoothed)) * (0.9 + 0.2 * pitch) * kick,
                 vy: -(2 + CGFloat.random(in: 0...9)),
-                radius: 3 + CGFloat.random(in: 0...4),
+                radius: (3 + CGFloat.random(in: 0...4)) * (1.15 - 0.3 * pitch) * kick,
                 life: 1.6 + CGFloat.random(in: 0...1.5),
                 age: 0,
                 seed: CGFloat.random(in: 0...7)
@@ -973,16 +1078,14 @@ final class VaporRenderer: HudRenderer {
 
 final class SonarRenderer: HudRenderer {
     private struct Ring {
-        var x, y, radius, alpha, growth: CGFloat
+        var x, y, radius, alpha, growth, decay, width: CGFloat
     }
     private var rings: [Ring] = []
-    private var previousLevel: CGFloat = 0
-    private var lastPing: CGFloat = -9
+    private var voice = VoiceFeatures()
 
     func reset() {
         rings = []
-        previousLevel = 0
-        lastPing = -9
+        voice.reset()
     }
 
     private func strokeArc(_ ctx: CGContext, center: CGPoint, radius: CGFloat,
@@ -1000,16 +1103,22 @@ final class SonarRenderer: HudRenderer {
                 level: CGFloat, spectrum: [CGFloat]) {
         let ex = bounds.width - 42
         let ey = bounds.height / 2
-        let onset = level > 0.32 && previousLevel <= 0.32 && t - lastPing > 0.13
-        let idlePing = level < 0.1 && t - lastPing > 2.6
-        previousLevel = level
-        if onset || idlePing {
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        if voice.onset {
+            // The ping is the syllable's attack: a soft onset spawns a small
+            // ring that radiates slowly and dies close to the emitter; a hard
+            // one a big ring that races the width of the panel. Loudness sets
+            // brightness; pitch only accents the stroke (lower voice, heavier
+            // ring). No timed idle ping — the emitter dot alone marks
+            // silence, so every ring on screen was a syllable.
+            let s = voice.onsetStrength
             rings.append(Ring(
                 x: ex, y: ey, radius: 3,
-                alpha: idlePing ? 0.3 : min(1, 0.35 + level * 0.85),
-                growth: 55 + level * 95
+                alpha: min(1, 0.30 + level * 0.9),
+                growth: 36 + s * 80,
+                decay: 0.05 + s * 0.24, // per-second alpha retention
+                width: 0.9 + s * 1.3 + (1 - voice.centroid) * 0.4
             ))
-            lastPing = t
         }
 
         // Marine snow.
@@ -1028,14 +1137,14 @@ final class SonarRenderer: HudRenderer {
         for var ring in rings {
             ring.radius += ring.growth * dt
             ring.x -= 46 * dt
-            ring.alpha *= pow(0.42, dt)
+            ring.alpha *= pow(ring.decay, dt)
             if ring.alpha < 0.02 || ring.x + ring.radius < 0 { continue }
             ctx.setStrokeColor(HudColor("#45E8D0").cg(ring.alpha))
-            ctx.setLineWidth(1.6)
+            ctx.setLineWidth(ring.width)
             strokeArc(ctx, center: CGPoint(x: ring.x, y: ring.y), radius: ring.radius,
                       from: .pi * 0.62, to: .pi * 1.38)
             ctx.setStrokeColor(HudColor("#7FF2A9").cg(ring.alpha * 0.4))
-            ctx.setLineWidth(0.9)
+            ctx.setLineWidth(ring.width * 0.55)
             strokeArc(ctx, center: CGPoint(x: ring.x, y: ring.y), radius: ring.radius * 0.82,
                       from: .pi * 0.7, to: .pi * 1.3)
             alive.append(ring)
@@ -1064,6 +1173,9 @@ final class ShorthandRenderer: HudRenderer {
     private var points: [Point] = []
     private var theta: CGFloat = 0
     private var smoothed: CGFloat = 0
+    private var pitch: CGFloat = 0.5
+    private var loopKick: CGFloat = 0
+    private var voice = VoiceFeatures()
     private let faded = HudColor("#4A4E86")
     private let mid = HudColor("#7B8AF5")
     private let fresh = HudColor("#6BE8F0")
@@ -1072,6 +1184,9 @@ final class ShorthandRenderer: HudRenderer {
         points = []
         theta = 0
         smoothed = 0
+        pitch = 0.5
+        loopKick = 0
+        voice.reset()
     }
 
     private func inkColor(at u: CGFloat) -> HudColor {
@@ -1084,17 +1199,25 @@ final class ShorthandRenderer: HudRenderer {
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
                 level: CGFloat, spectrum: [CGFloat]) {
         smoothed += (level - smoothed) * (level > smoothed ? 0.5 : 0.12)
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        pitch += (voice.centroid - pitch) * 0.2
+        // Each syllable whips the pen through an extra loop — the harder the
+        // onset, the bigger and quicker the curl. The voice's register only
+        // sets the hand: high voices write tight curls with a light nib, low
+        // voices carve lazy loops in heavy ink.
+        if voice.onset { loopKick = 0.3 + voice.onsetStrength * 0.7 }
+        loopKick *= pow(0.03, dt)
         let speed: CGFloat = 46
         let penX = bounds.width - 40
         let midY = bounds.height / 2
         for i in points.indices { points[i].x -= speed * dt }
         let wander = sin(t * 0.8) * 6 + sin(t * 1.9) * 3.5
-        theta += dt * (4 + 44 * smoothed)
-        let loopR = smoothed * bounds.height * 0.30
+        theta += dt * (4 + smoothed * (16 + 64 * pitch) + loopKick * 40)
+        let loopR = smoothed * bounds.height * (0.42 - 0.22 * pitch) * (1 + loopKick * 0.4)
         points.insert(Point(
             x: penX + cos(theta) * loopR * 0.75,
             y: midY + wander + sin(theta) * loopR,
-            width: 1 + smoothed * 2.8
+            width: 1 + smoothed * (1.4 + 2.6 * (1 - pitch))
         ), at: 0)
         while points.count > 540 || (points.last.map { $0.x < 14 } ?? false) {
             points.removeLast()
@@ -1214,10 +1337,14 @@ final class MurmurationRenderer: HudRenderer {
     }
     private var birds: [Bird] = []
     private var smoothed: CGFloat = 0
+    private var pitch: CGFloat = 0.5
+    private var voice = VoiceFeatures()
 
     func reset() {
         birds = []
         smoothed = 0
+        pitch = 0.5
+        voice.reset()
     }
 
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
@@ -1234,13 +1361,19 @@ final class MurmurationRenderer: HudRenderer {
             }
         }
         smoothed += (level - smoothed) * 0.22
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        pitch += (voice.centroid - pitch) * 0.12
 
         var cx: CGFloat = 0, cy: CGFloat = 0, avx: CGFloat = 0, avy: CGFloat = 0
         for b in birds { cx += b.x; cy += b.y; avx += b.vx; avy += b.vy }
         let n = CGFloat(birds.count)
         cx /= n; cy /= n; avx /= n; avy /= n
 
-        let ty = bounds.height * 0.5 + sin(t * 0.7) * bounds.height * 0.16 + sin(t * 1.7) * bounds.height * 0.05
+        // Idle: lazy sinusoidal cruising. Speaking: the flock's altitude
+        // tracks the voice's pitch — high registers lift it, low ones sink it.
+        let idleY = bounds.height * 0.5 + sin(t * 0.7) * bounds.height * 0.16 + sin(t * 1.7) * bounds.height * 0.05
+        let voiceY = bounds.height * (0.78 - pitch * 0.56)
+        let ty = idleY + (voiceY - idleY) * min(1, smoothed * 2.2)
         let cruise = 26 + smoothed * 150
         let sepR2 = pow(4 + smoothed * 13, 2)
 
@@ -1309,8 +1442,9 @@ final class FilamentRenderer: HudRenderer {
     }
     private var branches: [Branch] = []
     private var pulses: [Pulse] = []
-    private var previousLevel: CGFloat = 0
+    private var branchSide: CGFloat = 1
     private var smoothed: CGFloat = 0
+    private var voice = VoiceFeatures()
 
     init() {
         offsets = [CGFloat](repeating: 0, count: segments + 1)
@@ -1320,8 +1454,9 @@ final class FilamentRenderer: HudRenderer {
         offsets = [CGFloat](repeating: 0, count: segments + 1)
         branches = []
         pulses = []
-        previousLevel = 0
+        branchSide = 1
         smoothed = 0
+        voice.reset()
     }
 
     private func displace(amplitude: CGFloat) -> [CGFloat] {
@@ -1343,7 +1478,11 @@ final class FilamentRenderer: HudRenderer {
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
                 level: CGFloat, spectrum: [CGFloat]) {
         smoothed += (level - smoothed) * (level > smoothed ? 0.6 : 0.15)
-        let target = displace(amplitude: 2 + smoothed * 15)
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        // Arc jaggedness is voice energy: overall level plus an extra bite
+        // from sibilant high-band hiss. (The midpoint displacement inside
+        // stays random — that's the arc's texture, its amplitude is not.)
+        let target = displace(amplitude: 2 + smoothed * 11 + min(1, voice.high * 0.4) * 5)
         for i in 0...segments {
             offsets[i] = offsets[i] * 0.45 + target[i] * 0.55
         }
@@ -1354,15 +1493,21 @@ final class FilamentRenderer: HudRenderer {
             CGPoint(x: x0 + (x1 - x0) * CGFloat(k) / CGFloat(segments), y: midY + offsets[k])
         }
 
-        let onset = level > 0.5 && previousLevel <= 0.5
-        previousLevel = level
-        if onset {
-            pulses.append(Pulse(u: 1, speed: 0.9 + level * 1.1))
-            branches.append(Branch(
-                index: 8 + Int.random(in: 0..<(segments - 16)),
-                dy: (Bool.random() ? -1 : 1) * CGFloat.random(in: 6...15),
-                life: 0.14, age: 0
-            ))
+        if voice.onset {
+            // A soft syllable sends a slow pulse down the arc; a hard one a
+            // fast pulse that also forks — the branch peels off at the arc
+            // position matching the syllable's pitch, sized by the hit,
+            // alternating sides so consecutive forks don't overlap.
+            let s = voice.onsetStrength
+            pulses.append(Pulse(u: 1, speed: 0.7 + s * 1.5))
+            if s > 0.35 {
+                branchSide = -branchSide
+                branches.append(Branch(
+                    index: 8 + Int(voice.centroid * CGFloat(segments - 16)),
+                    dy: branchSide * (5 + s * 11),
+                    life: 0.14, age: 0
+                ))
+            }
         }
 
         func traceArc() {
@@ -1430,24 +1575,24 @@ final class FilamentRenderer: HudRenderer {
 
 final class BloomRenderer: HudRenderer {
     private struct Sprout {
-        var x, y, size, born: CGFloat
+        var x, y, size, born, grow: CGFloat // grow = seconds to unfurl
         var side: CGFloat
         var flower: Bool
         var color: HudColor
     }
     private var stem: [CGPoint] = []
     private var sprouts: [Sprout] = []
-    private var previousLevel: CGFloat = 0
     private var side: CGFloat = 1
     private var smoothed: CGFloat = 0
+    private var voice = VoiceFeatures()
     private let petals = ["#FF8A7A", "#FFB3C7", "#C89BF2"].map { HudColor($0) }
 
     func reset() {
         stem = []
         sprouts = []
-        previousLevel = 0
         side = 1
         smoothed = 0
+        voice.reset()
     }
 
     private func easeOutBack(_ x: CGFloat) -> CGFloat {
@@ -1471,18 +1616,20 @@ final class BloomRenderer: HudRenderer {
         stem.insert(CGPoint(x: penX, y: tipY), at: 0)
         if stem.count > 560 { stem.removeLast() }
 
-        let onset = level > 0.35 && previousLevel <= 0.35
-        previousLevel = level
-        if onset {
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        if voice.onset {
             side = -side
-            let c = hudCentroid(spectrum)
+            // A soft syllable buds a small leaf that unfurls lazily; a hard
+            // one springs open a big sprout. Pitch just picks the petal shade.
+            let s = voice.onsetStrength
             sprouts.append(Sprout(
                 x: penX, y: tipY,
-                size: min(1, level * 1.2),
+                size: 0.25 + 0.75 * s,
                 born: t,
+                grow: 0.62 - 0.34 * s,
                 side: side,
                 flower: level > 0.62,
-                color: petals[max(0, min(2, Int(c * 3)))]
+                color: petals[max(0, min(2, Int(voice.centroid * 3)))]
             ))
         }
 
@@ -1506,7 +1653,7 @@ final class BloomRenderer: HudRenderer {
 
         // Leaves and blossoms.
         for sprout in sprouts {
-            let k = easeOutBack(min(1, (t - sprout.born) / 0.45))
+            let k = easeOutBack(min(1, (t - sprout.born) / sprout.grow))
             let alpha = max(0, min(1, (sprout.x - 18) / 30))
             let sy = sprout.y + sway(sprout.x)
             ctx.saveGState()
@@ -1562,13 +1709,13 @@ final class PianolaRenderer: HudRenderer {
     }
     private var holes: [Hole] = []
     private var active: Hole?
-    private var previousLevel: CGFloat = 0
+    private var voice = VoiceFeatures()
     private let lanes = 6
 
     func reset() {
         holes = []
         active = nil
-        previousLevel = 0
+        voice.reset()
     }
 
     func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
@@ -1577,20 +1724,24 @@ final class PianolaRenderer: HudRenderer {
         let pad: CGFloat = 9
         let punchX = bounds.width - 34
 
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
         for hole in holes { hole.x -= speed * dt }
         holes.removeAll { $0.x + $0.length < pad + 3 }
         if let hole = active {
             hole.length += speed * dt
             if level < 0.24 { active = nil }
         }
-        if active == nil && level >= 0.32 && previousLevel < 0.32 {
-            let c = hudCentroid(spectrum)
-            let lane = max(0, min(lanes - 1, Int((c * CGFloat(lanes - 1)).rounded())))
-            let hole = Hole(x: punchX, length: 3, lane: lane, width: 3 + level * 3.6)
+        // Every syllable punches a fresh slot on the lane matching its pitch —
+        // even mid-phrase, so fast speech reads as separate notes; sustained
+        // sound keeps extending the current slot. The hit's strength sets the
+        // punch width: soft syllables cut narrow slots, hard ones wide.
+        if voice.onset {
+            let lane = max(0, min(lanes - 1, Int((voice.centroid * CGFloat(lanes - 1)).rounded())))
+            let hole = Hole(x: punchX, length: 3, lane: lane,
+                            width: 3 + voice.onsetStrength * 3.8)
             holes.append(hole)
             active = hole
         }
-        previousLevel = level
 
         // Paper roll.
         let tape = CGPath(roundedRect: CGRect(x: pad, y: pad, width: bounds.width - pad * 2, height: bounds.height - pad * 2),
