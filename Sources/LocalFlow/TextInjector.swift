@@ -8,6 +8,7 @@ import Carbon.HIToolbox
 /// synthesized unicode keystrokes when Secure Input is active (password
 /// fields block synthesized paste but sometimes accept typed events — and
 /// we must never leave dictated text on the clipboard in that case).
+@MainActor
 enum TextInjector {
     // All mutated on the main thread only (inject is called from the app's
     // main-actor pipeline). Tracks one save/restore cycle across possibly
@@ -16,6 +17,7 @@ enum TextInjector {
     private static var restoreWork: DispatchWorkItem?
     private static var pendingCompletion: ((Bool) -> Void)?
     private static var ourChangeCount = -1
+    private static var restoreGeneration = 0
 
     /// `completion` (main queue) reports whether the paste is believed to
     /// have landed: true when the restore window resolved with our text
@@ -40,6 +42,8 @@ enum TextInjector {
         // the FIRST of the sequence — snapshotting now would capture the
         // previous dictation as "the user's clipboard" and lose the real one.
         restoreWork?.cancel()
+        restoreWork = nil
+        restoreGeneration &+= 1
         // A superseded injection never reaches its restore work — resolve it
         // now with the same signal the work item would have used.
         if let pending = pendingCompletion {
@@ -68,7 +72,9 @@ enum TextInjector {
         // Give the frontmost app time to service the paste before restoring —
         // slow apps can take well over a second, and restoring too early
         // pastes the user's old clipboard instead of the dictation.
+        let generation = restoreGeneration
         let work = DispatchWorkItem {
+            guard generation == restoreGeneration else { return }
             restoreWork = nil
             let saved = savedItems
             savedItems = nil
@@ -125,27 +131,46 @@ enum TextInjector {
     /// strings on a single event get truncated by some apps).
     /// `completion` runs on the main queue once every chunk has been posted.
     private static func typeString(_ text: String, completion: ((Bool) -> Void)? = nil) {
-        let characters = Array(text.utf16)
+        let chunks = utf16Chunks(text)
         typingQueue.async {
             let source = CGEventSource(stateID: .combinedSessionState)
-            let chunkSize = 20
+            var allPosted = true
 
-            var index = 0
-            while index < characters.count {
-                let chunk = Array(characters[index ..< min(index + chunkSize, characters.count)])
+            for (index, chunk) in chunks.enumerated() {
                 if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
                    let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
                     down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
                     up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
                     down.post(tap: .cghidEventTap)
                     up.post(tap: .cghidEventTap)
+                } else {
+                    allPosted = false
                 }
-                index += chunkSize
-                usleep(8_000)
+                if index < chunks.count - 1 { usleep(8_000) }
             }
             if let completion {
-                DispatchQueue.main.async { completion(true) }
+                DispatchQueue.main.async { completion(allPosted) }
             }
         }
+    }
+
+    /// Splits UTF-16 at scalar boundaries. A fixed-width split can put the
+    /// halves of an emoji's surrogate pair on separate CGEvents and corrupt it.
+    static func utf16Chunks(_ text: String, maxUnits: Int = 20) -> [[UInt16]] {
+        precondition(maxUnits >= 2)
+        let units = Array(text.utf16)
+        var chunks: [[UInt16]] = []
+        var start = 0
+        while start < units.count {
+            var end = min(start + maxUnits, units.count)
+            if end < units.count,
+               (0xD800 ... 0xDBFF).contains(units[end - 1]),
+               (0xDC00 ... 0xDFFF).contains(units[end]) {
+                end -= 1
+            }
+            chunks.append(Array(units[start ..< end]))
+            start = end
+        }
+        return chunks
     }
 }

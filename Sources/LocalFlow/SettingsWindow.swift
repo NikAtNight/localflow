@@ -91,6 +91,7 @@ final class SettingsModel: ObservableObject {
                 Settings.loginItemSetupDone = true
             } catch {
                 DiagLog.log("login item toggle failed: %@", error.localizedDescription)
+                setStartAtLoginWithoutRegistering(loginAgent.status == .enabled)
             }
         }
     }
@@ -102,8 +103,12 @@ final class SettingsModel: ObservableObject {
 
     init() {
         // Seed from current status without re-registering the agent on every launch.
+        setStartAtLoginWithoutRegistering(loginAgent.status == .enabled)
+    }
+
+    private func setStartAtLoginWithoutRegistering(_ enabled: Bool) {
         suppressLoginSideEffect = true
-        startAtLogin = loginAgent.status == .enabled
+        startAtLogin = enabled
         suppressLoginSideEffect = false
     }
 
@@ -116,7 +121,7 @@ final class SettingsModel: ObservableObject {
         }
         // Reflect changes made elsewhere (first-run auto-registration, etc.).
         let enabled = loginAgent.status == .enabled
-        if startAtLogin != enabled { startAtLogin = enabled }
+        if startAtLogin != enabled { setStartAtLoginWithoutRegistering(enabled) }
     }
 }
 
@@ -340,9 +345,11 @@ final class PreviewHudView: NSView {
     private func startAnimating() {
         guard timer == nil else { return }
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.time += 1.0 / 30.0
-            self.needsDisplay = true
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.time += 1.0 / 30.0
+                self.needsDisplay = true
+            }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer

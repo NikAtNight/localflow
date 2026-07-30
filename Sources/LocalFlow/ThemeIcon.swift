@@ -6,18 +6,20 @@ import AppKit
 /// with that theme's palette. (Baking a literal frame of the HUD renderer
 /// was tried first and read as mud at icon sizes.)
 ///
-/// Applied two ways, because macOS reads icons from two places:
-/// - `NSWorkspace.setIcon` (a Finder xattr) — instant, covers Finder and Dock;
-/// - the bundle's own AppIcon.icns — what Launchpad and the Applications
-///   browser actually read. Rewriting it breaks the code seal, so the bundle
-///   is re-signed with the same identity scheme as make-app.sh; a marker file
-///   tracks which theme the baked icon belongs to (reinstalls reset it).
+/// The running process gets the new image immediately, while Finder and
+/// Launchpad read the bundle's AppIcon.icns. Rewriting it breaks the code seal,
+/// so the bundle is re-signed with the same identity scheme as make-app.sh; a
+/// marker file tracks which theme the baked icon belongs to (reinstalls reset
+/// it). Avoid NSWorkspace's custom-icon API here: its Finder xattrs make strict
+/// code-sign validation fail even after the bundle is re-signed.
 enum ThemeIcon {
     // Serial so rapid theme changes never run two `codesign --force` passes on
     // our own bundle at once (a torn signature drops the app's TCC grants).
     private static let queue = DispatchQueue(label: "app.talix.localflow.themeicon")
     private static let pendingLock = NSLock()
-    private static var pendingTheme: HudTheme?
+    // Every access is protected by pendingLock. Swift cannot infer lock-based
+    // isolation, so make that synchronization contract explicit.
+    nonisolated(unsafe) private static var pendingTheme: HudTheme?
 
     /// Fire-and-forget: generation runs off the main thread, application on it.
     /// Jobs coalesce — only the latest requested theme is applied; stale ones skip.
@@ -31,13 +33,14 @@ enum ThemeIcon {
             let latest = pendingTheme
             pendingLock.unlock()
             guard latest == theme else { return } // superseded by a newer request
+            // The bundle already supplies the right icon on normal launches.
+            // Rendering a 1024 px replacement is only needed after a theme
+            // change (or under `swift run`, where there is no app bundle).
+            if bundledThemeMatches(theme) { return }
             guard let cgImage = compose(theme) else { return }
             let icon = NSImage(cgImage: cgImage, size: NSSize(width: 512, height: 512))
             DispatchQueue.main.async {
                 NSApp.applicationIconImage = icon
-                let bundlePath = Bundle.main.bundlePath
-                guard bundlePath.hasSuffix(".app") else { return } // swift run / tests
-                NSWorkspace.shared.setIcon(icon, forFile: bundlePath, options: [])
             }
             syncBundleIcon(theme, cgImage)
         }
@@ -48,14 +51,26 @@ enum ThemeIcon {
     private static let lsregister =
         "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
+    private static func bundledThemeMatches(_ theme: HudTheme) -> Bool {
+        let bundlePath = Bundle.main.bundlePath
+        guard bundlePath.hasSuffix(".app") else { return false }
+        return bakedTheme(in: bundlePath) == theme.rawValue
+    }
+
+    private static func bakedTheme(in bundlePath: String) -> String {
+        let markerPath = bundlePath + "/Contents/Resources/ThemeIcon.marker"
+        let baked = (try? String(contentsOfFile: markerPath, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? HudTheme.classic.rawValue
+        return baked
+    }
+
     private static func syncBundleIcon(_ theme: HudTheme, _ image: CGImage) {
         let bundlePath = Bundle.main.bundlePath
         guard bundlePath.hasSuffix(".app") else { return }
         let resources = bundlePath + "/Contents/Resources"
         let markerPath = resources + "/ThemeIcon.marker"
         // A fresh install ships the classic icon and no marker.
-        let baked = (try? String(contentsOfFile: markerPath, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? HudTheme.classic.rawValue
+        let baked = bakedTheme(in: bundlePath)
         guard baked != theme.rawValue else { return }
         guard FileManager.default.isWritableFile(atPath: resources) else {
             DiagLog.log("bundle not writable — Launchpad icon left as-is")

@@ -5,6 +5,7 @@ import AppKit
 /// wants it (the spot persists across launches). The visual itself is
 /// whichever HudTheme the user picked — a frosted capsule for most themes,
 /// borderless for the ones that draw straight over the desktop.
+@MainActor
 final class WaveformOverlay {
     private let panel: NSPanel
     private var hudView: HudView
@@ -15,6 +16,13 @@ final class WaveformOverlay {
     // only drags may persist the origin.
     private var programmaticMove = false
     private var moveObserver: NSObjectProtocol?
+    // Audio buffers can arrive much faster than the HUD's 30 fps refresh.
+    // Coalesce their peaks so the capture queue never floods the main queue
+    // with redundant view updates.
+    nonisolated private let inputLock = NSLock()
+    nonisolated(unsafe) private var pendingLevel: Float?
+    nonisolated(unsafe) private var pendingSpectrum: [Float]?
+    nonisolated(unsafe) private var inputDrainScheduled = false
 
     init() {
         theme = HudTheme.current
@@ -42,8 +50,10 @@ final class WaveformOverlay {
         moveObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didMoveNotification, object: panel, queue: .main
         ) { [weak self] _ in
-            guard let self, !self.programmaticMove, self.panel.isVisible else { return }
-            Settings.hudOrigin = self.panel.frame.origin
+            MainActor.assumeIsolated {
+                guard let self, !self.programmaticMove, self.panel.isVisible else { return }
+                Settings.hudOrigin = self.panel.frame.origin
+            }
         }
     }
 
@@ -80,17 +90,52 @@ final class WaveformOverlay {
     }
 
     /// Thread-safe: callable from the audio capture thread.
-    func push(level: Float) {
-        DispatchQueue.main.async { [weak self] in
-            self?.hudView.ingest(level: level)
+    nonisolated func push(level: Float) {
+        inputLock.lock()
+        pendingLevel = max(pendingLevel ?? level, level)
+        let shouldSchedule = !inputDrainScheduled
+        inputDrainScheduled = true
+        inputLock.unlock()
+
+        if shouldSchedule {
+            DispatchQueue.main.async { [weak self] in self?.drainInput() }
         }
     }
 
     /// Thread-safe: callable from the audio capture thread.
-    func push(spectrum: [Float]) {
-        DispatchQueue.main.async { [weak self] in
-            self?.hudView.ingest(spectrum: spectrum)
+    nonisolated func push(spectrum: [Float]) {
+        inputLock.lock()
+        if var pendingSpectrum {
+            if pendingSpectrum.count < spectrum.count {
+                pendingSpectrum.append(contentsOf: spectrum[pendingSpectrum.count...])
+            }
+            for i in 0..<min(pendingSpectrum.count, spectrum.count) {
+                pendingSpectrum[i] = max(pendingSpectrum[i], spectrum[i])
+            }
+            self.pendingSpectrum = pendingSpectrum
+        } else {
+            pendingSpectrum = spectrum
         }
+        let shouldSchedule = !inputDrainScheduled
+        inputDrainScheduled = true
+        inputLock.unlock()
+
+        if shouldSchedule {
+            DispatchQueue.main.async { [weak self] in self?.drainInput() }
+        }
+    }
+
+    private func drainInput() {
+        inputLock.lock()
+        let level = pendingLevel
+        let spectrum = pendingSpectrum
+        pendingLevel = nil
+        pendingSpectrum = nil
+        inputDrainScheduled = false
+        inputLock.unlock()
+
+        if let level { hudView.ingest(level: level) }
+        if let spectrum { hudView.ingest(spectrum: spectrum) }
     }
 
     /// Hotkey pressed: the mic engine is starting but no audio has arrived
@@ -121,9 +166,11 @@ final class WaveformOverlay {
             context.duration = 0.25
             panel.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            // Skip the orderOut if show() ran again during the fade.
-            guard let self, self.hideGeneration == generation else { return }
-            self.panel.orderOut(nil)
+            MainActor.assumeIsolated {
+                // Skip the orderOut if show() ran again during the fade.
+                guard let self, self.hideGeneration == generation else { return }
+                self.panel.orderOut(nil)
+            }
         })
     }
 
@@ -162,7 +209,11 @@ final class WaveformOverlay {
     /// Whether a panel of `size` at `origin` still lands on any connected
     /// screen — a position saved on a since-removed display must not leave
     /// the HUD invisible and undraggable.
-    static func isVisible(origin: NSPoint, size: NSSize, on screenFrames: [NSRect]) -> Bool {
+    nonisolated static func isVisible(
+        origin: NSPoint,
+        size: NSSize,
+        on screenFrames: [NSRect]
+    ) -> Bool {
         let rect = NSRect(origin: origin, size: size)
         return screenFrames.contains { $0.intersects(rect) }
     }
@@ -176,16 +227,18 @@ final class WaveformOverlay {
         present(phase: .live)
         let start = Date()
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            let t = Date().timeIntervalSince(start)
-            if t > 3.6 {
-                self.cancelPreview()
-                self.hide()
-                return
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let t = Date().timeIntervalSince(start)
+                if t > 3.6 {
+                    self.cancelPreview()
+                    self.hide()
+                    return
+                }
+                let level = SyntheticSpeech.level(at: t)
+                self.hudView.ingest(level: level)
+                self.hudView.ingest(spectrum: SyntheticSpeech.spectrum(at: t, level: level))
             }
-            let level = SyntheticSpeech.level(at: t)
-            self.hudView.ingest(level: level)
-            self.hudView.ingest(spectrum: SyntheticSpeech.spectrum(at: t, level: level))
         }
         RunLoop.main.add(timer, forMode: .common)
         previewTimer = timer
@@ -275,7 +328,7 @@ private final class HudView: NSView {
     func startAnimating() {
         stopAnimating()
         let timer = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            self?.tick()
+            MainActor.assumeIsolated { self?.tick() }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer

@@ -1,3 +1,4 @@
+import CoreGraphics
 import XCTest
 @testable import LocalFlow
 
@@ -24,6 +25,35 @@ final class HotkeyManagerTests: XCTestCase {
     func testLabelsAreNonEmpty() {
         for key in HotkeyManager.Key.allCases {
             XCTAssertFalse(key.label.isEmpty)
+        }
+    }
+
+    func testDeviceSpecificFlagMeansPressed() {
+        for key in HotkeyManager.Key.allCases {
+            XCTAssertTrue(HotkeyManager.pressedState(
+                flags: key.deviceMask.union(key.genericMask), key: key, wasDown: false
+            ))
+            XCTAssertTrue(HotkeyManager.pressedState(
+                flags: key.deviceMask.union(key.genericMask), key: key, wasDown: true
+            ))
+        }
+    }
+
+    func testMissingGenericFlagMeansReleased() {
+        for key in HotkeyManager.Key.allCases {
+            XCTAssertFalse(HotkeyManager.pressedState(flags: [], key: key, wasDown: false))
+            XCTAssertFalse(HotkeyManager.pressedState(flags: [], key: key, wasDown: true))
+        }
+    }
+
+    func testGenericOnlyModifierAlternatesForRemappedKeys() {
+        for key in [HotkeyManager.Key.rightOption, .rightCommand] {
+            XCTAssertTrue(HotkeyManager.pressedState(
+                flags: key.genericMask, key: key, wasDown: false
+            ))
+            XCTAssertFalse(HotkeyManager.pressedState(
+                flags: key.genericMask, key: key, wasDown: true
+            ))
         }
     }
 }

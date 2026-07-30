@@ -190,6 +190,9 @@ final class HotkeyManager {
                 self.tapRunLoop = CFRunLoopGetCurrent()
                 self.threadTap = tap
                 self.tapKey = self._key // _key can't change until start() returns
+                // Own the initial hold state instead of relying on a previous
+                // tap's teardown having completed within its bounded wait.
+                self.isDown = false
             }
             CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
@@ -291,18 +294,36 @@ final class HotkeyManager {
         }
         tapRunLoop = nil
         // Tear down on the tap run loop so the callback never races the
-        // resets; the last block parks the thread's run loop.
+        // resets. Normally invalidation completes before start() installs a
+        // replacement. The identity guard also makes a late teardown safe if
+        // the old run loop is wedged long enough for the bounded wait to end.
+        let stopped = DispatchSemaphore(value: 0)
         CFRunLoopPerformBlock(runLoop, CFRunLoopMode.commonModes.rawValue) { [weak self] in
-            self?.isDown = false
-            self?.threadTap = nil
+            if let self, let tap, self.threadTap === tap {
+                self.isDown = false
+                self.threadTap = nil
+            }
             if let tap {
                 CGEvent.tapEnable(tap: tap, enable: false)
                 // Invalidating the port also invalidates its run loop source.
                 CFMachPortInvalidate(tap)
             }
             CFRunLoopStop(CFRunLoopGetCurrent())
+            stopped.signal()
         }
         CFRunLoopWakeUp(runLoop)
+        if stopped.wait(timeout: .now() + 1) == .timedOut {
+            DiagLog.log("timed out waiting for old event tap teardown")
+        }
+    }
+
+    /// Resolves the physical-key flags into a hold state. Device-specific
+    /// bits win when available; the alternating fallback supports external
+    /// keyboards and remappers that only report the generic modifier bit.
+    static func pressedState(flags: CGEventFlags, key: Key, wasDown: Bool) -> Bool {
+        if flags.contains(key.deviceMask) { return true }
+        if !flags.contains(key.genericMask) { return false }
+        return !wasDown
     }
 
     /// Returns true when the event was LocalFlow's own health probe, so the
@@ -310,8 +331,10 @@ final class HotkeyManager {
     private func handle(type: CGEventType, event: CGEvent) -> Bool {
         // macOS disables taps that stall; re-enable and carry on.
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            DiagLog.log("event tap disabled by system (%d) — re-enabling", type.rawValue)
             if let threadTap { CGEvent.tapEnable(tap: threadTap, enable: true) }
+            DispatchQueue.main.async {
+                DiagLog.log("event tap disabled by system (%d) — re-enabling", type.rawValue)
+            }
             return false
         }
         if event.getIntegerValueField(.eventSourceUserData) == Self.probeMagic {
@@ -323,29 +346,20 @@ final class HotkeyManager {
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         guard keyCode == tapKey.keyCode else { return false }
 
-        // Only fires for the push-to-talk key itself — a few lines per
-        // dictation, and the exact evidence needed when detection misfires.
-        DiagLog.log("hotkey flagsChanged keycode=%d flags=0x%llx isDown=%d",
-              keyCode, event.flags.rawValue, isDown ? 1 : 0)
-
-        let pressed: Bool
-        if event.flags.contains(tapKey.deviceMask) {
-            pressed = true
-        } else if !event.flags.contains(tapKey.genericMask) {
-            pressed = false
-        } else {
-            // Generic mask set but no device bit: a release while the twin
-            // key is held, or an input path that never reports device bits
-            // (some external keyboards / remappers). Either way, an event
-            // for OUR keycode while down can only be a release, and while
-            // up can only be a press.
-            pressed = !isDown
-        }
-        guard pressed != isDown else { return false }
+        let wasDown = isDown
+        let pressed = Self.pressedState(flags: event.flags, key: tapKey, wasDown: wasDown)
+        guard pressed != wasDown else { return false }
         isDown = pressed
 
         let handler = pressed ? onPress : onRelease
-        DispatchQueue.main.async { handler?() }
+        let flags = event.flags.rawValue
+        // NSLog can block. Keep all diagnostics out of the event-tap
+        // callback, and run the latency-sensitive owner action first.
+        DispatchQueue.main.async {
+            handler?()
+            DiagLog.log("hotkey flagsChanged keycode=%d flags=0x%llx isDown=%d",
+                  keyCode, flags, wasDown ? 1 : 0)
+        }
         return false
     }
 }

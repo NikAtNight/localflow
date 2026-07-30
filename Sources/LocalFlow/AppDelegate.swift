@@ -54,7 +54,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     private var hotkeyActive = false
     private var modelLoaded = false
-    private var ollamaReachable = false
     private var lastLatencyMs: Int?
 
     // Recording and transcription are tracked separately from the UI `state`
@@ -65,6 +64,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Lets a stale async start-failure from an abandoned recording be
     // distinguished from the one currently in flight.
     private var recordingGeneration = 0
+    // A start failure can arrive after release already queued stop(). Mark
+    // that generation so its empty result is not misreported as silence.
+    private var failedCaptureStarts: Set<Int> = []
     // Same idea for model loads: switching models twice quickly must not
     // let the slower (older) load win after the newer one finished.
     private var modelLoadGeneration = 0
@@ -79,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestPermissions()
         startHotkey()
         loadModel()
-        probeOllama()
+        if Settings.cleanupEnabled { probeOllama() }
         // Called on the audio thread; overlay.push hops to main internally.
         let overlay = self.overlay
         recorder.onLevel = { level in overlay.push(level: level) }
@@ -125,9 +127,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsModel.onModelChange = { [weak self] in self?.loadModel() }
         settingsModel.onMicChange = { [weak self] uid in
-            self?.recorder.deviceUID = uid
-            // A warm session on the old mic must not answer the next press.
-            self?.recorder.releaseWarmSession()
+            // Release the old warm route and pre-open the new one so its
+            // Bluetooth hands-free transition is paid at selection time,
+            // rather than during the first dictation.
+            self?.recorder.selectDevice(uid)
         }
         settingsModel.onKeepWarmChange = { [weak self] in
             self?.recorder.keepWarm = Settings.keepMicWarm
@@ -320,9 +323,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func probeOllama() {
         Task {
-            ollamaReachable = await OllamaCleaner.isAvailable()
-            settingsModel?.ollamaReachable = ollamaReachable
-            refreshStatusUI()
+            settingsModel?.ollamaReachable = await OllamaCleaner.isAvailable()
         }
     }
 
@@ -332,11 +333,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Gate only on the model and an active recording — never on the UI
         // state. Pressing while a previous dictation is still transcribing
         // (or after a transient mic error) must start a new recording.
-        DiagLog.log("hotkey pressed (modelLoaded=%d recording=%d)", modelLoaded ? 1 : 0, isRecording ? 1 : 0)
         guard modelLoaded, !isRecording else {
             // The model recompiles for minutes after every binary change —
             // a press during that window must never be silently swallowed.
-            if !modelLoaded { playCue("Basso") }
+            if !modelLoaded {
+                DiagLog.log("hotkey press refused: model is not loaded")
+                playCue("Basso")
+            }
             return
         }
         // A denied mic yields an engine that happily records silence —
@@ -354,23 +357,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         isRecording = true
         recordingGeneration += 1
         let generation = recordingGeneration
-        state = .recording
-        overlay.show()
+        // Enqueue hardware startup before doing menu/HUD work on the main
+        // thread. A warm microphone can now begin delivering immediately
+        // while the visual state is updated in parallel.
         recorder.start { [weak self] error in
-            guard let self, generation == self.recordingGeneration else { return }
+            guard let self else { return }
             if let error {
+                // A newer recording owns the UI, but the failed older start
+                // still has a queued stop completion that must be discarded.
+                guard generation == self.recordingGeneration else {
+                    self.failedCaptureStarts.insert(generation)
+                    return
+                }
                 if self.isRecording {
                     self.isRecording = false
-                    self.overlay.hide()
+                    // Release may never call stop now that the active flag is
+                    // clear, so finish recorder-side cleanup here.
+                    self.recorder.stop { _ in }
+                } else {
+                    // Release already queued stop; let that completion close
+                    // the HUD without treating the empty capture as silence.
+                    self.failedCaptureStarts.insert(generation)
                 }
+                self.overlay.hide()
                 self.playCue("Basso")
                 self.state = .failed("Mic error: \(error.localizedDescription)")
                 self.scheduleFailureRecovery()
+                return
             }
+            guard generation == self.recordingGeneration else { return }
             // Success cue is handled by onCaptureLive — the first actual
             // audio buffer — not by engine start, which can precede flowing
             // audio by over a second on Bluetooth mics.
         }
+        state = .recording
+        overlay.show()
         // Backstop against a hold that never ends (stuck key, pocket
         // dictation): cap the recording rather than run an open mic.
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.maxRecordingSeconds) { [weak self] in
@@ -383,18 +404,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let maxRecordingSeconds: TimeInterval = 300
 
     private func hotkeyReleased() {
-        DiagLog.log("hotkey released (recording=%d)", isRecording ? 1 : 0)
+        let releasedAt = Date()
         guard isRecording else { return }
         isRecording = false
         // The HUD stays up as a loading state until this dictation resolves;
         // the generation ties the eventual dismissHud to this dictation so a
         // newer press's HUD is never torn down by a stale completion.
-        overlay.beginProcessing()
         let generation = recordingGeneration
-        let releasedAt = Date()
+        // Queue capture stop before updating the HUD. This timestamp and
+        // ordering include all release-side work in the latency metric and
+        // let sample handoff start as soon as possible.
         recorder.stop { [weak self] samples in
-            self?.process(samples: samples, releasedAt: releasedAt, hudGeneration: generation)
+            guard let self else { return }
+            if self.failedCaptureStarts.remove(generation) != nil {
+                self.dismissHud(generation)
+                return
+            }
+            self.process(samples: samples, releasedAt: releasedAt, hudGeneration: generation)
         }
+        overlay.beginProcessing()
     }
 
     /// Hides the processing HUD for the dictation identified by `generation`
@@ -447,16 +475,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 var text = raw
                 if cleanupWanted {
-                    if await OllamaCleaner.isAvailable() {
-                        ollamaReachable = true
-                        do {
-                            text = try await OllamaCleaner.clean(raw, model: ollamaModel)
-                        } catch {
-                            DiagLog.log("Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
-                        }
-                    } else {
-                        ollamaReachable = false
-                        DiagLog.log("Ollama not reachable — pasting raw transcript")
+                    do {
+                        text = try await OllamaCleaner.clean(raw, model: ollamaModel)
+                        settingsModel?.ollamaReachable = true
+                    } catch {
+                        // A transport error means the server is unavailable;
+                        // HTTP/decoding failures still prove it was reached.
+                        settingsModel?.ollamaReachable = !(error is URLError)
+                        DiagLog.log("Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
                     }
                 }
 
@@ -489,8 +515,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // The metric the plan says to watch: hotkey-release → pasted text.
                 let ms = Int(Date().timeIntervalSince(releasedAt) * 1000)
                 lastLatencyMs = ms
-                DiagLog.log("end-to-end %dms (%.1fs audio, cleanup=%@) — \"%@\"",
-                      ms, duration, cleanupWanted ? "on" : "off", text)
+                DiagLog.log("end-to-end %dms (%.1fs audio, cleanup=%@, outputBytes=%d)",
+                      ms, duration, cleanupWanted ? "on" : "off", text.utf8.count)
                 finishProcessing()
             } catch {
                 processingCount -= 1
@@ -697,7 +723,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
-        probeOllama()
+        if Settings.cleanupEnabled { probeOllama() }
         rebuildRecentDictationsMenu()
         rebuildMicrophoneMenu()
         refreshQuickActionChecks()

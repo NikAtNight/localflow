@@ -30,14 +30,22 @@ final class AudioRecorder {
     /// empty or all-zero buffers. Used to tell silence from speech before
     /// handing audio to Whisper.
     static func rmsDBFS(of samples: [Float]) -> Float {
-        guard !samples.isEmpty else { return -.infinity }
+        samples.withUnsafeBufferPointer { signalMetrics(of: $0).dbfs }
+    }
+
+    /// Computes both values consumers need in one pass. Keeping this pointer-
+    /// based avoids materializing an Array for each capture buffer.
+    private static func signalMetrics(
+        of samples: UnsafeBufferPointer<Float>
+    ) -> (rms: Float, dbfs: Float) {
+        guard !samples.isEmpty else { return (0, -.infinity) }
         // Double accumulator: a 5-minute capture is ~5M squares and a Float
         // running sum loses the small terms.
         var sum = 0.0
         for s in samples { sum += Double(s) * Double(s) }
         let rms = (sum / Double(samples.count)).squareRoot()
-        guard rms > 0 else { return -.infinity }
-        return Float(20 * log10(rms))
+        guard rms > 0 else { return (0, -.infinity) }
+        return (Float(rms), Float(20 * log10(rms)))
     }
 
     /// Called on the capture queue with a 0…1 loudness level per captured
@@ -52,6 +60,9 @@ final class AudioRecorder {
     /// Goertzel center frequencies: 12 log-spaced bands across the speech range.
     private static let bandFrequencies: [Float] = {
         (0..<12).map { 120 * pow(3800 / 120, Float($0) / 11) }
+    }()
+    private static let goertzelCoefficients: [Float] = {
+        bandFrequencies.map { 2 * cos(2 * Float.pi * $0 / Float(sampleRate)) }
     }()
 
     /// Called once per `start`, on the capture queue, when the first AUDIBLE
@@ -111,6 +122,7 @@ final class AudioRecorder {
     private var levelWindowSecond = 0 // guarded by `lock`
     private var peakDBFSWindow: Float = -.infinity // guarded by `lock`
     private var recordingGeneration = 0 // touched only on `controlQueue`
+    private var captureGeneration = 0 // guarded by `lock`
     private let lock = NSLock()
 
     // Session start/stop can block (mic hardware spin-up, TCC prompts) —
@@ -140,6 +152,9 @@ final class AudioRecorder {
     func stop(completion: @escaping ([Float]) -> Void) {
         controlQueue.async {
             self.recordingGeneration += 1
+            // Drain conversion work already queued at release time so the
+            // tail of the utterance is included in the returned samples.
+            self.sampleQueue.sync {}
             self.lock.lock()
             let captured = self.samples
             self.samples = []
@@ -149,10 +164,13 @@ final class AudioRecorder {
             self.lock.unlock()
             if warmWanted, wasLive, self.session != nil {
                 self.scheduleWarmTeardown()
+                DispatchQueue.main.async { completion(captured) }
             } else {
+                // Hardware shutdown can block. The immutable sample Array is
+                // already detached, so let transcription start in parallel.
+                DispatchQueue.main.async { completion(captured) }
                 self.tearDownSession()
             }
-            DispatchQueue.main.async { completion(captured) }
         }
     }
 
@@ -170,6 +188,50 @@ final class AudioRecorder {
             self.warmTeardown?.cancel()
             self.warmTeardown = nil
             self.tearDownSession()
+        }
+    }
+
+    /// Changes the preferred microphone and, when keep-warm is enabled,
+    /// immediately starts an idle session on it. Bluetooth inputs otherwise
+    /// pay their hands-free route transition on the first hotkey press after
+    /// every switch, losing the start of that dictation while they emit
+    /// digital zeroes.
+    func selectDevice(_ uid: String?) {
+        deviceUID = uid
+        controlQueue.async {
+            self.lock.lock()
+            let active = self.recordingActive
+            let warmWanted = self._keepWarm
+            self.lock.unlock()
+
+            // Do not interrupt a recording already in flight. Its next start
+            // sees that the warm session is on the wrong UID and rebuilds it.
+            guard !active else {
+                DiagLog.log("microphone changed during capture — applying it on the next recording")
+                return
+            }
+
+            self.warmTeardown?.cancel()
+            self.warmTeardown = nil
+            self.tearDownSession()
+            guard warmWanted else { return }
+
+            do {
+                // Prewarming must target the requested route. Falling back
+                // here would keep the wrong microphone warm and force another
+                // rebuild on the first press anyway.
+                try self.beginCapture(pinning: uid, fallbackToDefaultIfUnavailable: false)
+                DiagLog.log("prewarming selected microphone (%@)", self.sessionDeviceUID ?? "system default")
+                self.scheduleWarmTeardown()
+            } catch {
+                // A device can still be enumerating immediately after it is
+                // selected. Leave the recorder cold; start() retains its retry
+                // and built-in fallback behavior when the user actually holds
+                // the hotkey.
+                self.tearDownSession()
+                DiagLog.log("selected microphone could not be prewarmed (%@) — will retry on first press",
+                      error.localizedDescription)
+            }
         }
     }
 
@@ -307,12 +369,17 @@ final class AudioRecorder {
     /// Builds a fresh session capturing from the given device UID (nil =
     /// current system default). Split from `startCapture` so recovery paths
     /// can rebuild without discarding what was already recorded.
-    private func beginCapture(pinning uid: String?) throws {
+    private func beginCapture(
+        pinning uid: String?,
+        fallbackToDefaultIfUnavailable: Bool = true
+    ) throws {
         tearDownSession()
         // Stray buffers from a torn-down session must not count toward the
         // fresh session's sustained-delivery threshold.
         lock.lock()
         buffersThisSession = 0
+        captureGeneration &+= 1
+        let generation = captureGeneration
         lock.unlock()
 
         var device: AVCaptureDevice?
@@ -320,6 +387,7 @@ final class AudioRecorder {
             // AVCaptureDevice uniqueIDs are the CoreAudio device UIDs.
             device = AVCaptureDevice(uniqueID: uid)
             if device == nil {
+                guard fallbackToDefaultIfUnavailable else { throw RecorderError.noInput }
                 DiagLog.log("selected microphone (%@) not available — using system default", uid)
             }
         }
@@ -335,7 +403,7 @@ final class AudioRecorder {
 
         let output = AVCaptureAudioDataOutput()
         let forwarder = SampleForwarder(targetFormat: Self.targetFormat) { [weak self] converted in
-            self?.append(converted)
+            self?.append(converted, from: generation)
         }
         output.setSampleBufferDelegate(forwarder, queue: sampleQueue)
         guard session.canAddOutput(output) else { throw RecorderError.noInput }
@@ -403,6 +471,11 @@ final class AudioRecorder {
     }
 
     private func tearDownSession() {
+        // Invalidate queued callbacks before stopRunning blocks. A callback
+        // from this session must never enter a replacement session.
+        lock.lock()
+        captureGeneration &+= 1
+        lock.unlock()
         if let runtimeObserver {
             NotificationCenter.default.removeObserver(runtimeObserver)
             self.runtimeObserver = nil
@@ -414,16 +487,18 @@ final class AudioRecorder {
         sessionDeviceUID = nil
     }
 
-    private func append(_ converted: AVAudioPCMBuffer) {
+    private func append(_ converted: AVAudioPCMBuffer, from generation: Int) {
         guard let channel = converted.floatChannelData else { return }
         let count = Int(converted.frameLength)
         guard count > 0 else { return }
+        let buffer = UnsafeBufferPointer(start: channel[0], count: count)
+        let metrics = Self.signalMetrics(of: buffer)
 
         lock.lock()
         // A warm idle session keeps delivering buffers; none of them are
         // part of a recording — no accumulation, no HUD levels, no
         // capture-live transitions.
-        guard recordingActive else {
+        guard recordingActive, generation == captureGeneration else {
             lock.unlock()
             return
         }
@@ -439,12 +514,16 @@ final class AudioRecorder {
         // seconds while the mic path itself spins up — a live microphone
         // always carries a noise floor, so -inf/-80 dBFS means "connected
         // but not hearing yet" and must not cue the user to speak.
-        let dbfs = Self.rmsDBFS(of: Array(UnsafeBufferPointer(start: channel[0], count: count)))
+        let dbfs = metrics.dbfs
         if !wasLive && dbfs > Self.digitalSilenceDBFS { captureLive = true }
         let nowLive = captureLive
         let bufferIndex = buffersThisSession
         let epoch = sessionEpoch
-        samples.append(contentsOf: UnsafeBufferPointer(start: channel[0], count: count))
+        // Do not hand Whisper the digital-zero prefix produced while a cold
+        // Bluetooth hands-free route is switching on. That prefix contains no
+        // recoverable audio and made the first post-switch capture materially
+        // different from every warm capture.
+        if nowLive { samples.append(contentsOf: buffer) }
         // Per-second peak trace: shows whether speech ever reaches usable
         // levels after the mic wakes (AirPods AGC/noise-gate diagnosis).
         peakDBFSWindow = max(peakDBFSWindow, dbfs)
@@ -472,11 +551,8 @@ final class AudioRecorder {
         }
 
         if let onLevel {
-            var sum: Float = 0
-            for i in 0..<count { sum += channel[0][i] * channel[0][i] }
-            let rms = (sum / Float(count)).squareRoot()
             // sqrt curve so quiet speech still moves the bars; ~0.2 RMS ≈ full scale
-            onLevel(min(1, rms.squareRoot() * 2.2))
+            onLevel(min(1, metrics.rms.squareRoot() * 2.2))
         }
 
         // Coarse spectrum for the pitch-aware HUD themes: one Goertzel filter
@@ -484,10 +560,8 @@ final class AudioRecorder {
         if let onSpectrum {
             let n = min(count, 512)
             let start = count - n
-            var bands = [Float](repeating: 0, count: Self.bandFrequencies.count)
-            for (bi, freq) in Self.bandFrequencies.enumerated() {
-                let omega = 2 * Float.pi * freq / Float(Self.sampleRate)
-                let coeff = 2 * cos(omega)
+            var bands = [Float](repeating: 0, count: Self.goertzelCoefficients.count)
+            for (bi, coeff) in Self.goertzelCoefficients.enumerated() {
                 var s1: Float = 0, s2: Float = 0
                 for i in start..<count {
                     let s0 = channel[0][i] + coeff * s1 - s2
@@ -508,7 +582,11 @@ final class AudioRecorder {
 /// buffer self-describes its format, so there is nothing to go stale.
 private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let targetFormat: AVAudioFormat
+    private var sourceDescription: AudioStreamBasicDescription?
+    private var sourceFormat: AVAudioFormat?
     private var converter: AVAudioConverter?
+    private var rawBuffer: AVAudioPCMBuffer?
+    private var convertedBuffer: AVAudioPCMBuffer?
     private let onPCM: (AVAudioPCMBuffer) -> Void
 
     init(targetFormat: AVAudioFormat, onPCM: @escaping (AVAudioPCMBuffer) -> Void) {
@@ -522,26 +600,45 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
         from connection: AVCaptureConnection
     ) {
         guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc),
-              let sourceFormat = AVAudioFormat(streamDescription: asbd) else { return }
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc) else { return }
+        let incomingDescription = asbd.pointee
+        if sourceDescription.map({ !Self.matches($0, incomingDescription) }) ?? true {
+            guard let format = AVAudioFormat(streamDescription: asbd),
+                  let converter = AVAudioConverter(from: format, to: targetFormat) else { return }
+            sourceDescription = incomingDescription
+            sourceFormat = format
+            self.converter = converter
+            rawBuffer = nil
+            convertedBuffer = nil
+        }
+        guard let sourceFormat, let converter else { return }
+
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
-        guard frames > 0,
-              let raw = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames) else { return }
+        guard frames > 0 else { return }
+        let raw: AVAudioPCMBuffer
+        if let rawBuffer, rawBuffer.frameCapacity >= frames {
+            raw = rawBuffer
+        } else {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames) else { return }
+            rawBuffer = buffer
+            raw = buffer
+        }
         raw.frameLength = frames
         guard CMSampleBufferCopyPCMDataIntoAudioBufferList(
             sampleBuffer, at: 0, frameCount: Int32(frames), into: raw.mutableAudioBufferList
         ) == noErr else { return }
 
-        if converter == nil || converter!.inputFormat != sourceFormat {
-            converter = AVAudioConverter(from: sourceFormat, to: targetFormat)
-        }
-        guard let converter else { return }
-
         let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
         let capacity = AVAudioFrameCount(Double(raw.frameLength) * ratio) + 32
-        guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else {
-            return
+        let converted: AVAudioPCMBuffer
+        if let convertedBuffer, convertedBuffer.frameCapacity >= capacity {
+            converted = convertedBuffer
+        } else {
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+            convertedBuffer = buffer
+            converted = buffer
         }
+        converted.frameLength = 0
         var consumed = false
         var conversionError: NSError?
         converter.convert(to: converted, error: &conversionError) { _, status in
@@ -555,5 +652,22 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
         }
         guard conversionError == nil, converted.frameLength > 0 else { return }
         onPCM(converted)
+    }
+
+    /// Audio format objects are relatively expensive to build and capture
+    /// normally sends the same ASBD hundreds of times. Rebuild only for an
+    /// actual device/profile format change.
+    private static func matches(
+        _ lhs: AudioStreamBasicDescription,
+        _ rhs: AudioStreamBasicDescription
+    ) -> Bool {
+        lhs.mSampleRate == rhs.mSampleRate &&
+            lhs.mFormatID == rhs.mFormatID &&
+            lhs.mFormatFlags == rhs.mFormatFlags &&
+            lhs.mBytesPerPacket == rhs.mBytesPerPacket &&
+            lhs.mFramesPerPacket == rhs.mFramesPerPacket &&
+            lhs.mBytesPerFrame == rhs.mBytesPerFrame &&
+            lhs.mChannelsPerFrame == rhs.mChannelsPerFrame &&
+            lhs.mBitsPerChannel == rhs.mBitsPerChannel
     }
 }

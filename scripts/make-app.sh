@@ -48,7 +48,7 @@ fi
 echo "Pre-warming CoreML model cache (can take a few minutes on a new binary)…"
 WARM_AIFF="$(mktemp -t localflow-warm).aiff"
 if say -o "$WARM_AIFF" "warm up" 2>/dev/null &&
-   "$APP/Contents/MacOS/LocalFlow" --transcribe "$WARM_AIFF" >/dev/null 2>&1; then
+   "$APP/Contents/MacOS/LocalFlow" --transcribe "$WARM_AIFF" --no-cleanup >/dev/null 2>&1; then
     echo "Model cache warm."
 else
     echo "warning: pre-warm skipped/failed — first in-app dictation will be slow"

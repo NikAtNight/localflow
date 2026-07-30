@@ -12,14 +12,17 @@ struct LocalFlowMain {
     static func main() {
         let arguments = CommandLine.arguments
         if let flagIndex = arguments.firstIndex(of: "--transcribe"), flagIndex + 1 < arguments.count {
-            transcribeFile(arguments[flagIndex + 1])
+            transcribeFile(
+                arguments[flagIndex + 1],
+                cleanupEnabled: !arguments.contains("--no-cleanup")
+            )
             return
         }
         if let flagIndex = arguments.firstIndex(of: "--record-test") {
             // Optional trailing arg: a device UID to record from (defaults
             // to the saved setting / system default).
             let uid = flagIndex + 1 < arguments.count ? arguments[flagIndex + 1] : nil
-            recordTest(deviceUID: uid)
+            MainActor.assumeIsolated { recordTest(deviceUID: uid) }
             return
         }
 
@@ -50,7 +53,7 @@ struct LocalFlowMain {
     /// Loads the configured Whisper model, transcribes the file with the same
     /// pipeline the app uses (including optional Ollama cleanup), and prints
     /// per-stage timings to stderr and the final text to stdout.
-    private static func transcribeFile(_ path: String) {
+    private static func transcribeFile(_ path: String, cleanupEnabled: Bool) {
         let done = DispatchSemaphore(value: 0)
         Task {
             defer { done.signal() }
@@ -66,7 +69,7 @@ struct LocalFlowMain {
                 var text = try await transcriber.transcribe(file: path)
                 stderr.write(Data("transcribe: \(elapsedMs(since: stageStart))ms\n".utf8))
 
-                if Settings.cleanupEnabled, await OllamaCleaner.isAvailable() {
+                if cleanupEnabled, Settings.cleanupEnabled {
                     stageStart = Date()
                     do {
                         text = try await OllamaCleaner.clean(text, model: Settings.ollamaModel)
@@ -99,6 +102,7 @@ struct LocalFlowMain {
     /// like a user's second hotkey press: with keep-warm on it must reuse
     /// the warm session (near-zero start), without it it must survive
     /// teardown residue.
+    @MainActor
     private static func recordTest(deviceUID: String?) {
         let stderr = FileHandle.standardError
         let recorder = AudioRecorder()

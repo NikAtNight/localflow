@@ -5,6 +5,42 @@ import XCTest
 /// canonical-hallucination match used to drop invented filler for silent audio.
 final class TranscriberTests: XCTestCase {
 
+    func testInferenceGateSerializesWaitersInFIFOOrder() async {
+        let gate = TranscriptionGate()
+        let order = CompletionOrder()
+        await gate.acquire()
+
+        let first = Task {
+            await gate.acquire()
+            await order.append(1)
+            await gate.release()
+        }
+        let firstQueued = await waitForWaiterCount(1, on: gate)
+        XCTAssertTrue(firstQueued)
+
+        let second = Task {
+            await gate.acquire()
+            await order.append(2)
+            await gate.release()
+        }
+        let secondQueued = await waitForWaiterCount(2, on: gate)
+        XCTAssertTrue(secondQueued)
+
+        await gate.release()
+        await first.value
+        await second.value
+        let completed = await order.values
+        XCTAssertEqual(completed, [1, 2])
+    }
+
+    private func waitForWaiterCount(_ count: Int, on gate: TranscriptionGate) async -> Bool {
+        for _ in 0..<10_000 {
+            if await gate.waitingCount == count { return true }
+            await Task.yield()
+        }
+        return false
+    }
+
     // MARK: stripSpecialTokens
 
     func testStripsBlankAudioAndAllCapsBracketTokens() {
@@ -64,5 +100,13 @@ final class TranscriberTests: XCTestCase {
         // Empty transcript is not one of the canonical phrases.
         XCTAssertFalse(Transcriber.isCanonicalHallucination(""))
         XCTAssertFalse(Transcriber.isCanonicalHallucination("   "))
+    }
+}
+
+private actor CompletionOrder {
+    private(set) var values: [Int] = []
+
+    func append(_ value: Int) {
+        values.append(value)
     }
 }

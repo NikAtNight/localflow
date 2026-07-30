@@ -2,7 +2,9 @@ import Foundation
 
 /// UserDefaults-backed app settings.
 enum Settings {
-    private static let defaults = UserDefaults.standard
+    // A computed accessor avoids storing Foundation's non-Sendable singleton
+    // as global state; UserDefaults itself provides synchronized access.
+    private static var defaults: UserDefaults { .standard }
 
     private enum Key {
         static let hotkey = "hotkey"
@@ -18,13 +20,15 @@ enum Settings {
     }
 
     /// Whisper models available in the argmaxinc/whisperkit-coreml registry,
-    /// ordered smallest → largest. Small models are the right default for
-    /// dictation latency (see plan: ~0.3–0.5s per sentence).
+    /// ordered from development-speed models to the best dictation models.
+    /// Small English remains the default latency/accuracy balance; the large
+    /// variants are the quality choices on well-provisioned Apple silicon.
     static let whisperModels: [(name: String, label: String)] = [
-        ("openai_whisper-tiny.en", "Tiny (fastest, least accurate)"),
-        ("openai_whisper-base.en", "Base (fast)"),
-        ("openai_whisper-small.en", "Small (recommended)"),
-        ("openai_whisper-large-v3-v20240930_turbo", "Large v3 Turbo (most accurate)"),
+        ("openai_whisper-tiny.en", "Tiny English (development only)"),
+        ("openai_whisper-base.en", "Base English (fast, lower accuracy)"),
+        ("openai_whisper-small.en", "Small English (balanced, current default)"),
+        ("openai_whisper-large-v3-v20240930_626MB", "Large v3 626 MB (best compact accuracy)"),
+        ("openai_whisper-large-v3-v20240930_turbo", "Large v3 Turbo (best Mac speed + accuracy)"),
     ]
 
     static var hotkey: HotkeyManager.Key {
