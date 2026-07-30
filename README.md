@@ -52,9 +52,9 @@ macOS will prompt for these on first use — both are required:
    retries every few seconds, so the hotkey starts working the moment you
    grant it (no relaunch needed). The menubar icon shows ⚠️ until then.
 
-**If the hotkey stops working after a rebuild:** the ad-hoc code signature
-changes on every build, which silently invalidates the old TCC grant even
-though the checkbox still looks enabled. Fix: in System Settings →
+**If the hotkey stops working after a rebuild:** `make-app.sh` prefers the
+stable `Talix Dev Signing` identity and otherwise uses a pinned ad-hoc
+requirement, but macOS can still retain a stale TCC grant. In System Settings →
 Accessibility, remove LocalFlow with the − button and re-add the new build
 (or toggle it off and on).
 
@@ -70,8 +70,10 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   still transcribing.
 - Menu options:
   - **Hold to Talk** — switch the hotkey (Right Option / Right Command / Fn).
-  - **Whisper Model** — Tiny/Base/Small/Large-v3-Turbo. Small (default) is the
-    right latency/accuracy trade-off for dictation; switching triggers a new download.
+  - **Whisper Model** — Small English (default) is the latency/accuracy balance.
+    Large v3 626 MB prioritizes compact accuracy, while Large v3 Turbo is the
+    best speed/accuracy option on a well-provisioned Mac; switching downloads
+    and specializes the selected model before Ready.
   - **Recent Dictations** — the last 5 transcripts; click one to copy it back
     to the clipboard (the safety net if a paste ever goes astray).
   - **Retry Failed Dictation** — appears if a transcription errored; the
@@ -86,13 +88,13 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   crashes; quitting from the menu stays quit.
 - If something misfires, the menu keeps a "Last error" line until the next
   successful dictation.
-- **The very first transcription is slow** (~20 s): CoreML specializes the
-  model for the Neural Engine once per binary; the OS caches the result and
-  every transcription after that is sub-second.
+- **Initial startup or a model switch can take minutes**: LocalFlow downloads,
+  loads, and CoreML-specializes the model before the menubar reports Ready.
+  Once Ready, the first transcription no longer pays that setup cost.
 - End-to-end latency (hotkey release → text pasted) is logged on every
-  dictation. To see the logs, run the binary from a terminal
-  (`build/LocalFlow.app/Contents/MacOS/LocalFlow`) or open Console.app and
-  filter for "LocalFlow:".
+  dictation. Follow `~/Library/Logs/LocalFlow-diag.log`, or open Console.app
+  and filter for "LocalFlow:". Launch the app bundle normally so macOS keeps
+  Microphone and Accessibility permission attribution on LocalFlow.
 
 ### Headless testing / benchmarking
 
@@ -103,6 +105,7 @@ the mic (the plan's "measure hotkey-release → pasted-text early" step):
 say -o /tmp/test.aiff "This is a test sentence."
 build/LocalFlow.app/Contents/MacOS/LocalFlow --transcribe /tmp/test.aiff
 # stderr: model load / transcribe / cleanup timings; stdout: final text
+# Add --no-cleanup to benchmark Whisper alone regardless of saved settings.
 ```
 
 Measured on this machine (M-series, small.en, warm): **~790 ms** for 7 s of
@@ -110,7 +113,8 @@ speech, model load ~1.8 s at app startup.
 
 ## Optional: Ollama cleanup (the WhisperFlow "magic" pass)
 
-Whisper already punctuates reasonably well; the cleanup pass additionally
+Whisper already punctuates reasonably well; larger Whisper models improve word
+recognition but do not replace semantic cleanup. The cleanup pass additionally
 strips fillers ("um", "like"), fixes false starts, and formats dictated lists.
 It runs against a local Ollama server and is **off by default** because it's
 the main latency cost (roughly 0.5–1.5 s extra for a 4B model).
@@ -146,3 +150,7 @@ on the LLM. To use a different model:
 | `Sources/LocalFlow/OllamaCleaner.swift` | Optional local LLM cleanup via Ollama HTTP API |
 | `Sources/LocalFlow/TextInjector.swift` | Clipboard+⌘V injection with save/restore, keystroke fallback |
 | `Sources/LocalFlow/AppDelegate.swift` | Menubar UI, permissions, pipeline orchestration |
+
+## License
+
+MIT. See [LICENSE](LICENSE).
