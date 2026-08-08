@@ -76,6 +76,16 @@ enum ThemeIcon {
             DiagLog.log("bundle not writable — Launchpad icon left as-is")
             return
         }
+        // A distributed build is signed with a Developer ID and carries a
+        // stapled notarization ticket. Any re-sign here invalidates that
+        // ticket (it is bound to the signature), which is far worse than a
+        // stale Launchpad icon: Gatekeeper would start questioning the app
+        // and its TCC grants could be dropped. The running app still shows
+        // the themed icon via NSApp.applicationIconImage.
+        guard canSafelyResign(bundlePath) else {
+            DiagLog.log("release-signed bundle — leaving the Launchpad icon alone")
+            return
+        }
         // The rewrite and re-sign must be transactional: bundle contents
         // that don't match the seal make validation fail and macOS silently
         // drops the app's Microphone/Accessibility grants. Both the icns AND
@@ -141,6 +151,27 @@ enum ThemeIcon {
     /// present, else ad-hoc with the pinned identifier requirement — either
     /// way the designated requirement stays `identifier "app.talix.localflow"`,
     /// so TCC grants survive the rewrite.
+    /// True only when the bundle's existing seal is one this machine can
+    /// reproduce exactly: an ad-hoc signature, or the local development
+    /// identity. Anything issued by Apple (Developer ID, Apple
+    /// Development) belongs to a distributed build and must be left alone.
+    private static func canSafelyResign(_ bundlePath: String) -> Bool {
+        let description = run("/usr/bin/codesign", ["-dvv", bundlePath]).1
+        let authorities = description
+            .components(separatedBy: .newlines)
+            .filter { $0.hasPrefix("Authority=") }
+            .map { String($0.dropFirst("Authority=".count)) }
+        guard let authority = authorities.first else {
+            // No authority line: ad-hoc. Nothing to invalidate.
+            return true
+        }
+        guard authority == localSigningIdentity else { return false }
+        let identities = run("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"]).1
+        return identities.contains(localSigningIdentity)
+    }
+
+    private static let localSigningIdentity = "Talix Dev Signing"
+
     private static func resign(_ bundlePath: String) -> Bool {
         let (_, identities) = run("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"])
         let result: (Int32, String)

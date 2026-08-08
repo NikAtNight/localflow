@@ -18,13 +18,58 @@ No audio ever leaves your machine.
  AVAudioEngine            CoreML / ANE             gemma3:4b               clipboard + ⌘V
 ```
 
-## Build & run
+## Requirements
+
+LocalFlow is **macOS only** and there are no plans for other platforms: it is
+built on CoreML, the Neural Engine, CGEvent taps, and Apple's on-device models.
+
+| | Minimum | Recommended |
+|---|---|---|
+| Mac | Apple Silicon (M1 or later) | M1 Pro or later |
+| macOS | 14 Sonoma | 26 or later |
+| Memory | 8 GB | 16 GB |
+| Free disk | 2 GB for the model cache | 4 GB |
+| Network | First launch only, to download the model | Not needed after that |
+
+Notes on the edges of that table:
+
+- **Apple Silicon is required.** Intel Macs are not supported: transcription
+  runs on the Neural Engine, and without it dictation is too slow to be useful.
+- **macOS 26+ unlocks the optional extras.** Transcription, formatting,
+  snippets, and corrections all work on macOS 14. Transcript cleanup and
+  command mode use Apple's on-device foundation model, which needs macOS 26
+  with Apple Intelligence enabled in System Settings.
+- **Disk depends on the model.** Small English is ~500 MB; the default
+  Large v3 Turbo is ~1.5 GB. Models download on first launch and are cached in
+  `~/Library/Application Support/LocalFlow/`.
+- **No account, no server, no subscription.** Nothing is uploaded, so there is
+  nothing to sign in to.
+
+## Install
+
+Download the latest `LocalFlow-<version>.dmg` from the
+[Releases page](../../releases), open it, and drag LocalFlow to Applications.
+Launch it and grant the two permissions below.
+
+The app runs in the menubar with no Dock icon, and registers a LaunchAgent so
+it starts at login and comes back if it ever crashes. Quit from the menu and it
+stays quit. To uninstall, quit LocalFlow, drag it out of Applications, and
+delete `~/Library/Application Support/LocalFlow/`.
+
+> Builds are signed with a Developer ID and notarized by Apple, so they open
+> normally. If you build it yourself the result is ad-hoc signed, and macOS
+> will block the first launch until you right-click the app and pick **Open**.
+
+## Build from source
 
 Requires macOS 14+ and the Swift toolchain (Xcode Command Line Tools are enough).
 
 ```bash
 ./scripts/make-app.sh          # builds release + packages build/LocalFlow.app
 open build/LocalFlow.app
+
+./scripts/make-app.sh --install  # or: replace /Applications/LocalFlow.app and relaunch
+./scripts/make-dmg.sh            # wrap the built app in dist/LocalFlow-<version>.dmg
 ```
 
 For quick dev iteration you can also `swift run`, but then the TCC permissions
@@ -275,6 +320,29 @@ a folder shortcut, and **Delete All History**.
 | `Sources/LocalFlow/AppStyleProfile.swift` | Per-app writing register for the cleanup pass |
 | `Sources/LocalFlow/DictationDiff.swift` | Learns corrections from hand-edited dictations |
 | `Sources/LocalFlow/AppDelegate.swift` | Menubar UI, permissions, pipeline orchestration |
+
+## Cutting a release
+
+Releases are built by `.github/workflows/release.yml` on a macOS runner:
+tests, signed build, notarization, DMG, then the DMG is attached to the
+GitHub Release. Publish a release tagged `v1.2.3` and the workflow does the
+rest; `workflow_dispatch` produces the same artifact without publishing.
+
+Signing and notarization need these repository secrets. Without them the
+workflow still builds and attaches a DMG, but it is ad-hoc signed and
+Gatekeeper makes users right-click → Open:
+
+| Secret | What it is |
+|---|---|
+| `MAC_CERT_P12_BASE64` | Developer ID Application certificate + key, exported as .p12 and base64-encoded |
+| `MAC_CERT_PASSWORD` | Password used for that .p12 export |
+| `APPLE_ID` | Apple ID for notarization |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for that Apple ID |
+| `APPLE_TEAM_ID` | Developer team ID |
+
+The workflow fails the build if `FoundationModels` did not link, since an
+older SDK would silently ship a build with no command mode and no on-device
+cleanup.
 
 ## License
 
