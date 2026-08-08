@@ -180,6 +180,33 @@ active). If the backend is down or errors, LocalFlow pastes the raw
 transcript instead — dictation never blocks on the LLM. Different Ollama
 model: `defaults write app.talix.localflow ollamaModel "qwen2.5:3b"`.
 
+## Command mode (voice editing)
+
+Hold the command key (Right Option by default; configurable in Settings) and
+say what you want done:
+
+- **With text selected** it's rewritten in place: "make this shorter",
+  "turn this into bullet points", "make it friendlier", "translate to Spanish".
+- **With nothing selected** what you ask for is written at the cursor.
+
+Runs on Apple's on-device model, so the text being edited never leaves the
+Mac. Needs Apple Intelligence enabled, and a different key from dictation.
+
+## App-aware style
+
+The cleanup pass adapts to whatever app you're dictating into: full
+sentences and punctuation in Mail, short and casual in Slack or Messages,
+and identifier-safe in editors and terminals (no "correcting" camelCase or
+file paths into prose). Unknown apps get ordinary written punctuation.
+
+## Snippets
+
+Voice shortcuts for text you type often. Define a trigger in Settings, say
+it anywhere in a dictation, and it's replaced verbatim:
+
+> "thanks for the update, insert my signature" → "Thanks for the update,
+> Nikhil Kapadia / Talix"
+
 ## Custom vocabulary & corrections
 
 Settings has a "Custom vocabulary" field: comma-separated names and jargon
@@ -192,6 +219,12 @@ wrong: teach a fix ("talex" → "Talix") and it is (1) applied automatically
 to every future transcript (whole words only, case-aware) and (2) its
 correct form joins the recognition vocabulary, so the decoder gets a chance
 to hear it right at the source.
+
+You don't have to type both halves. Fix the text in your app, copy it, then
+pick **Fix Last Dictation…** in the menubar: LocalFlow diffs your version
+against what it pasted and offers to learn the word swaps. Only one-word
+substitutions are proposed, and common words are ignored, so rewording a
+sentence never becomes a permanent rule.
 
 ## Dictation history
 
@@ -238,6 +271,9 @@ a folder shortcut, and **Delete All History**.
 | `Sources/LocalFlow/OllamaCleaner.swift` | Fallback LLM cleanup via Ollama HTTP API |
 | `Sources/LocalFlow/TextInjector.swift` | Clipboard+⌘V injection with save/restore, keystroke fallback |
 | `Sources/LocalFlow/DictationHistory.swift` | Daily Markdown log of every dictation |
+| `Sources/LocalFlow/CommandMode.swift` | Voice editing of the current selection |
+| `Sources/LocalFlow/AppStyleProfile.swift` | Per-app writing register for the cleanup pass |
+| `Sources/LocalFlow/DictationDiff.swift` | Learns corrections from hand-edited dictations |
 | `Sources/LocalFlow/AppDelegate.swift` | Menubar UI, permissions, pipeline orchestration |
 
 ## License

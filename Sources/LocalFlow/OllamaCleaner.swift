@@ -31,7 +31,6 @@ struct OllamaCleaner {
         return URLSession(configuration: configuration)
     }()
 
-    private static let systemPrompt = TranscriptCleanup.systemPrompt
 
     /// Quick reachability probe with a short timeout.
     static func isAvailable() async -> Bool {
@@ -47,7 +46,11 @@ struct OllamaCleaner {
         }
     }
 
-    static func clean(_ rawText: String, model: String) async throws -> String {
+    static func clean(
+        _ rawText: String,
+        model: String,
+        profile: AppStyleProfile = .general
+    ) async throws -> String {
         struct GenerateRequest: Encodable {
             let model: String
             let system: String
@@ -85,7 +88,7 @@ struct OllamaCleaner {
         request.timeoutInterval = 45
         request.httpBody = try JSONEncoder().encode(GenerateRequest(
             model: model,
-            system: systemPrompt,
+            system: TranscriptCleanup.instructions(for: profile),
             prompt: rawText,
             stream: false,
             think: false,

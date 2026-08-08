@@ -56,6 +56,34 @@ enum TranscriptCorrections {
     }
 }
 
+/// Voice-triggered text expansion: say the trigger phrase, get the block of
+/// text. Applied after formatting so an expansion's own punctuation and line
+/// breaks are inserted verbatim and never re-interpreted as commands.
+enum Snippets {
+    static func expand(_ text: String, snippets: [(trigger: String, expansion: String)]) -> String {
+        var result = text
+        for (trigger, expansion) in snippets {
+            let phrase = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !phrase.isEmpty, !expansion.isEmpty else { continue }
+            // Trailing punctuation is the dictation's, not the trigger's:
+            // "insert signature." must still fire.
+            let pattern = "\\b"
+                + NSRegularExpression.escapedPattern(for: phrase).replacingOccurrences(of: " ", with: "\\s+")
+                + "\\b[.,;:!?]?"
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            let range = NSRange(result.startIndex..<result.endIndex, in: result)
+            result = regex.stringByReplacingMatches(
+                in: result,
+                range: range,
+                withTemplate: NSRegularExpression.escapedTemplate(for: expansion)
+            )
+        }
+        return result
+    }
+}
+
 enum VoiceFormatter {
 
     // MARK: - Emoji vocabulary

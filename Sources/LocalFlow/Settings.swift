@@ -17,6 +17,9 @@ enum Settings {
         static let customVocabulary = "customVocabulary"
         static let corrections = "corrections"
         static let saveHistory = "saveHistory"
+        static let commandHotkey = "commandHotkey"
+        static let commandModeEnabled = "commandModeEnabled"
+        static let snippets = "snippets"
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
         static let hudOrigin = "hudOrigin"
@@ -88,6 +91,48 @@ enum Settings {
     static var ollamaModel: String {
         get { defaults.string(forKey: Key.ollamaModel) ?? "gemma3:4b" }
         set { defaults.set(newValue, forKey: Key.ollamaModel) }
+    }
+
+    /// Hold-to-edit key for command mode. Must differ from `hotkey`;
+    /// `commandModeActive` enforces that.
+    static var commandHotkey: HotkeyManager.Key {
+        get {
+            if let raw = defaults.string(forKey: Key.commandHotkey),
+               let key = HotkeyManager.Key(rawValue: raw) {
+                return key
+            }
+            return .rightOption
+        }
+        set { defaults.set(newValue.rawValue, forKey: Key.commandHotkey) }
+    }
+
+    static var commandModeEnabled: Bool {
+        get { defaults.object(forKey: Key.commandModeEnabled) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.commandModeEnabled) }
+    }
+
+    /// Command mode only runs when it's enabled, its key doesn't collide
+    /// with the dictation key, and the on-device model can actually serve it.
+    static var commandModeActive: Bool {
+        commandModeEnabled && commandHotkey != hotkey && CommandMode.isAvailable
+    }
+
+    /// Voice-triggered text expansions, stored as "trigger\texpansion"
+    /// (newlines inside an expansion are escaped as \n).
+    static var snippets: [(trigger: String, expansion: String)] {
+        get {
+            (defaults.stringArray(forKey: Key.snippets) ?? []).compactMap { entry in
+                let parts = entry.components(separatedBy: "\t")
+                guard parts.count == 2 else { return nil }
+                return (parts[0], parts[1].replacingOccurrences(of: "\\n", with: "\n"))
+            }
+        }
+        set {
+            defaults.set(
+                newValue.map { "\($0.trigger)\t\($0.expansion.replacingOccurrences(of: "\n", with: "\\n"))" },
+                forKey: Key.snippets
+            )
+        }
     }
 
     /// Append every dictation to the daily Markdown log (see

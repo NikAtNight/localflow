@@ -16,6 +16,13 @@ struct CorrectionPair: Identifiable, Equatable {
     var right: String
 }
 
+/// One voice-triggered expansion: say the trigger, get the text.
+struct SnippetPair: Identifiable, Equatable {
+    let id = UUID()
+    var trigger: String
+    var expansion: String
+}
+
 // MARK: - Model
 
 /// Observable mirror of Settings for the settings window. Writes persist
@@ -31,6 +38,7 @@ final class SettingsModel: ObservableObject {
     var onThemeChange: (() -> Void)?
     var onVocabularyChange: ((String) -> Void)?
     var onCorrectionsChange: (() -> Void)?
+    var onCommandModeChange: (() -> Void)?
 
     private let loginAgent = SMAppService.agent(plistName: "app.talix.localflow.plist")
 
@@ -80,6 +88,43 @@ final class SettingsModel: ObservableObject {
 
     @Published var saveHistory: Bool = Settings.saveHistory {
         didSet { Settings.saveHistory = saveHistory }
+    }
+
+    @Published var commandModeEnabled: Bool = Settings.commandModeEnabled {
+        didSet {
+            guard oldValue != commandModeEnabled else { return }
+            Settings.commandModeEnabled = commandModeEnabled
+            onCommandModeChange?()
+        }
+    }
+
+    @Published var commandHotkey: HotkeyManager.Key = Settings.commandHotkey {
+        didSet {
+            guard oldValue != commandHotkey else { return }
+            Settings.commandHotkey = commandHotkey
+            onCommandModeChange?()
+        }
+    }
+
+    @Published var snippets: [SnippetPair] = Settings.snippets.map {
+        SnippetPair(trigger: $0.trigger, expansion: $0.expansion)
+    } {
+        didSet {
+            guard oldValue != snippets else { return }
+            Settings.snippets = snippets.map { ($0.trigger, $0.expansion) }
+        }
+    }
+
+    func addSnippet(trigger: String, expansion: String) {
+        let trigger = trigger.trimmingCharacters(in: .whitespacesAndNewlines)
+        let expansion = expansion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trigger.isEmpty, !expansion.isEmpty else { return }
+        snippets.removeAll { $0.trigger.caseInsensitiveCompare(trigger) == .orderedSame }
+        snippets.append(SnippetPair(trigger: trigger, expansion: expansion))
+    }
+
+    func removeSnippet(_ id: UUID) {
+        snippets.removeAll { $0.id == id }
     }
 
     @Published var customVocabulary: String = Settings.customVocabulary {
@@ -224,6 +269,8 @@ struct SettingsView: View {
     @State private var newCorrectionWrong = ""
     @State private var newCorrectionRight = ""
     @State private var confirmingHistoryDeletion = false
+    @State private var newSnippetTrigger = ""
+    @State private var newSnippetExpansion = ""
 
     private var cleanupLabel: String {
         AppleIntelligenceCleaner.isAvailable
@@ -242,6 +289,76 @@ struct SettingsView: View {
                 }
                 Toggle("Sound cues", isOn: $model.soundCues)
                 Toggle("Start at login", isOn: $model.startAtLogin)
+            }
+
+            Section {
+                Toggle("Enable command mode", isOn: $model.commandModeEnabled)
+                Picker("Hold to edit", selection: $model.commandHotkey) {
+                    ForEach(HotkeyManager.Key.allCases, id: \.self) { key in
+                        Text(key.label).tag(key)
+                    }
+                }
+                .disabled(!model.commandModeEnabled)
+                if model.commandModeEnabled, model.commandHotkey == model.hotkey {
+                    Text("This is the same key as dictation. Pick a different one for command mode.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if model.commandModeEnabled, !CommandMode.isAvailable {
+                    Text("Command mode needs Apple Intelligence. Turn it on in System Settings.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            } header: {
+                Text("Command mode")
+            } footer: {
+                Text("Select text, hold the key and say what to do with it (\u{201C}make this shorter\u{201D}, \u{201C}turn this into bullets\u{201D}) and it's rewritten in place. With nothing selected, what you ask for is written at the cursor. Runs on-device.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                ForEach(model.snippets) { snippet in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("“\(snippet.trigger)”")
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "arrow.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(snippet.expansion)
+                            .lineLimit(3)
+                        Spacer()
+                        Button {
+                            model.removeSnippet(snippet.id)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove this snippet")
+                    }
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    TextField("Say this…", text: $newSnippetTrigger)
+                    TextField("…to insert this", text: $newSnippetExpansion, axis: .vertical)
+                        .lineLimit(2...5)
+                    HStack {
+                        Spacer()
+                        Button("Add Snippet") {
+                            model.addSnippet(trigger: newSnippetTrigger, expansion: newSnippetExpansion)
+                            newSnippetTrigger = ""
+                            newSnippetExpansion = ""
+                        }
+                        .disabled(
+                            newSnippetTrigger.trimmingCharacters(in: .whitespaces).isEmpty
+                                || newSnippetExpansion.trimmingCharacters(in: .whitespaces).isEmpty
+                        )
+                    }
+                }
+            } header: {
+                Text("Snippets")
+            } footer: {
+                Text("Voice shortcuts for text you type often. Say the trigger anywhere in a dictation (\u{201C}insert my signature\u{201D}) and it's replaced with the full text, verbatim.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

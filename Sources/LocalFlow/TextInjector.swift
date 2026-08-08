@@ -94,6 +94,51 @@ enum TextInjector {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
     }
 
+    /// Reads the frontmost app's current selection by synthesizing ⌘C, then
+    /// puts the user's clipboard back. `completion` (main queue) gets nil
+    /// when nothing is selected (the pasteboard never changed) or when
+    /// Secure Input forbids the round trip.
+    ///
+    /// The restore matters: leaving the copied selection behind would make
+    /// the later `inject` snapshot it as "the user's clipboard" and hand it
+    /// back to them in place of what they actually had.
+    static func copySelection(completion: @escaping (String?) -> Void) {
+        guard !IsSecureEventInputEnabled() else {
+            completion(nil)
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        let saved = snapshot(of: pasteboard)
+        let before = pasteboard.changeCount
+        guard postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_C), flags: .maskCommand) else {
+            completion(nil)
+            return
+        }
+        // The frontmost app services the copy asynchronously; poll briefly
+        // rather than guessing one delay that is either slow or too short.
+        pollForCopy(pasteboard: pasteboard, before: before, saved: saved, attempt: 0, completion: completion)
+    }
+
+    private static func pollForCopy(
+        pasteboard: NSPasteboard,
+        before: Int,
+        saved: [NSPasteboardItem],
+        attempt: Int,
+        completion: @escaping (String?) -> Void
+    ) {
+        let copied = pasteboard.changeCount != before ? pasteboard.string(forType: .string) : nil
+        guard copied == nil, attempt < 12 else {
+            pasteboard.clearContents()
+            pasteboard.writeObjects(saved)
+            completion(copied)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
+            pollForCopy(pasteboard: pasteboard, before: before, saved: saved,
+                        attempt: attempt + 1, completion: completion)
+        }
+    }
+
     // MARK: - Clipboard save/restore
 
     private static func snapshot(of pasteboard: NSPasteboard) -> [NSPasteboardItem] {

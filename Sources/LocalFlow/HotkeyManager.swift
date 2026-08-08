@@ -2,6 +2,10 @@ import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
 
+/// Instances are created on the main thread at launch; the counter only
+/// needs to hand out distinct values, not thread safety.
+nonisolated(unsafe) private var probeMagicCounter = 0
+
 /// Global push-to-talk via a CGEventTap on flagsChanged events.
 /// Hold-to-talk on a bare modifier (Right Option by default) works in any app.
 /// Requires the Accessibility permission.
@@ -104,8 +108,14 @@ final class HotkeyManager {
         CFRunLoopWakeUp(tapRunLoop)
     }
 
-    /// Marks our self-test event so the callback can recognize it.
-    private static let probeMagic: Int64 = 0x10CA1F10
+    /// Marks our self-test event so the callback can recognize it. Unique
+    /// per manager: with two managers (dictation + command mode) running
+    /// two taps, a shared value would let one consume the other's probe and
+    /// each would declare its own healthy tap dead.
+    private let probeMagic: Int64 = {
+        probeMagicCounter += 1
+        return 0x10CA1F10 &+ Int64(probeMagicCounter)
+    }()
 
     /// Creates the tap and then VERIFIES events actually flow by posting a
     /// probe event through the system. Verification matters because a tap
@@ -220,7 +230,7 @@ final class HotkeyManager {
         // event would tell the frontmost app "all modifiers released"
         // mid-⇧/⌘-drag.
         probe.flags = CGEventSource.flagsState(.combinedSessionState)
-        probe.setIntegerValueField(.eventSourceUserData, value: Self.probeMagic)
+        probe.setIntegerValueField(.eventSourceUserData, value: probeMagic)
         probe.post(tap: .cgSessionEventTap)
     }
 
@@ -337,7 +347,7 @@ final class HotkeyManager {
             }
             return false
         }
-        if event.getIntegerValueField(.eventSourceUserData) == Self.probeMagic {
+        if event.getIntegerValueField(.eventSourceUserData) == probeMagic {
             DispatchQueue.main.async { self.probeSeen = true }
             return true
         }

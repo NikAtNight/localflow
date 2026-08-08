@@ -52,6 +52,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let injectionStallSeconds: TimeInterval = 90
 
     private let hotkey = HotkeyManager()
+    private let commandHotkey = HotkeyManager()
+    private var commandHotkeyActive = false
+    /// True while the in-flight recording is a command-mode utterance
+    /// rather than a dictation. Both share one recorder, so only one can be
+    /// held at a time.
+    private var recordingIsCommand = false
     private let recorder = AudioRecorder()
     private let transcriber = Transcriber()
     private let overlay = WaveformOverlay()
@@ -179,6 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsModel.onVocabularyChange = { _ in refreshVocabulary() }
         settingsModel.onCorrectionsChange = { refreshVocabulary() }
+        settingsModel.onCommandModeChange = { [weak self] in self?.startCommandHotkey() }
         settingsModel.onThemeChange = { [weak self] in
             guard let self else { return }
             if !self.isRecording { self.overlay.preview() }
@@ -208,6 +215,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// would be worse than losing a dictation the user watched get cut off.
     private func abortRecording(reason: String) {
         hotkey.cancelHold()
+        commandHotkey.cancelHold()
+        recordingIsCommand = false
         if isRecording {
             DiagLog.log("%@ while recording — discarding the recording", reason)
             isRecording = false
@@ -266,6 +275,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey.onRelease = { [weak self] in self?.hotkeyReleased() }
         hotkey.onTapDied = { [weak self] in self?.hotkeyTapDied() }
         attemptHotkeyStart()
+        startCommandHotkey()
+    }
+
+    /// Command mode runs a second, independent tap so its key is watched
+    /// exactly like the dictation key. Silently absent when command mode is
+    /// off, the keys collide, or the on-device model isn't available.
+    private func startCommandHotkey() {
+        guard Settings.commandModeActive else {
+            if commandHotkeyActive {
+                commandHotkey.stop()
+                commandHotkeyActive = false
+            }
+            return
+        }
+        commandHotkey.key = Settings.commandHotkey
+        commandHotkey.onPress = { [weak self] in self?.commandKeyPressed() }
+        commandHotkey.onRelease = { [weak self] in self?.commandKeyReleased() }
+        commandHotkey.onTapDied = { [weak self] in
+            guard let self else { return }
+            if self.recordingIsCommand { self.commandKeyReleased() }
+            self.commandHotkeyActive = false
+            self.startCommandHotkey()
+        }
+        commandHotkey.start { [weak self] verified in
+            guard let self else { return }
+            self.commandHotkeyActive = verified
+            DiagLog.log("command-mode tap %@ (%@)",
+                  verified ? "active" : "unavailable", self.commandHotkey.key.label)
+        }
     }
 
     /// The watchdog found the tap dead. A release can't arrive through a
@@ -457,6 +495,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let maxRecordingSeconds: TimeInterval = 300
 
+    // MARK: - Command mode (hold, speak an instruction, edit in place)
+
+    private func commandKeyPressed() {
+        guard modelLoaded, !isRecording else { return }
+        recordingIsCommand = true
+        hotkeyPressed()
+    }
+
+    private func commandKeyReleased() {
+        guard recordingIsCommand else { return }
+        hotkeyReleased()
+    }
+
+    /// The spoken instruction is in; grab whatever is selected in the
+    /// frontmost app and run the edit. Ordered through the same injection
+    /// queue as dictations so results never overtake each other.
+    private func runCommand(instruction: String, seq: Int, hudGeneration: Int?) {
+        TextInjector.copySelection { [weak self] selection in
+            guard let self else { return }
+            Task {
+                do {
+                    let result = try await CommandMode.run(instruction: instruction, selection: selection)
+                    guard !result.isEmpty else {
+                        self.finishDictation(seq, with: .skip)
+                        self.dismissHud(hudGeneration)
+                        self.finishProcessing()
+                        return
+                    }
+                    self.recentTranscripts.insert(RecentDictation(text: result), at: 0)
+                    if self.recentTranscripts.count > 5 { self.recentTranscripts.removeLast() }
+                    self.settingsModel?.recentDictations = self.recentTranscripts
+                    DictationHistory.record(result)
+                    self.finishDictation(seq, with: .inject(result))
+                    self.dismissHud(hudGeneration)
+                    DiagLog.log("command mode applied (selection=%d chars, result=%d chars)",
+                          selection?.count ?? 0, result.count)
+                    self.finishProcessing()
+                } catch {
+                    self.finishDictation(seq, with: .skip)
+                    self.dismissHud(hudGeneration)
+                    self.playCue("Basso")
+                    self.state = .failed("Command failed: \(error.localizedDescription)")
+                    self.scheduleFailureRecovery()
+                    self.finishProcessing()
+                }
+            }
+        }
+    }
+
     private func hotkeyReleased() {
         let releasedAt = Date()
         guard isRecording else { return }
@@ -468,13 +555,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Queue capture stop before updating the HUD. This timestamp and
         // ordering include all release-side work in the latency metric and
         // let sample handoff start as soon as possible.
+        // Whether this hold was a command must be latched here, at release:
+        // the next press can flip the flag before the stop completion runs.
+        let asCommand = recordingIsCommand
+        recordingIsCommand = false
         recorder.stop { [weak self] samples in
             guard let self else { return }
             if self.failedCaptureStarts.remove(generation) != nil {
                 self.dismissHud(generation)
                 return
             }
-            self.process(samples: samples, releasedAt: releasedAt, hudGeneration: generation)
+            self.process(samples: samples, releasedAt: releasedAt,
+                         hudGeneration: generation, asCommand: asCommand)
         }
         overlay.beginProcessing()
     }
@@ -497,7 +589,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // transcriber drop canonical hallucination phrases.
     private static let quietVoicedDBFS: Float = -40
 
-    private func process(samples rawSamples: [Float], releasedAt: Date, hudGeneration: Int? = nil) {
+    private func process(
+        samples rawSamples: [Float],
+        releasedAt: Date,
+        hudGeneration: Int? = nil,
+        asCommand: Bool = false
+    ) {
         let seq = injectionSeqCounter
         injectionSeqCounter += 1
 
@@ -520,6 +617,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cleanupWanted = Settings.cleanupEnabled
         let ollamaModel = Settings.ollamaModel
         let corrections = Settings.corrections
+        let snippets = Settings.snippets
+        // Read while the target app is still frontmost.
+        let styleProfile = AppStyleProfile.current()
 
         Task {
             do {
@@ -536,12 +636,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
+                // A command-mode utterance is an instruction, not text to
+                // paste: corrections still apply (names get misheard the
+                // same way), but no formatting, snippets, or cleanup.
+                if asCommand {
+                    let instruction = TranscriptCorrections.apply(raw, corrections: corrections)
+                    runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration)
+                    return
+                }
+
                 // Learned corrections first, then spoken formatting commands
-                // ("bullet point", "thumbs up emoji") become real formatting;
-                // cleanup sees the already-corrected text.
-                var text = VoiceFormatter.apply(TranscriptCorrections.apply(raw, corrections: corrections))
+                // ("bullet point", "thumbs up emoji") become real formatting,
+                // then snippet expansions go in verbatim; cleanup sees the
+                // finished text and is told to preserve it.
+                var text = Snippets.expand(
+                    VoiceFormatter.apply(TranscriptCorrections.apply(raw, corrections: corrections)),
+                    snippets: snippets
+                )
                 if cleanupWanted {
-                    text = await cleanTranscript(text, ollamaModel: ollamaModel)
+                    text = await cleanTranscript(text, ollamaModel: ollamaModel, profile: styleProfile)
                 }
 
                 // Keep the transcript reachable even if the paste goes
@@ -583,10 +696,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Runs the enabled cleanup backend; any failure returns the input so a
     /// dictation is never lost to the cleanup stage. Apple's on-device model
     /// is preferred; Ollama is the fallback for systems without it.
-    private func cleanTranscript(_ text: String, ollamaModel: String) async -> String {
+    private func cleanTranscript(
+        _ text: String,
+        ollamaModel: String,
+        profile: AppStyleProfile
+    ) async -> String {
         if AppleIntelligenceCleaner.isAvailable {
             do {
-                return try await AppleIntelligenceCleaner.clean(text)
+                return try await AppleIntelligenceCleaner.clean(text, profile: profile)
             } catch {
                 DiagLog.log("Apple Intelligence cleanup failed (%@), pasting uncleaned text",
                       error.localizedDescription)
@@ -594,7 +711,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         do {
-            let cleaned = try await OllamaCleaner.clean(text, model: ollamaModel)
+            let cleaned = try await OllamaCleaner.clean(text, model: ollamaModel, profile: profile)
             settingsModel?.ollamaReachable = true
             return cleaned
         } catch {
@@ -732,6 +849,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         retryMenuItem.isHidden = true
         menu.addItem(retryMenuItem)
 
+        let fixItem = NSMenuItem(
+            title: "Fix Last Dictation…",
+            action: #selector(fixLastDictation),
+            keyEquivalent: ""
+        )
+        fixItem.target = self
+        fixItem.toolTip = "Copy your corrected text, then pick this to teach LocalFlow the fix"
+        menu.addItem(fixItem)
+
         let historyItem = NSMenuItem(
             title: "Open Dictation History",
             action: #selector(openDictationHistory),
@@ -845,6 +971,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    /// Learns from an edit the user made by hand: they fix the pasted text
+    /// in their app, copy it, and pick this. The clipboard is diffed against
+    /// what LocalFlow actually pasted and the word-level swaps become
+    /// correction rules, so the same mishearing stops recurring.
+    @objc private func fixLastDictation() {
+        guard let original = recentTranscripts.first?.text else {
+            presentFixAlert(title: "Nothing to fix yet",
+                            message: "Dictate something first, then correct it and try again.")
+            return
+        }
+        guard let edited = NSPasteboard.general.string(forType: .string),
+              !edited.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            presentFixAlert(title: "Copy your corrected text first",
+                            message: "Fix the text in your app, select it and press ⌘C, then pick this again.")
+            return
+        }
+        guard edited != original else {
+            presentFixAlert(title: "That's the same text",
+                            message: "The clipboard matches the last dictation, so there's nothing to learn.")
+            return
+        }
+        let proposals = DictationDiff.proposedCorrections(original: original, edited: edited)
+        guard !proposals.isEmpty else {
+            presentFixAlert(
+                title: "No word fixes found",
+                message: "The clipboard differs from the last dictation, but not by simple word swaps. "
+                    + "reworded text isn't learned. Add the fix by hand in Settings if you want it."
+            )
+            return
+        }
+
+        let summary = proposals.map { "“\($0.wrong)” → \($0.right)" }.joined(separator: "\n")
+        let alert = NSAlert()
+        alert.messageText = proposals.count == 1 ? "Learn this correction?" : "Learn these \(proposals.count) corrections?"
+        alert.informativeText = summary
+            + "\n\nThese will be applied to future dictations, and the corrected words "
+            + "join the recognition vocabulary."
+        alert.addButton(withTitle: "Learn")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        var stored = Settings.corrections
+        for proposal in proposals {
+            stored.removeAll { $0.wrong.caseInsensitiveCompare(proposal.wrong) == .orderedSame }
+            stored.append(proposal)
+        }
+        Settings.corrections = stored
+        settingsModel?.corrections = stored.map { CorrectionPair(wrong: $0.wrong, right: $0.right) }
+        DiagLog.log("learned %d correction(s) from an edited dictation", proposals.count)
+    }
+
+    private func presentFixAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     /// Opens today's log when there is one, otherwise the folder (created
