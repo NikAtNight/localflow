@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # WhisperKit and its transitive Swift dependencies. Pinned in
+  # Package.resolved, so an update is a reviewable PR rather than a drift.
+  - package-ecosystem: "swift"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # The release workflow signs and notarizes the app, so a compromised
+  # action would be a compromised build. Keep them current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"

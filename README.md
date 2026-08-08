@@ -60,6 +60,32 @@ delete `~/Library/Application Support/LocalFlow/`.
 > normally. If you build it yourself the result is ad-hoc signed, and macOS
 > will block the first launch until you right-click the app and pick **Open**.
 
+### Verifying what you downloaded
+
+Every release DMG carries build provenance, so you can prove it was built by
+this repository's workflow rather than uploaded by someone:
+
+```bash
+gh attestation verify LocalFlow-1.0.0.dmg --repo NikAtNight/localflow
+shasum -a 256 -c SHA256SUMS.txt      # SHA256SUMS.txt is attached to the release
+```
+
+## Security & privacy
+
+LocalFlow asks for the microphone, global key monitoring, and the ability to
+synthesize keystrokes. That is a lot of trust, so the details are written
+down in [SECURITY.md](SECURITY.md): what each permission is for, what the
+event tap does and does not observe (modifier keys only, never characters),
+where transcripts are stored, and how to report a vulnerability.
+
+The short version: there is no account, no server, and no telemetry. Audio is
+transcribed on-device and never written to disk. The only outbound request
+LocalFlow makes on its own is the one-time Whisper model download.
+
+The repository runs CodeQL static analysis on every push, keeps dependencies
+current with Dependabot, and builds releases in a workflow with least-
+privilege permissions.
+
 ## Build from source
 
 Requires macOS 14+ and the Swift toolchain (Xcode Command Line Tools are enough).

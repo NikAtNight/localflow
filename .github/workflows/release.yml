@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -20,6 +20,10 @@ jobs:
     # Apple silicon: LocalFlow ships arm64-only (see README requirements),
     # and the on-device cleanup model needs a recent SDK.
     runs-on: macos-26
+    permissions:
+      contents: write # attach the DMG to the release
+      id-token: write # Sigstore signing for build provenance
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -175,11 +179,31 @@ jobs:
               echo "::warning::DMG is not stapled (un-notarized build)."
           fi
 
+      - name: Checksum
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 "LocalFlow-${APP_VERSION}.dmg" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Cryptographic proof that this DMG came out of this workflow, from
+      # this commit. Users verify with:
+      #   gh attestation verify LocalFlow-<v>.dmg --repo <owner>/<repo>
+      # Notarization proves Apple checked it; this proves where it came from.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/LocalFlow-${{ steps.version.outputs.version }}.dmg
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: LocalFlow-${{ steps.version.outputs.version }}
-          path: dist/*.dmg
+          path: |
+            dist/*.dmg
+            dist/SHA256SUMS.txt
           retention-days: 14
 
       - name: Attach DMG to the release
@@ -191,4 +215,5 @@ jobs:
           set -euo pipefail
           gh release upload "${{ steps.version.outputs.tag }}" \
             "dist/LocalFlow-${APP_VERSION}.dmg" \
+            "dist/SHA256SUMS.txt" \
             --repo "${{ github.repository }}" --clobber
