@@ -31,7 +31,10 @@ cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # identifier-based designated requirement — same effect, but any unsigned
 # binary claiming the identifier could inherit the grants.
 SIGN_ID="Talix Dev Signing"
-if security find-identity -v -p codesigning | grep -q "$SIGN_ID"; then
+# Capture instead of piping into grep -q: with pipefail, grep exiting early
+# can SIGPIPE `security` and fail the build even when the identity exists.
+IDENTITIES="$(security find-identity -v -p codesigning || true)"
+if [[ "$IDENTITIES" == *"$SIGN_ID"* ]]; then
     codesign --force --sign "$SIGN_ID" --identifier app.talix.localflow "$APP"
 else
     echo "warning: '$SIGN_ID' identity not found — ad-hoc signing with pinned requirement"
@@ -46,22 +49,36 @@ fi
 # signed binary, so the installed app's first dictation is instant. Skipped
 # gracefully if the model isn't downloaded yet (true first install).
 echo "Pre-warming CoreML model cache (can take a few minutes on a new binary)…"
-WARM_AIFF="$(mktemp -t localflow-warm).aiff"
+WARM_BASE="$(mktemp -t localflow-warm)"
+WARM_AIFF="$WARM_BASE.aiff"
 if say -o "$WARM_AIFF" "warm up" 2>/dev/null &&
    "$APP/Contents/MacOS/LocalFlow" --transcribe "$WARM_AIFF" --no-cleanup >/dev/null 2>&1; then
     echo "Model cache warm."
 else
     echo "warning: pre-warm skipped/failed — first in-app dictation will be slow"
 fi
-rm -f "$WARM_AIFF"
+rm -f "$WARM_AIFF" "$WARM_BASE"
 
 echo
 echo "Built $APP"
 
 if [[ "${1:-}" == "--install" ]]; then
     echo "Installing to /Applications…"
-    pkill -f 'LocalFlow.app/Contents/MacOS/LocalFlow' 2>/dev/null || true
-    sleep 1
+    # Stop through launchd, not pkill: a SIGTERM'd agent counts as an
+    # unsuccessful exit, so KeepAlive would relaunch the OLD binary during
+    # the sleep below and the fresh copy would exit at its already-running
+    # guard. bootout both stops the process and stops supervision.
+    launchctl bootout "gui/$(id -u)/app.talix.localflow" 2>/dev/null || true
+    # Belt for instances launched outside the agent (Finder, `open`, dev runs).
+    pkill -f '/Applications/LocalFlow.app/Contents/MacOS/LocalFlow' 2>/dev/null || true
+    # Verify the old instance is actually gone before swapping the bundle:
+    # if bootout failed (label variants, transient launchctl errors),
+    # KeepAlive can respawn it and the copy would race a running process.
+    for _ in 1 2 3 4 5; do
+        pgrep -f '/Applications/LocalFlow.app/Contents/MacOS/LocalFlow' >/dev/null || break
+        sleep 1
+    done
+    pkill -9 -f '/Applications/LocalFlow.app/Contents/MacOS/LocalFlow' 2>/dev/null || true
     rm -rf /Applications/LocalFlow.app
     cp -R "$APP" /Applications/
     open /Applications/LocalFlow.app

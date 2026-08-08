@@ -27,7 +27,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Safety nets: a paste can fail (secure input quirks, slow app) and a
     // transcription can error — neither should ever lose the user's words.
     private var recentTranscripts: [RecentDictation] = []
-    private var retrySamples: [Float]?
+    // FIFO, bounded: two failures in a row must not discard the first
+    // dictation's audio.
+    private var retrySamples: [[Float]] = []
+
+    // Dictations must paste in SPOKEN order, but cleanup time varies (a
+    // short later dictation can clear the LLM before a long earlier one).
+    // Every dictation takes a sequence number in `process`; its result
+    // waits here until all earlier numbers have resolved.
+    private enum DictationOutcome {
+        case inject(String)
+        case skip // silence, empty transcript, or a failed transcription
+    }
+    private var injectionQueue: [Int: DictationOutcome] = [:]
+    private var injectionSeqCounter = 0
+    private var nextInjectionSeq = 0
+    // True while a between-pastes beat is pending; the delayed step owns
+    // the next drain, so an outcome arriving mid-beat must not jump it.
+    private var injectionDrainPending = false
+    private var headStallTimeout: DispatchWorkItem?
+    // A dictation should resolve in seconds; one stuck this long with later
+    // results waiting behind it is hung (its text is in Recent Dictations
+    // if it ever resolves), and must not dam every later paste forever.
+    private static let injectionStallSeconds: TimeInterval = 90
 
     private let hotkey = HotkeyManager()
     private let recorder = AudioRecorder()
@@ -81,20 +103,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestPermissions()
         startHotkey()
         loadModel()
-        if Settings.cleanupEnabled { probeOllama() }
+        if Settings.cleanupEnabled {
+            probeOllama()
+            // Load the on-device model's weights now, not on the first
+            // dictation's cleanup call.
+            AppleIntelligenceCleaner.prewarm()
+        }
+        Task { await transcriber.setVocabulary(Settings.effectiveVocabulary) }
         // Called on the audio thread; overlay.push hops to main internally.
         let overlay = self.overlay
         recorder.onLevel = { level in overlay.push(level: level) }
         recorder.onSpectrum = { bands in overlay.push(spectrum: bands) }
-        // The "speak now" cue fires on the first real audio buffer, not on
-        // engine start — a Bluetooth mic can take a second to deliver.
-        recorder.onCaptureLive = { [weak self] in
-            DispatchQueue.main.async {
-                guard let self, self.isRecording else { return }
-                self.overlay.captureLive()
-                self.playCue("Pop")
-            }
-        }
+        // The capture-live cue is passed to recorder.start per press, so it
+        // carries that recording's generation and is installed on the
+        // recorder's own queues — recording A's audio can't fire B's cue.
         // Capture died mid-recording and recovery failed — stop pretending
         // the mic is live.
         recorder.onRuntimeFailure = { [weak self] error in
@@ -110,6 +132,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         recorder.deviceUID = Settings.inputDeviceUID
         recorder.keepWarm = Settings.keepMicWarm
+        // Hot-plug: when the default input or the device list changes, an
+        // idle warm session moves to whatever the next dictation would use,
+        // instead of sitting on the stale device until the next press.
+        AudioDevices.observeDeviceChanges { [weak self] in
+            self?.recorder.reconcileRoute()
+        }
         observeSystemTransitions()
         registerLoginItemOnce()
         // Bundle icon matches whichever listening theme is active; the
@@ -137,8 +165,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !Settings.keepMicWarm { self?.recorder.releaseWarmSession() }
         }
         settingsModel.onCleanupToggle = { [weak self] in
-            if Settings.cleanupEnabled { self?.probeOllama() }
+            guard Settings.cleanupEnabled else { return }
+            self?.probeOllama()
+            AppleIntelligenceCleaner.prewarm()
         }
+        // Vocabulary and corrections feed the same decoder bias; either
+        // changing rebuilds the effective term list.
+        let refreshVocabulary = { [weak self] in
+            guard let self else { return }
+            let transcriber = self.transcriber
+            let terms = Settings.effectiveVocabulary
+            Task { await transcriber.setVocabulary(terms) }
+        }
+        settingsModel.onVocabularyChange = { _ in refreshVocabulary() }
+        settingsModel.onCorrectionsChange = { refreshVocabulary() }
         settingsModel.onThemeChange = { [weak self] in
             guard let self else { return }
             if !self.isRecording { self.overlay.preview() }
@@ -260,7 +300,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func loadModel() {
         modelLoadGeneration += 1
         let generation = modelLoadGeneration
-        state = .loadingModel
+        // A model switch mid-recording must not repaint the recording UI.
+        if !isRecording { state = .loadingModel }
         let model = Settings.whisperModel
         Task {
             // Only gate the hotkey when nothing can transcribe: during a
@@ -315,13 +356,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard hotkeyActive, modelLoaded else { return }
         switch state {
         case .loadingModel, .failed:
-            state = .idle
+            // restingState, not .idle: transcriptions may still be in
+            // flight after a model switch finished loading.
+            state = isRecording ? .recording : restingState
         case .idle, .recording, .processing:
             break
         }
     }
 
     private func probeOllama() {
+        // Ollama is only the fallback backend, so no point probing (or
+        // warning about) it when the on-device model handles cleanup.
+        guard !AppleIntelligenceCleaner.isAvailable else { return }
         Task {
             settingsModel?.ollamaReachable = await OllamaCleaner.isAvailable()
         }
@@ -359,8 +405,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let generation = recordingGeneration
         // Enqueue hardware startup before doing menu/HUD work on the main
         // thread. A warm microphone can now begin delivering immediately
-        // while the visual state is updated in parallel.
-        recorder.start { [weak self] error in
+        // while the visual state is updated in parallel. The "speak now"
+        // cue fires on the first sustained audio, not on engine start, and
+        // only for THIS recording's generation.
+        recorder.start(onCaptureLive: { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, self.isRecording, generation == self.recordingGeneration else { return }
+                self.overlay.captureLive()
+                self.playCue("Pop")
+            }
+        }) { [weak self] error in
             guard let self else { return }
             if let error {
                 // A newer recording owns the UI, but the failed older start
@@ -436,19 +490,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // An accidental hotkey brush captures a sliver of near-silence, and
     // Whisper hallucinates text for it ("Thank you.") that gets pasted into
-    // the focused app — gate on duration and energy before transcribing.
-    private static let minDictationSeconds: TimeInterval = 0.4
-    private static let silenceFloorDBFS: Float = -55
-    // Above the silence floor but still too quiet to trust: transcribe, but
-    // let the transcriber drop canonical hallucination phrases.
-    private static let quietAudioDBFS: Float = -40
+    // the focused app. Gate on VOICED time before transcribing (whole-
+    // capture RMS diluted real speech with every thinking pause).
+    private static let minVoicedSeconds: TimeInterval = 0.3
+    // Voiced but still too quiet to trust: transcribe, but let the
+    // transcriber drop canonical hallucination phrases.
+    private static let quietVoicedDBFS: Float = -40
 
-    private func process(samples: [Float], releasedAt: Date, hudGeneration: Int? = nil) {
+    private func process(samples rawSamples: [Float], releasedAt: Date, hudGeneration: Int? = nil) {
+        let seq = injectionSeqCounter
+        injectionSeqCounter += 1
+
+        // Silent bookends are Whisper's main hallucination trigger and pure
+        // wasted encode time.
+        let samples = AudioRecorder.trimmingSilence(rawSamples)
         let duration = Double(samples.count) / AudioRecorder.sampleRate
-        let dbfs = AudioRecorder.rmsDBFS(of: samples)
-        guard duration >= Self.minDictationSeconds, dbfs > Self.silenceFloorDBFS else {
-            DiagLog.log("skipping transcription — %.2fs at %.0f dBFS is too short or silent",
-                  duration, dbfs)
+        let voice = AudioRecorder.voicedMetrics(of: samples)
+        guard voice.voicedSeconds >= Self.minVoicedSeconds else {
+            DiagLog.log("skipping transcription: %.2fs voiced (of %.2fs) at %.0f dBFS is below the gate",
+                  voice.voicedSeconds, duration, voice.voicedDBFS)
+            finishDictation(seq, with: .skip)
             reportHeardNothing()
             dismissHud(hudGeneration)
             return
@@ -458,32 +519,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !isRecording { state = .processing }
         let cleanupWanted = Settings.cleanupEnabled
         let ollamaModel = Settings.ollamaModel
+        let corrections = Settings.corrections
 
         Task {
             do {
                 let raw = try await transcriber.transcribe(samples: samples,
-                                                           lowEnergy: dbfs < Self.quietAudioDBFS)
+                                                           lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS)
                 guard !raw.isEmpty else {
                     // Muted mic, wrong input, silence: without a cue the
                     // user only finds out nothing was pasted much later.
                     DiagLog.log("transcription produced no text (%.1fs of audio)", duration)
+                    finishDictation(seq, with: .skip)
                     reportHeardNothing()
                     dismissHud(hudGeneration)
                     finishProcessing()
                     return
                 }
 
-                var text = raw
+                // Learned corrections first, then spoken formatting commands
+                // ("bullet point", "thumbs up emoji") become real formatting;
+                // cleanup sees the already-corrected text.
+                var text = VoiceFormatter.apply(TranscriptCorrections.apply(raw, corrections: corrections))
                 if cleanupWanted {
-                    do {
-                        text = try await OllamaCleaner.clean(raw, model: ollamaModel)
-                        settingsModel?.ollamaReachable = true
-                    } catch {
-                        // A transport error means the server is unavailable;
-                        // HTTP/decoding failures still prove it was reached.
-                        settingsModel?.ollamaReachable = !(error is URLError)
-                        DiagLog.log("Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
-                    }
+                    text = await cleanTranscript(text, ollamaModel: ollamaModel)
                 }
 
                 // Keep the transcript reachable even if the paste goes
@@ -493,23 +551,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
                 settingsModel?.recentDictations = recentTranscripts
 
-                // The success cue waits for the injector's verdict — hearing
-                // it while nothing was pasted is worse than hearing it late.
-                TextInjector.inject(text) { [weak self] landed in
-                    guard let self else { return }
-                    if landed {
-                        self.playCue("Bottle")
-                        self.lastError = nil
-                    } else {
-                        DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
-                        self.playCue("Basso")
-                        self.state = .failed("Paste may not have landed — see Recent Dictations")
-                        self.scheduleFailureRecovery()
-                    }
-                }
-                // The Cmd-V is posted synchronously inside inject — the HUD's
-                // job ends here; the 2.5s paste-confirmation window runs on
-                // cues/banners alone.
+                finishDictation(seq, with: .inject(text))
+                // The Cmd-V is posted synchronously inside inject (once the
+                // queue reaches this dictation); the HUD's job ends here;
+                // the paste-confirmation window runs on cues/banners alone.
                 dismissHud(hudGeneration)
 
                 // The metric the plan says to watch: hotkey-release → pasted text.
@@ -520,15 +565,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 finishProcessing()
             } catch {
                 processingCount -= 1
+                finishDictation(seq, with: .skip)
                 dismissHud(hudGeneration)
                 // Don't discard the audio: the error may be transient, and
                 // re-dictating a long passage from memory is the worst case.
-                retrySamples = samples
+                retrySamples.append(samples)
+                if retrySamples.count > 3 { retrySamples.removeFirst() }
                 playCue("Basso")
                 state = .failed("Transcription failed: \(error.localizedDescription) — audio kept (see Retry in menu)")
                 scheduleFailureRecovery()
             }
         }
+    }
+
+    /// Runs the enabled cleanup backend; any failure returns the input so a
+    /// dictation is never lost to the cleanup stage. Apple's on-device model
+    /// is preferred; Ollama is the fallback for systems without it.
+    private func cleanTranscript(_ text: String, ollamaModel: String) async -> String {
+        if AppleIntelligenceCleaner.isAvailable {
+            do {
+                return try await AppleIntelligenceCleaner.clean(text)
+            } catch {
+                DiagLog.log("Apple Intelligence cleanup failed (%@), pasting uncleaned text",
+                      error.localizedDescription)
+                return text
+            }
+        }
+        do {
+            let cleaned = try await OllamaCleaner.clean(text, model: ollamaModel)
+            settingsModel?.ollamaReachable = true
+            return cleaned
+        } catch {
+            // A transport error means the server is unavailable;
+            // HTTP/decoding failures still prove it was reached.
+            settingsModel?.ollamaReachable = !(error is URLError)
+            DiagLog.log("Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
+            return text
+        }
+    }
+
+    /// Records a dictation's outcome and drains everything now unblocked,
+    /// in sequence order. The paste itself happens in the drain (never
+    /// directly from `process`), so spoken order is always paste order,
+    /// even when a later dictation clears cleanup before an earlier one.
+    private func finishDictation(_ seq: Int, with outcome: DictationOutcome) {
+        guard seq >= nextInjectionSeq else {
+            // Resolved after the stall timeout already skipped past it.
+            // Pasting minutes late into whatever has focus is worse than
+            // not pasting; the text is in Recent Dictations.
+            DiagLog.log("dictation #%d resolved after being skipped, not pasting", seq)
+            return
+        }
+        injectionQueue[seq] = outcome
+        drainInjectionQueue()
+    }
+
+    /// Pastes resolved dictations from the queue head, one per beat: firing
+    /// two Cmd-Vs back-to-back replaces the clipboard before the frontmost
+    /// app services the first, which pastes the second text twice and loses
+    /// the first. Skip outcomes drain instantly. When later results are
+    /// waiting behind an unresolved head (a hung transcription or cleanup
+    /// call), a stall timeout eventually skips it so the queue never dams.
+    private func drainInjectionQueue() {
+        guard !injectionDrainPending else { return }
+        headStallTimeout?.cancel()
+        headStallTimeout = nil
+        while let next = injectionQueue.removeValue(forKey: nextInjectionSeq) {
+            nextInjectionSeq += 1
+            guard case .inject(let text) = next else { continue }
+            // The success cue waits for the injector's verdict — hearing
+            // it while nothing was pasted is worse than hearing it late.
+            TextInjector.inject(text) { [weak self] landed in
+                guard let self else { return }
+                if landed {
+                    self.playCue("Bottle")
+                    self.lastError = nil
+                } else {
+                    DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
+                    self.playCue("Basso")
+                    self.state = .failed("Paste may not have landed — see Recent Dictations")
+                    self.scheduleFailureRecovery()
+                }
+            }
+            injectionDrainPending = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self else { return }
+                self.injectionDrainPending = false
+                self.drainInjectionQueue()
+            }
+            return
+        }
+        guard !injectionQueue.isEmpty else { return }
+        let stalled = nextInjectionSeq
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.nextInjectionSeq == stalled, !self.injectionQueue.isEmpty else { return }
+            DiagLog.log("dictation #%d never resolved, skipping it to unblock %d queued paste(s)",
+                  stalled, self.injectionQueue.count)
+            self.nextInjectionSeq += 1
+            self.drainInjectionQueue()
+        }
+        headStallTimeout = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.injectionStallSeconds, execute: work)
     }
 
     /// A transcription task ended — return the UI to idle unless something
@@ -682,9 +819,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func retryFailedDictation() {
-        guard let samples = retrySamples else { return }
-        retrySamples = nil
-        process(samples: samples, releasedAt: Date())
+        guard !retrySamples.isEmpty else { return }
+        let pending = retrySamples
+        retrySamples = []
+        // Oldest first, so a multi-failure backlog pastes in spoken order
+        // (the injection queue preserves this ordering downstream too).
+        for samples in pending {
+            process(samples: samples, releasedAt: Date())
+        }
     }
 
     @objc private func copyRecentDictation(_ sender: NSMenuItem) {
@@ -727,7 +869,10 @@ extension AppDelegate: NSMenuDelegate {
         rebuildRecentDictationsMenu()
         rebuildMicrophoneMenu()
         refreshQuickActionChecks()
-        retryMenuItem.isHidden = retrySamples == nil
+        retryMenuItem.isHidden = retrySamples.isEmpty
+        retryMenuItem.title = retrySamples.count > 1
+            ? "Retry \(retrySamples.count) Failed Dictations"
+            : "Retry Failed Dictation"
         if let lastError {
             let ago = RelativeDateTimeFormatter().localizedString(for: lastError.at, relativeTo: Date())
             lastErrorMenuItem.title = "Last error (\(ago)): \(lastError.message)"

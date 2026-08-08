@@ -31,14 +31,7 @@ struct OllamaCleaner {
         return URLSession(configuration: configuration)
     }()
 
-    private static let systemPrompt = """
-    You are a transcript cleaner. You receive raw speech-to-text output. \
-    Fix punctuation and capitalization, remove filler words (um, uh, like, you know), \
-    remove false starts and repeated words, and format lists as lists when the speaker \
-    clearly dictates one. Do not change the meaning, do not add content, do not answer \
-    questions in the transcript. Output ONLY the cleaned text, with no commentary, \
-    no quotes, and no preamble.
-    """
+    private static let systemPrompt = TranscriptCleanup.systemPrompt
 
     /// Quick reachability probe with a short timeout.
     static func isAvailable() async -> Bool {
@@ -111,12 +104,6 @@ struct OllamaCleaner {
 
         let result = try JSONDecoder().decode(GenerateResponse.self, from: data)
         guard result.doneReason != "length" else { return rawText }
-        let cleaned = result.response
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // A cleaner that returns nothing (or balloons the text) has misfired.
-        guard !cleaned.isEmpty, cleaned.count < rawText.count * 3 + 64 else {
-            return rawText
-        }
-        return cleaned
+        return TranscriptCleanup.validated(result.response, raw: rawText)
     }
 }

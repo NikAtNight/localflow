@@ -48,6 +48,77 @@ final class AudioRecorder {
         return (Float(rms), Float(20 * log10(rms)))
     }
 
+    // MARK: - Voiced-audio analysis (transcription gating + trimming)
+
+    /// 20 ms analysis frames.
+    private static let voiceFrameSamples = Int(sampleRate * 0.02)
+
+    /// Frame-level voice metrics: seconds of 20ms frames whose RMS beats
+    /// `floorDBFS`, and the RMS level over just those frames. Whole-capture
+    /// RMS dilutes real speech with every pause; these don't.
+    static func voicedMetrics(
+        of samples: [Float],
+        floorDBFS: Float = -50
+    ) -> (voicedSeconds: Double, voicedDBFS: Float) {
+        let frame = voiceFrameSamples
+        guard samples.count >= frame else { return (0, -.infinity) }
+        var voicedFrames = 0
+        var voicedMeanSquares = 0.0
+        var index = 0
+        while index + frame <= samples.count {
+            let mean = meanSquare(samples, index, frame)
+            // 10·log10(mean square) == 20·log10(rms)
+            if mean > 0, Float(10 * log10(mean)) > floorDBFS {
+                voicedFrames += 1
+                voicedMeanSquares += mean
+            }
+            index += frame
+        }
+        guard voicedFrames > 0 else { return (0, -.infinity) }
+        let seconds = Double(voicedFrames * frame) / sampleRate
+        return (seconds, Float(10 * log10(voicedMeanSquares / Double(voicedFrames))))
+    }
+
+    /// Cuts leading/trailing silence, keeping `padding` seconds around the
+    /// speech. Long silent bookends are Whisper's main hallucination trigger
+    /// and pure wasted encode time. Returns the input untouched when nothing
+    /// beats the floor (the caller's gate decides what silence means).
+    static func trimmingSilence(
+        _ samples: [Float],
+        floorDBFS: Float = -55,
+        padding: Double = 0.25
+    ) -> [Float] {
+        let frame = voiceFrameSamples
+        guard samples.count > frame else { return samples }
+        var firstVoiced = -1
+        var lastVoiced = -1
+        var index = 0
+        var frameIndex = 0
+        while index + frame <= samples.count {
+            let mean = meanSquare(samples, index, frame)
+            if mean > 0, Float(10 * log10(mean)) > floorDBFS {
+                if firstVoiced < 0 { firstVoiced = frameIndex }
+                lastVoiced = frameIndex
+            }
+            index += frame
+            frameIndex += 1
+        }
+        guard firstVoiced >= 0 else { return samples }
+        let pad = Int(padding * sampleRate)
+        let start = max(0, firstVoiced * frame - pad)
+        let end = min(samples.count, (lastVoiced + 1) * frame + pad)
+        guard start > 0 || end < samples.count else { return samples }
+        return Array(samples[start..<end])
+    }
+
+    private static func meanSquare(_ samples: [Float], _ start: Int, _ count: Int) -> Double {
+        var sum = 0.0
+        for i in start..<(start + count) {
+            sum += Double(samples[i]) * Double(samples[i])
+        }
+        return sum / Double(count)
+    }
+
     /// Called on the capture queue with a 0…1 loudness level per captured
     /// buffer — drives the waveform overlay. Callee must hop to main itself.
     var onLevel: ((Float) -> Void)?
@@ -65,15 +136,23 @@ final class AudioRecorder {
         bandFrequencies.map { 2 * cos(2 * Float.pi * $0 / Float(sampleRate)) }
     }()
 
-    /// Called once per `start`, on the capture queue, when the first AUDIBLE
-    /// buffer arrives. Neither session start nor buffer arrival means the
-    /// mic is hearing — AirPods stream digital zeros for seconds while
-    /// their mic path spins up — and the "speak now" cue must not lie.
-    var onCaptureLive: (() -> Void)?
+    // The live-audio callback for the CURRENT recording, installed by
+    // `start` on the control queue and read under `lock` on the sample
+    // queue. A plain property set from the main thread raced: a new press
+    // could overwrite it while the previous session's last buffers were
+    // still draining, letting recording A's audio fire recording B's cue.
+    private var onLiveCallback: (() -> Void)? // guarded by `lock`
 
     /// RMS floor separating "mic not actually on yet" (exact zeros, -inf)
     /// from a live mic's noise floor (rarely below -70 dBFS).
     static let digitalSilenceDBFS: Float = -80
+
+    /// Consecutive audible buffers before capture counts as live (~20-40ms).
+    private static let liveStreakBuffers = 2
+
+    /// Hard recorder-side ceiling just past the app's 5-minute UI cap; the
+    /// UI cap alone lives on the main queue, which can wedge.
+    private static let maxCaptureSamples = Int(sampleRate * 310)
 
     /// Called on the control queue when capture died mid-recording and could
     /// not be recovered — without it the app looks like it's recording while
@@ -117,6 +196,8 @@ final class AudioRecorder {
     private var warmTeardown: DispatchWorkItem? // touched only on `controlQueue`
     private var recordingActive = false // guarded by `lock`
     private var captureLive = false // guarded by `lock`
+    private var audibleStreak = 0 // guarded by `lock`
+    private var pendingAudible: [Float] = [] // guarded by `lock`
     private var buffersThisSession = 0 // guarded by `lock`
     private var sessionEpoch = Date() // guarded by `lock`
     private var levelWindowSecond = 0 // guarded by `lock`
@@ -132,9 +213,18 @@ final class AudioRecorder {
     private let sampleQueue = DispatchQueue(label: "LocalFlow.AudioSamples", qos: .userInitiated)
 
     /// Starts capture; `completion` runs on the main queue with nil on
-    /// success or the error that prevented recording.
-    func start(completion: @escaping (Error?) -> Void) {
+    /// success or the error that prevented recording. `onCaptureLive` fires
+    /// once, on the capture queue, at this recording's first sustained
+    /// AUDIBLE audio. Neither session start nor buffer arrival means the
+    /// mic is hearing — AirPods stream digital zeros for seconds while
+    /// their mic path spins up — and the "speak now" cue must not lie.
+    func start(onCaptureLive: (() -> Void)? = nil, completion: @escaping (Error?) -> Void) {
         controlQueue.async {
+            // Installed here, after any queued stop() has fully drained the
+            // previous session, so old audio can never fire this callback.
+            self.lock.lock()
+            self.onLiveCallback = onCaptureLive
+            self.lock.unlock()
             do {
                 try self.startCapture()
                 DispatchQueue.main.async { completion(nil) }
@@ -255,6 +345,8 @@ final class AudioRecorder {
         lock.lock()
         samples.removeAll(keepingCapacity: true)
         captureLive = false
+        audibleStreak = 0
+        pendingAudible = []
         buffersThisSession = 0
         levelWindowSecond = 0
         peakDBFSWindow = -.infinity
@@ -275,10 +367,44 @@ final class AudioRecorder {
     }
 
     /// The device a fresh capture would land on right now: the selected mic
-    /// when it's present, otherwise the current system default.
+    /// when it's present, otherwise the current system default (resolved
+    /// through the HAL, which reflects a just-changed default immediately).
     private func currentWantedDeviceUID() -> String? {
         if let uid = deviceUID, AVCaptureDevice(uniqueID: uid) != nil { return uid }
-        return AVCaptureDevice.default(for: .audio)?.uniqueID
+        return AudioDevices.defaultInputDeviceUID() ?? AVCaptureDevice.default(for: .audio)?.uniqueID
+    }
+
+    /// The audio device landscape changed (mic plugged in or unplugged, the
+    /// system default moved). If a warm session is idling on a device the
+    /// next recording would no longer use, move it now, so hot-plugging
+    /// takes effect immediately instead of at the next press. A recording
+    /// in flight is never touched, and nothing opens the mic when no warm
+    /// session existed (a plug event must not light the mic-in-use
+    /// indicator on its own).
+    func reconcileRoute() {
+        controlQueue.async {
+            self.lock.lock()
+            let active = self.recordingActive
+            self.lock.unlock()
+            guard !active, self.session != nil else { return }
+            let wanted = self.currentWantedDeviceUID()
+            guard self.sessionDeviceUID != wanted else { return }
+            DiagLog.log("audio devices changed, moving warm session %@ -> %@",
+                  self.sessionDeviceUID ?? "?", wanted ?? "system default")
+            self.warmTeardown?.cancel()
+            self.warmTeardown = nil
+            self.tearDownSession()
+            do {
+                try self.beginCapture(pinning: wanted, fallbackToDefaultIfUnavailable: false)
+                self.scheduleWarmTeardown()
+            } catch {
+                // The new device may still be enumerating; the next press
+                // retries with the full fallback chain.
+                self.tearDownSession()
+                DiagLog.log("could not prewarm the new route (%@), next press will retry",
+                      error.localizedDescription)
+            }
+        }
     }
 
     /// Watches a started session until audible audio arrives. Two distinct
@@ -295,12 +421,21 @@ final class AudioRecorder {
     /// watched.
     private func armNoAudioWatchdog(rebuildsLeft: Int, checks: Int = 0) {
         let generation = recordingGeneration
+        // Also pin to the capture session: error recovery replaces the
+        // session (and arms its own watchdog) without bumping the recording
+        // generation, and a stale chain from before the swap must not
+        // rebuild or fail the replacement.
+        lock.lock()
+        let watchedCapture = captureGeneration
+        lock.unlock()
         controlQueue.asyncAfter(deadline: .now() + 1.2) { [weak self] in
             guard let self, generation == self.recordingGeneration, self.session != nil else { return }
             self.lock.lock()
             let live = self.captureLive
             let buffers = self.buffersThisSession
+            let captureNow = self.captureGeneration
             self.lock.unlock()
+            guard captureNow == watchedCapture else { return }
             guard !live else { return }
 
             // buffers == 0: stuck session, rebuild is the known fix. Silent
@@ -375,9 +510,15 @@ final class AudioRecorder {
     ) throws {
         tearDownSession()
         // Stray buffers from a torn-down session must not count toward the
-        // fresh session's sustained-delivery threshold.
+        // fresh session's sustained-delivery threshold. `captureLive` also
+        // resets: a mid-recording rebuild (runtime-error recovery) must
+        // prove the REPLACEMENT route audible — inheriting live state let a
+        // dead replacement record zeros unwatched until release.
         lock.lock()
         buffersThisSession = 0
+        audibleStreak = 0
+        pendingAudible = []
+        captureLive = false
         captureGeneration &+= 1
         let generation = captureGeneration
         lock.unlock()
@@ -509,21 +650,44 @@ final class AudioRecorder {
         // now" and disarmed the no-audio watchdog while the mic was still
         // seconds from working). Live = sustained delivery.
         buffersThisSession += 1
-        // Live = audible signal, not buffer arrival. AirPods bring the HFP
-        // stream up within ~300ms but deliver exact digital zeros for
-        // seconds while the mic path itself spins up — a live microphone
-        // always carries a noise floor, so -inf/-80 dBFS means "connected
-        // but not hearing yet" and must not cue the user to speak.
+        // Live = a STREAK of audible buffers, not buffer arrival and not a
+        // lone audible blip. AirPods bring the HFP stream up within ~300ms
+        // but deliver exact digital zeros for seconds while the mic path
+        // spins up — a live microphone always carries a noise floor, so
+        // -inf/-80 dBFS means "connected but not hearing yet"; and one
+        // audible buffer followed by a stall must not disarm the watchdog.
+        // Pre-live audible buffers are parked in `pendingAudible` so the
+        // streak requirement never costs the first syllable.
         let dbfs = metrics.dbfs
-        if !wasLive && dbfs > Self.digitalSilenceDBFS { captureLive = true }
+        if !wasLive {
+            if dbfs > Self.digitalSilenceDBFS {
+                audibleStreak += 1
+                if audibleStreak >= Self.liveStreakBuffers {
+                    captureLive = true
+                } else {
+                    pendingAudible.append(contentsOf: buffer)
+                }
+            } else {
+                audibleStreak = 0
+                pendingAudible.removeAll(keepingCapacity: true)
+            }
+        }
         let nowLive = captureLive
         let bufferIndex = buffersThisSession
         let epoch = sessionEpoch
         // Do not hand Whisper the digital-zero prefix produced while a cold
         // Bluetooth hands-free route is switching on. That prefix contains no
         // recoverable audio and made the first post-switch capture materially
-        // different from every warm capture.
-        if nowLive { samples.append(contentsOf: buffer) }
+        // different from every warm capture. The cap keeps a wedged main
+        // thread (which schedules the 5-minute stop) from growing the buffer
+        // without bound.
+        if nowLive, samples.count < Self.maxCaptureSamples {
+            if !pendingAudible.isEmpty {
+                samples.append(contentsOf: pendingAudible)
+                pendingAudible.removeAll(keepingCapacity: true)
+            }
+            samples.append(contentsOf: buffer)
+        }
         // Per-second peak trace: shows whether speech ever reaches usable
         // levels after the mic wakes (AirPods AGC/noise-gate diagnosis).
         peakDBFSWindow = max(peakDBFSWindow, dbfs)
@@ -536,6 +700,7 @@ final class AudioRecorder {
             levelWindowSecond = second
             peakDBFSWindow = -.infinity
         }
+        let liveCallback = (!wasLive && nowLive) ? onLiveCallback : nil
         lock.unlock()
         if completedSecond >= 0 && completedSecond < 20 {
             DiagLog.log("[diag] level s%d peak %.1f dBFS", completedSecond, completedPeak)
@@ -547,7 +712,7 @@ final class AudioRecorder {
         if !wasLive && nowLive {
             DiagLog.log("[diag] first audible buffer (%d) at +%.0fms, %.1f dBFS",
                   bufferIndex, Date().timeIntervalSince(epoch) * 1000, dbfs)
-            onCaptureLive?()
+            liveCallback?()
         }
 
         if let onLevel {

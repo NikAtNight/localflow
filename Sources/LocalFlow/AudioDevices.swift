@@ -52,6 +52,38 @@ enum AudioDevices {
         return err == noErr && id != kAudioObjectUnknown ? id : nil
     }
 
+    /// Stable UID of the current system default input, straight from the
+    /// HAL (AVCaptureDevice's notion can lag behind a just-changed default).
+    static func defaultInputDeviceUID() -> String? {
+        defaultInputDeviceID().flatMap { stringProperty($0, kAudioDevicePropertyDeviceUID) }
+    }
+
+    // Touched only on the main queue (the listener blocks are delivered there).
+    nonisolated(unsafe) private static var changeCoalescer: DispatchWorkItem?
+
+    /// Fires `handler` on the main queue whenever the system default input
+    /// or the device list changes (mic plugged/unplugged, default moved in
+    /// System Settings, AirPods connecting). A plug event produces a burst
+    /// of HAL notifications, so changes are coalesced for half a second.
+    /// Install once; listeners live for the app's lifetime.
+    static func observeDeviceChanges(_ handler: @escaping () -> Void) {
+        let selectors: [AudioObjectPropertySelector] = [
+            kAudioHardwarePropertyDefaultInputDevice,
+            kAudioHardwarePropertyDevices,
+        ]
+        for selector in selectors {
+            var addr = address(selector)
+            AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject), &addr, DispatchQueue.main
+            ) { _, _ in
+                changeCoalescer?.cancel()
+                let work = DispatchWorkItem { handler() }
+                changeCoalescer = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+            }
+        }
+    }
+
     // MARK: - HAL plumbing
 
     private static func address(

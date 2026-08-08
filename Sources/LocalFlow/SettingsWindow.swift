@@ -9,6 +9,13 @@ struct RecentDictation: Identifiable {
     let at = Date()
 }
 
+/// One learned fix: what Whisper heard vs. what it should have written.
+struct CorrectionPair: Identifiable, Equatable {
+    let id = UUID()
+    var wrong: String
+    var right: String
+}
+
 // MARK: - Model
 
 /// Observable mirror of Settings for the settings window. Writes persist
@@ -22,6 +29,8 @@ final class SettingsModel: ObservableObject {
     var onCleanupToggle: (() -> Void)?
     var onKeepWarmChange: (() -> Void)?
     var onThemeChange: (() -> Void)?
+    var onVocabularyChange: ((String) -> Void)?
+    var onCorrectionsChange: (() -> Void)?
 
     private let loginAgent = SMAppService.agent(plistName: "app.talix.localflow.plist")
 
@@ -67,6 +76,38 @@ final class SettingsModel: ObservableObject {
 
     @Published var soundCues: Bool = Settings.soundCues {
         didSet { Settings.soundCues = soundCues }
+    }
+
+    @Published var customVocabulary: String = Settings.customVocabulary {
+        didSet {
+            guard oldValue != customVocabulary else { return }
+            Settings.customVocabulary = customVocabulary
+            onVocabularyChange?(customVocabulary)
+        }
+    }
+
+    @Published var corrections: [CorrectionPair] = Settings.corrections.map {
+        CorrectionPair(wrong: $0.wrong, right: $0.right)
+    } {
+        didSet {
+            guard oldValue != corrections else { return }
+            Settings.corrections = corrections.map { ($0.wrong, $0.right) }
+            onCorrectionsChange?()
+        }
+    }
+
+    func addCorrection(wrong: String, right: String) {
+        let wrong = wrong.trimmingCharacters(in: .whitespacesAndNewlines)
+        let right = right.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !wrong.isEmpty, !right.isEmpty else { return }
+        // Re-teaching a word replaces the old fix instead of stacking a
+        // duplicate rule.
+        corrections.removeAll { $0.wrong.caseInsensitiveCompare(wrong) == .orderedSame }
+        corrections.append(CorrectionPair(wrong: wrong, right: right))
+    }
+
+    func removeCorrection(_ id: UUID) {
+        corrections.removeAll { $0.id == id }
     }
 
     @Published var keepMicWarm: Bool = Settings.keepMicWarm {
@@ -176,18 +217,80 @@ final class SettingsPanelController {
 
 struct SettingsView: View {
     @ObservedObject var model: SettingsModel
+    @State private var newCorrectionWrong = ""
+    @State private var newCorrectionRight = ""
+
+    private var cleanupLabel: String {
+        AppleIntelligenceCleaner.isAvailable
+            ? "Clean up with Apple Intelligence (on-device)"
+            : "Clean up with Ollama (\(Settings.ollamaModel))"
+    }
 
     var body: some View {
         Form {
             Section("After transcribing") {
-                Toggle("Clean up with Ollama (\(Settings.ollamaModel))", isOn: $model.cleanupEnabled)
-                if model.cleanupEnabled && !model.ollamaReachable {
+                Toggle(cleanupLabel, isOn: $model.cleanupEnabled)
+                if model.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable && !model.ollamaReachable {
                     Text("Ollama isn't running — raw transcripts will be pasted until it's back.")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
                 Toggle("Sound cues", isOn: $model.soundCues)
                 Toggle("Start at login", isOn: $model.startAtLogin)
+            }
+
+            Section {
+                TextField("Names, products, acronyms…", text: $model.customVocabulary, axis: .vertical)
+                    .lineLimit(2...4)
+            } header: {
+                Text("Custom vocabulary")
+            } footer: {
+                Text("Comma-separated terms Whisper keeps mishearing (people, projects, jargon). They bias recognition on every dictation. Keep it short, a couple dozen terms at most; heavy bias can backfire.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                ForEach(model.corrections) { pair in
+                    HStack(spacing: 8) {
+                        Text("“\(pair.wrong)”")
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "arrow.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(pair.right)
+                        Spacer()
+                        Button {
+                            model.removeCorrection(pair.id)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove this correction")
+                    }
+                }
+                HStack(spacing: 8) {
+                    TextField("Whisper wrote…", text: $newCorrectionWrong)
+                    Image(systemName: "arrow.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("Should be…", text: $newCorrectionRight)
+                    Button("Add") {
+                        model.addCorrection(wrong: newCorrectionWrong, right: newCorrectionRight)
+                        newCorrectionWrong = ""
+                        newCorrectionRight = ""
+                    }
+                    .disabled(
+                        newCorrectionWrong.trimmingCharacters(in: .whitespaces).isEmpty
+                            || newCorrectionRight.trimmingCharacters(in: .whitespaces).isEmpty
+                    )
+                }
+            } header: {
+                Text("Corrections")
+            } footer: {
+                Text("When a dictation comes out wrong, teach the fix here. It's applied to every future transcript, and the corrected word also joins the recognition vocabulary so Whisper starts hearing it right.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section {

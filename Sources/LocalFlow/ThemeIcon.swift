@@ -76,9 +76,61 @@ enum ThemeIcon {
             DiagLog.log("bundle not writable — Launchpad icon left as-is")
             return
         }
-        guard writeIcns(image, to: resources + "/AppIcon.icns") else { return }
+        // The rewrite and re-sign must be transactional: bundle contents
+        // that don't match the seal make validation fail and macOS silently
+        // drops the app's Microphone/Accessibility grants. Both the icns AND
+        // the marker are sealed resources, so both go in before signing and
+        // both roll back if the sign/verify fails (identical restored bytes
+        // mean the previous seal is valid again). A failed rebake is
+        // retried on the next apply because the marker was rolled back too.
+        // Backups live OUTSIDE the bundle: anything left inside Resources
+        // while codesign runs would itself be sealed, and deleting it
+        // afterwards would tear the seal all over again.
+        let fm = FileManager.default
+        let icnsPath = resources + "/AppIcon.icns"
+        let markerExisted = fm.fileExists(atPath: markerPath)
+        let backupDir = fm.temporaryDirectory
+            .appendingPathComponent("LocalFlowIconBackup-\(UUID().uuidString)").path
+        try? fm.createDirectory(atPath: backupDir, withIntermediateDirectories: true)
+        let icnsBackup = backupDir + "/AppIcon.icns"
+        let markerBackup = backupDir + "/ThemeIcon.marker"
+        try? fm.removeItem(atPath: icnsBackup)
+        try? fm.copyItem(atPath: icnsPath, toPath: icnsBackup)
+        try? fm.removeItem(atPath: markerBackup)
+        if markerExisted { try? fm.copyItem(atPath: markerPath, toPath: markerBackup) }
+        // No verified backup, no rebake: without one, a later failure has
+        // nothing to roll back to and the bundle would stay torn.
+        let icnsBackedUp = !fm.fileExists(atPath: icnsPath) || fm.fileExists(atPath: icnsBackup)
+        let markerBackedUp = !markerExisted || fm.fileExists(atPath: markerBackup)
+        guard icnsBackedUp, markerBackedUp else {
+            try? fm.removeItem(atPath: backupDir)
+            DiagLog.log("could not back up current icon, leaving bundle untouched")
+            return
+        }
+        func restorePrevious() {
+            if fm.fileExists(atPath: icnsBackup) {
+                try? fm.removeItem(atPath: icnsPath)
+                try? fm.copyItem(atPath: icnsBackup, toPath: icnsPath)
+            }
+            try? fm.removeItem(atPath: markerPath)
+            if markerExisted { try? fm.copyItem(atPath: markerBackup, toPath: markerPath) }
+        }
+        defer { try? fm.removeItem(atPath: backupDir) }
+
+        guard writeIcns(image, to: icnsPath) else {
+            restorePrevious()
+            DiagLog.log("icon write failed, bundle icon left as-is")
+            return
+        }
         try? theme.rawValue.write(toFile: markerPath, atomically: true, encoding: .utf8)
-        resign(bundlePath)
+        guard resign(bundlePath) else {
+            restorePrevious()
+            // Best effort: the failed attempt may have left a seal that no
+            // longer matches the restored bytes; try once to reseal them.
+            _ = resign(bundlePath)
+            DiagLog.log("re-sign failed, previous icon restored; will retry on the next theme change")
+            return
+        }
         // Nudge LaunchServices/iconservices to pick the new icon up.
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: bundlePath)
         _ = run(lsregister, ["-f", bundlePath])
@@ -89,7 +141,7 @@ enum ThemeIcon {
     /// present, else ad-hoc with the pinned identifier requirement — either
     /// way the designated requirement stays `identifier "app.talix.localflow"`,
     /// so TCC grants survive the rewrite.
-    private static func resign(_ bundlePath: String) {
+    private static func resign(_ bundlePath: String) -> Bool {
         let (_, identities) = run("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"])
         let result: (Int32, String)
         if identities.contains("Talix Dev Signing") {
@@ -97,6 +149,13 @@ enum ThemeIcon {
                 "--force", "--sign", "Talix Dev Signing",
                 "--identifier", "app.talix.localflow", bundlePath,
             ])
+        } else if run("/usr/bin/codesign", ["-dvv", bundlePath]).1.contains("Talix Dev Signing") {
+            // The bundle carries the certificate-backed identity but the
+            // keychain can't produce it right now (locked, transient error).
+            // Downgrading to ad-hoc would change the designated requirement
+            // and orphan the TCC grants; fail and let the rollback run.
+            DiagLog.log("signing identity unavailable, refusing to downgrade the bundle to ad-hoc")
+            return false
         } else {
             result = run("/usr/bin/codesign", [
                 "--force", "--sign", "-",
@@ -106,7 +165,16 @@ enum ThemeIcon {
         }
         if result.0 != 0 {
             DiagLog.log("re-sign after icon rebake failed: %@", result.1)
+            return false
         }
+        // Trust the verifier, not codesign's exit status alone: this seal
+        // is what stands between the app and losing its TCC grants.
+        let verify = run("/usr/bin/codesign", ["--verify", "--deep", bundlePath])
+        if verify.0 != 0 {
+            DiagLog.log("re-signed bundle fails verification: %@", verify.1)
+            return false
+        }
+        return true
     }
 
     private static func writeIcns(_ image: CGImage, to icnsPath: String) -> Bool {

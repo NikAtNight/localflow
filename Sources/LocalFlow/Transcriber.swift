@@ -45,6 +45,11 @@ actor Transcriber {
     private(set) var loadedModel: String?
     private var loadGeneration = 0
     private let transcriptionGate = TranscriptionGate()
+    // One CoreML pipeline construction at a time: rapid model switches could
+    // otherwise build several multi-hundred-MB pipelines concurrently.
+    private let loadGate = TranscriptionGate()
+    private var vocabularyText = ""
+    private var vocabularyTokens: [Int]?
 
     var isLoaded: Bool { whisperKit != nil }
 
@@ -81,36 +86,79 @@ actor Transcriber {
         loadGeneration += 1
         let generation = loadGeneration
 
+        await loadGate.acquire()
+        // A newer load was requested while this one queued; let it win
+        // without building (and briefly double-retaining) a stale pipeline.
+        guard generation == loadGeneration else {
+            await loadGate.release()
+            return
+        }
+
         // With only `model` and `downloadBase`, WhisperKit 0.18 downloads the
         // model but leaves CoreML unloaded until the first transcription.
         // Load now so the app's ready state is truthful and the first hotkey
         // release does not pay model initialization latency.
         let cachedFolder = Self.cachedModelFolder(for: model)
         let pipe: WhisperKit
-        if let cachedFolder {
-            do {
-                pipe = try await WhisperKit(Self.config(modelFolder: cachedFolder))
-            } catch {
-                // Directory presence is only a fast completeness signal. If
-                // CoreML or tokenizer loading finds corruption, let the Hub
-                // path verify/repair the cache instead of stranding startup.
-                guard generation == loadGeneration else { return }
-                DiagLog.log(
-                    "cached model %@ failed to load (%@) — resolving through model registry",
-                    model,
-                    error.localizedDescription
-                )
+        do {
+            if let cachedFolder {
+                do {
+                    pipe = try await WhisperKit(Self.config(modelFolder: cachedFolder))
+                } catch {
+                    // Directory presence is only a fast completeness signal. If
+                    // CoreML or tokenizer loading finds corruption, let the Hub
+                    // path verify/repair the cache instead of stranding startup.
+                    DiagLog.log(
+                        "cached model %@ failed to load (%@) — resolving through model registry",
+                        model,
+                        error.localizedDescription
+                    )
+                    pipe = try await WhisperKit(Self.config(model: model))
+                }
+            } else {
                 pipe = try await WhisperKit(Self.config(model: model))
             }
-        } else {
-            pipe = try await WhisperKit(Self.config(model: model))
+        } catch {
+            await loadGate.release()
+            throw error
         }
+        await loadGate.release()
 
-        // The actor is reentrant across that await: a later load may have
+        // The actor is reentrant across those awaits: a later load may have
         // started (and even finished) meanwhile. Last requested wins.
         guard generation == loadGeneration else { return }
         whisperKit = pipe
         loadedModel = model
+        refreshVocabularyTokens()
+    }
+
+    /// Names and jargon to bias decoding toward (people, products,
+    /// acronyms). Encoded with the loaded model's tokenizer and fed to the
+    /// decoder as preceding context on every transcription.
+    func setVocabulary(_ terms: String) {
+        vocabularyText = terms
+        refreshVocabularyTokens()
+    }
+
+    private func refreshVocabularyTokens() {
+        let trimmed = vocabularyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let tokenizer = whisperKit?.tokenizer else {
+            vocabularyTokens = nil
+            return
+        }
+        // Whisper treats promptTokens as text that came before, so phrase
+        // the vocabulary as prose it might continue. Capped: heavy bias
+        // makes the decoder hallucinate the vocabulary into silence.
+        let tokens = tokenizer.encode(text: " Glossary: \(trimmed).")
+        vocabularyTokens = tokens.isEmpty ? nil : Array(tokens.prefix(96))
+    }
+
+    private func currentDecodingOptions() -> DecodingOptions {
+        var options = Self.decodingOptions
+        if let vocabularyTokens {
+            options.promptTokens = vocabularyTokens
+        }
+        return options
     }
 
     private static func config(model: String) -> WhisperKitConfig {
@@ -153,13 +201,21 @@ actor Transcriber {
     /// treated as an empty transcript. Never applied to normal-energy audio —
     /// people legitimately dictate "thank you".
     func transcribe(samples: [Float], lowEnergy: Bool = false) async throws -> String {
-        guard let whisperKit else { throw TranscriberError.notLoaded }
+        guard whisperKit != nil else { throw TranscriberError.notLoaded }
         await transcriptionGate.acquire()
+        // Snapshot pipeline + options together AFTER the gate: a model
+        // switch while queued regenerates the vocabulary tokens, and the
+        // old pipeline must never decode with the new model's token IDs.
+        guard let whisperKit else {
+            await transcriptionGate.release()
+            throw TranscriberError.notLoaded
+        }
+        let options = currentDecodingOptions()
         let results: [TranscriptionResult]
         do {
             results = try await whisperKit.transcribe(
                 audioArray: samples,
-                decodeOptions: Self.decodingOptions
+                decodeOptions: options
             )
             await transcriptionGate.release()
         } catch {
@@ -170,11 +226,13 @@ actor Transcriber {
         let isHallucination = lowEnergy && Self.isCanonicalHallucination(text)
         if text.isEmpty || isHallucination {
             // A healthy-audio dictation has produced an empty transcript in
-            // the field; the raw hypothesis tells whether Whisper returned
-            // nothing or post-processing ate a real result.
+            // the field; the raw hypothesis SIZE tells whether Whisper
+            // returned nothing or post-processing ate a real result. Never
+            // log the content itself — the diag file must stay free of
+            // dictated text.
             let raw = results.map(\.text).joined(separator: " ")
-            DiagLog.log("[diag] empty transcript: raw=\"%@\" segments=%d lowEnergy=%d",
-                  String(raw.prefix(160)), results.count, lowEnergy ? 1 : 0)
+            DiagLog.log("[diag] empty transcript: rawChars=%d segments=%d lowEnergy=%d",
+                  raw.count, results.count, lowEnergy ? 1 : 0)
         }
         if isHallucination { return "" }
         return text
@@ -183,13 +241,18 @@ actor Transcriber {
     /// Transcribes an audio file (any AVFoundation-readable format).
     /// Used by the `--transcribe` CLI mode for testing and benchmarking.
     func transcribe(file path: String) async throws -> String {
-        guard let whisperKit else { throw TranscriberError.notLoaded }
+        guard whisperKit != nil else { throw TranscriberError.notLoaded }
         await transcriptionGate.acquire()
+        guard let whisperKit else {
+            await transcriptionGate.release()
+            throw TranscriberError.notLoaded
+        }
+        let options = currentDecodingOptions()
         let results: [TranscriptionResult]
         do {
             results = try await whisperKit.transcribe(
                 audioPath: path,
-                decodeOptions: Self.decodingOptions
+                decodeOptions: options
             )
             await transcriptionGate.release()
         } catch {
@@ -204,6 +267,14 @@ actor Transcriber {
         options.task = .transcribe
         options.temperature = 0
         options.language = "en"
+        // Don't decode <|...|> markers into the transcript at all (the
+        // regex stripper below stays as a second line of defense).
+        options.skipSpecialTokens = true
+        options.suppressBlank = true
+        // Chunk long captures at detected speech gaps instead of blind 30s
+        // windows: fewer mid-word window boundaries on multi-minute
+        // dictations. Timestamps stay ON: paragraph detection needs them.
+        options.chunkingStrategy = .vad
         return options
     }()
 
@@ -225,11 +296,44 @@ actor Transcriber {
     }
 
     private static func finalize(_ results: [TranscriptionResult]) -> String {
-        let text = results
-            .map(\.text)
-            .joined(separator: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return stripSpecialTokens(from: text)
+        joinSegments(results.flatMap { result in
+            result.segments.map { (text: $0.text, start: $0.start, end: $0.end) }
+        })
+    }
+
+    /// A long silence between segments is the speaker moving to a new
+    /// thought, so insert a paragraph break there so dictated text doesn't
+    /// come out as one wall of prose. Conservative on purpose: the previous
+    /// segment must end a sentence (a thinking pause mid-sentence is not a
+    /// paragraph), and the gap must be well beyond a breath.
+    static let paragraphPauseSeconds: Float = 1.75
+
+    static func joinSegments(_ segments: [(text: String, start: Float, end: Float)]) -> String {
+        var output = ""
+        var previousEnd: Float?
+        for segment in segments {
+            let text = stripSpecialTokens(from: segment.text)
+            // Empty segments (markers, silence) don't move `previousEnd`:
+            // the silence they span still counts toward the pause.
+            guard !text.isEmpty else { continue }
+            if !output.isEmpty {
+                if let previousEnd,
+                   segment.start - previousEnd >= paragraphPauseSeconds,
+                   endsSentence(output) {
+                    output += "\n\n"
+                } else {
+                    output += " "
+                }
+            }
+            output += text
+            previousEnd = segment.end
+        }
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func endsSentence(_ text: String) -> Bool {
+        guard let last = text.last else { return false }
+        return last == "." || last == "!" || last == "?" || last == "…"
     }
 
     /// Whisper sometimes emits bracketed markers like [BLANK_AUDIO] or (music).

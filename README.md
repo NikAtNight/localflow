@@ -78,9 +78,14 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
     to the clipboard (the safety net if a paste ever goes astray).
   - **Retry Failed Dictation** — appears if a transcription errored; the
     audio is kept so your words aren't lost.
-  - **Clean Up with Ollama** — toggle the LLM cleanup pass (see below).
+  - **Clean up transcripts** — toggle the LLM cleanup pass (Apple
+    Intelligence on-device when available, else Ollama — see below).
   - **Sound Cues** — start/finish sounds, plus a low "Basso" when something
     fails (mic denied, nothing heard, transcription error).
+- In "System Default" microphone mode, plugging in or removing a mic (or
+  changing the default in System Settings) re-routes immediately, including
+  an idle warm session. A specifically selected mic stays pinned while it's
+  connected.
 - Your previous clipboard contents are saved and restored after the paste.
 - Recordings cap at 5 minutes, and putting the Mac to sleep mid-hold discards
   the recording (rather than pasting it somewhere surprising at wake).
@@ -95,6 +100,42 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   dictation. Follow `~/Library/Logs/LocalFlow-diag.log`, or open Console.app
   and filter for "LocalFlow:". Launch the app bundle normally so macOS keeps
   Microphone and Accessibility permission attribution on LocalFlow.
+
+### Automatic formatting
+
+Structure is inferred without any spoken command:
+
+- **Paragraphs**: a pause of ~1.75 s after a finished sentence starts a new
+  paragraph (detected from Whisper segment timestamps; a mid-sentence
+  thinking pause never splits).
+- **Numbered lists**: a spoken run of sentence-initial ordinals ("First,
+  … Second, … Finally, …" or "Number one, … number two, …") becomes
+  `1.` / `2.` / `3.` items. Conservative: needs at least two cues, ascending
+  from one, each punctuated. "Second, I want to say thanks" alone stays prose.
+- **With cleanup on**, an LLM additionally breaks long text into
+  paragraphs at topic shifts and formats clearly-enumerated items as lists,
+  while preserving whatever the deterministic pass already produced.
+
+### Voice formatting commands
+
+Explicit spoken commands also work (deterministically, before any Ollama
+pass, with cleanup on or off). Case-insensitive, and tolerant of
+the commas/periods Whisper wraps around them:
+
+| Say                          | Get                                    |
+| ---------------------------- | -------------------------------------- |
+| "new line"                   | line break                             |
+| "new paragraph"              | blank line                             |
+| "bullet point milk bullet point eggs" | `- Milk` / `- Eggs`           |
+| "numbered list apples next item bananas" | `1. Apples` / `2. Bananas` |
+| "next item"                  | next list item (only inside a list)    |
+| "thumbs up emoji"            | 👍                                     |
+
+Emoji names cover the common set (thumbs up/down, heart, fire, rocket,
+tada/party, check mark, eyes, thinking, shrug, 💯, …); see `emojiNames` in
+`Sources/LocalFlow/VoiceFormatter.swift` to add your own. Caveat: command
+phrases are always interpreted, so literally dictating the words "bullet
+point" mid-sentence starts a list item.
 
 ### Headless testing / benchmarking
 
@@ -111,13 +152,21 @@ build/LocalFlow.app/Contents/MacOS/LocalFlow --transcribe /tmp/test.aiff
 Measured on this machine (M-series, small.en, warm): **~790 ms** for 7 s of
 speech, model load ~1.8 s at app startup.
 
-## Optional: Ollama cleanup (the WhisperFlow "magic" pass)
+## Optional: LLM cleanup (the WhisperFlow "magic" pass)
 
 Whisper already punctuates reasonably well; larger Whisper models improve word
 recognition but do not replace semantic cleanup. The cleanup pass additionally
-strips fillers ("um", "like"), fixes false starts, and formats dictated lists.
-It runs against a local Ollama server and is **off by default** because it's
-the main latency cost (roughly 0.5–1.5 s extra for a 4B model).
+strips filler tics ("um", standalone "like"), fixes false starts, and handles
+the judgment-call formatting (topic-shift paragraphs, list detection). It is
+**off by default** because it's the main latency cost.
+
+Two backends, picked automatically:
+
+1. **Apple Intelligence (preferred)**: on macOS 26+ with Apple Intelligence
+   turned on in System Settings, cleanup runs on Apple's on-device foundation
+   model. Nothing to install, no server, fully local, typically well under a
+   second.
+2. **Ollama (fallback)**: used only when the on-device model isn't available.
 
 ```bash
 brew install ollama
@@ -125,10 +174,23 @@ ollama serve                # or: brew services start ollama
 ollama pull gemma3:4b
 ```
 
-Then enable **Clean Up with Ollama** in the menubar. If Ollama is down or
-errors, LocalFlow pastes the raw transcript instead — dictation never blocks
-on the LLM. To use a different model:
-`defaults write app.talix.localflow ollamaModel "qwen2.5:3b"`.
+Enable the cleanup toggle in Settings (its label shows which backend is
+active). If the backend is down or errors, LocalFlow pastes the raw
+transcript instead — dictation never blocks on the LLM. Different Ollama
+model: `defaults write app.talix.localflow ollamaModel "qwen2.5:3b"`.
+
+## Custom vocabulary & corrections
+
+Settings has a "Custom vocabulary" field: comma-separated names and jargon
+(people, projects, acronyms) that Whisper keeps mishearing. The terms are
+tokenized and fed to the decoder as context on every dictation, biasing
+recognition toward them. Keep the list short; heavy bias can backfire.
+
+The "Corrections" section closes the loop on words that still come out
+wrong: teach a fix ("talex" → "Talix") and it is (1) applied automatically
+to every future transcript (whole words only, case-aware) and (2) its
+correct form joins the recognition vocabulary, so the decoder gets a chance
+to hear it right at the source.
 
 ## Known limitations (v1)
 
@@ -136,7 +198,7 @@ on the LLM. To use a different model:
 - In Secure Input fields (password boxes), LocalFlow avoids the clipboard and
   falls back to synthesized keystrokes, which some apps ignore.
 - No streaming/partial transcription — audio is transcribed on hotkey release.
-- No cursor-context awareness or custom vocabulary yet (see plan roadmap).
+- No cursor-context awareness yet (see plan roadmap).
 
 ## Layout
 
@@ -146,8 +208,10 @@ on the LLM. To use a different model:
 | `Sources/LocalFlow/AudioRecorder.swift` | AVAudioEngine capture → 16 kHz mono Float32 |
 | `Sources/LocalFlow/WaveformOverlay.swift` | Floating live-waveform pill shown while recording |
 | `scripts/generate-icon.swift` + `scripts/make-icon.sh` | Renders the app icon (organic wave motif) → `Resources/AppIcon.icns` |
-| `Sources/LocalFlow/Transcriber.swift` | WhisperKit model load + transcription |
-| `Sources/LocalFlow/OllamaCleaner.swift` | Optional local LLM cleanup via Ollama HTTP API |
+| `Sources/LocalFlow/Transcriber.swift` | WhisperKit model load + transcription, vocabulary biasing, pause-paragraphing |
+| `Sources/LocalFlow/VoiceFormatter.swift` | Spoken formatting commands + automatic list detection |
+| `Sources/LocalFlow/TranscriptCleaner.swift` | Cleanup contract + Apple Intelligence on-device backend |
+| `Sources/LocalFlow/OllamaCleaner.swift` | Fallback LLM cleanup via Ollama HTTP API |
 | `Sources/LocalFlow/TextInjector.swift` | Clipboard+⌘V injection with save/restore, keystroke fallback |
 | `Sources/LocalFlow/AppDelegate.swift` | Menubar UI, permissions, pipeline orchestration |
 

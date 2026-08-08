@@ -14,6 +14,8 @@ enum Settings {
         static let soundCues = "soundCues"
         static let keepMicWarm = "keepMicWarm"
         static let inputDeviceUID = "inputDeviceUID"
+        static let customVocabulary = "customVocabulary"
+        static let corrections = "corrections"
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
         static let hudOrigin = "hudOrigin"
@@ -21,14 +23,14 @@ enum Settings {
 
     /// Whisper models available in the argmaxinc/whisperkit-coreml registry,
     /// ordered from development-speed models to the best dictation models.
-    /// Small English remains the default latency/accuracy balance; the large
-    /// variants are the quality choices on well-provisioned Apple silicon.
+    /// Large v3 Turbo is the default: on Apple silicon it decodes fast
+    /// enough for dictation and is the single biggest accuracy lever.
     static let whisperModels: [(name: String, label: String)] = [
         ("openai_whisper-tiny.en", "Tiny English (development only)"),
         ("openai_whisper-base.en", "Base English (fast, lower accuracy)"),
-        ("openai_whisper-small.en", "Small English (balanced, current default)"),
-        ("openai_whisper-large-v3-v20240930_626MB", "Large v3 626 MB (best compact accuracy)"),
-        ("openai_whisper-large-v3-v20240930_turbo", "Large v3 Turbo (best Mac speed + accuracy)"),
+        ("openai_whisper-small.en", "Small English (fastest useful)"),
+        ("openai_whisper-large-v3-v20240930_626MB", "Large v3 626 MB (compact, high accuracy)"),
+        ("openai_whisper-large-v3-v20240930_turbo", "Large v3 Turbo (best accuracy, default)"),
     ]
 
     static var hotkey: HotkeyManager.Key {
@@ -43,8 +45,38 @@ enum Settings {
     }
 
     static var whisperModel: String {
-        get { defaults.string(forKey: Key.whisperModel) ?? "openai_whisper-small.en" }
+        get { defaults.string(forKey: Key.whisperModel) ?? "openai_whisper-large-v3-v20240930_turbo" }
         set { defaults.set(newValue, forKey: Key.whisperModel) }
+    }
+
+    /// Comma-separated names and jargon (people, products, acronyms) to
+    /// bias Whisper's decoder toward. Empty = no biasing.
+    static var customVocabulary: String {
+        get { defaults.string(forKey: Key.customVocabulary) ?? "" }
+        set { defaults.set(newValue, forKey: Key.customVocabulary) }
+    }
+
+    /// User-taught fixes for words Whisper keeps getting wrong: what it
+    /// heard paired with what it should have written. Stored as
+    /// tab-separated "wrong\tright" strings.
+    static var corrections: [(wrong: String, right: String)] {
+        get {
+            (defaults.stringArray(forKey: Key.corrections) ?? []).compactMap { entry in
+                let parts = entry.components(separatedBy: "\t")
+                guard parts.count == 2 else { return nil }
+                return (parts[0], parts[1])
+            }
+        }
+        set { defaults.set(newValue.map { "\($0.wrong)\t\($0.right)" }, forKey: Key.corrections) }
+    }
+
+    /// The recognition-bias vocabulary Whisper actually receives: the
+    /// free-form custom terms plus every correction's right-hand side. A
+    /// word the user had to fix is by definition a word worth biasing toward.
+    static var effectiveVocabulary: String {
+        let base = customVocabulary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let corrected = corrections.map(\.right)
+        return ((base.isEmpty ? [] : [base]) + corrected).joined(separator: ", ")
     }
 
     static var cleanupEnabled: Bool {
