@@ -23,6 +23,7 @@ enum Settings {
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
         static let hudOrigin = "hudOrigin"
+        static let settingsWindowOrigin = "settingsWindowOrigin"
     }
 
     /// Whisper models available in the argmaxinc/whisperkit-coreml registry,
@@ -177,6 +178,25 @@ enum Settings {
                 defaults.set("\(origin.x),\(origin.y)", forKey: Key.hudOrigin)
             } else {
                 defaults.removeObject(forKey: Key.hudOrigin)
+            }
+        }
+    }
+
+    /// Where the settings window was last dragged to, so reopening it puts
+    /// it back. Same encoding as `hudOrigin`.
+    static var settingsWindowOrigin: CGPoint? {
+        get {
+            let parts = (defaults.string(forKey: Key.settingsWindowOrigin) ?? "")
+                .split(separator: ",")
+                .compactMap { Double($0) }
+            guard parts.count == 2 else { return nil }
+            return CGPoint(x: parts[0], y: parts[1])
+        }
+        set {
+            if let origin = newValue {
+                defaults.set("\(origin.x),\(origin.y)", forKey: Key.settingsWindowOrigin)
+            } else {
+                defaults.removeObject(forKey: Key.settingsWindowOrigin)
             }
         }
     }

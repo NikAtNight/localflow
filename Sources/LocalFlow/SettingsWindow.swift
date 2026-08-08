@@ -221,12 +221,19 @@ final class SettingsModel: ObservableObject {
 final class SettingsPanelController {
     private let model: SettingsModel
     private var window: NSWindow?
-    private var closeObserver: NSObjectProtocol?
+    private var moveObserver: NSObjectProtocol?
+    private var hasBeenShown = false
 
     init(model: SettingsModel) {
         self.model = model
     }
 
+    /// The window is built once and reused. It used to be destroyed on
+    /// close (to stop the theme previews animating) and rebuilt on the next
+    /// open, which is why it never came back where you left it: the
+    /// restored frame was overwritten by SwiftUI's own sizing pass on the
+    /// fresh window. The previews now stop on their own when the window
+    /// isn't visible (see PreviewHudView), so the window can simply live on.
     func show() {
         model.refresh()
         if window == nil {
@@ -235,30 +242,45 @@ final class SettingsPanelController {
             w.title = "LocalFlow Settings"
             w.styleMask = [.titled, .closable, .miniaturizable]
             w.isReleasedWhenClosed = false
-            // The window is recreated per open, so the autosaved frame must
-            // be restored explicitly (and before the window is shown);
-            // center() only on the first-ever open, or it clobbers the restore.
-            w.setFrameAutosaveName("LocalFlowSettings")
-            if !w.setFrameUsingName("LocalFlowSettings") {
-                w.center()
-            }
-            // Drop the window on close so the 16 animating previews stop.
-            closeObserver = NotificationCenter.default.addObserver(
-                forName: NSWindow.willCloseNotification, object: w, queue: .main
-            ) { [weak self] _ in
+            window = w
+            // Position is persisted explicitly rather than through
+            // setFrameAutosaveName: the SwiftUI content resizes the window
+            // after the frame is restored, and the autosave machinery hands
+            // back a frame whose height no longer matches, moving it.
+            moveObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didMoveNotification, object: w, queue: .main
+            ) { _ in
                 MainActor.assumeIsolated {
-                    guard let self else { return }
-                    self.window = nil
-                    if let observer = self.closeObserver {
-                        NotificationCenter.default.removeObserver(observer)
-                        self.closeObserver = nil
-                    }
+                    guard w.isVisible else { return }
+                    Settings.settingsWindowOrigin = w.frame.origin
                 }
             }
-            window = w
         }
+        guard let window else { return }
+        let isFirstOpen = !hasBeenShown
+        hasBeenShown = true
         NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        window.makeKeyAndOrderFront(nil)
+        restorePosition(of: window, centeringIfUnplaced: isFirstOpen)
+    }
+
+    /// Applies the saved origin after AppKit has finished sizing the window
+    /// to its SwiftUI content; doing it earlier lets that layout pass move
+    /// the window again. Off-screen origins (a display that is no longer
+    /// attached) fall back to centering.
+    private func restorePosition(of window: NSWindow, centeringIfUnplaced: Bool) {
+        guard let origin = Settings.settingsWindowOrigin else {
+            if centeringIfUnplaced { window.center() }
+            return
+        }
+        DispatchQueue.main.async {
+            let candidate = NSRect(origin: origin, size: window.frame.size)
+            if NSScreen.screens.contains(where: { $0.visibleFrame.intersects(candidate) }) {
+                window.setFrameOrigin(origin)
+            } else {
+                window.center()
+            }
+        }
     }
 }
 
@@ -280,6 +302,31 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            Section {
+                HelpRow(symbol: "mic.fill", title: "Dictate anywhere") {
+                    Text("Hold **\(model.hotkey.label)**, speak, let go. The text is pasted where your cursor is. You can start the next dictation while the last one is still working.")
+                }
+                HelpRow(symbol: "text.badge.plus", title: "Say the formatting") {
+                    Text("\u{201C}new line\u{201D}, \u{201C}new paragraph\u{201D}, \u{201C}bullet point\u{201D}, \u{201C}numbered list\u{201D}, \u{201C}next item\u{201D}, and \u{201C}thumbs up emoji\u{201D} (and ~45 other emoji names) become real formatting.")
+                }
+                HelpRow(symbol: "wand.and.stars", title: "Or don't") {
+                    Text("Pause a beat after a finished sentence and you get a new paragraph. Counting off items (\u{201C}First\u{2026} Second\u{2026} Finally\u{2026}\u{201D}) becomes a numbered list on its own.")
+                }
+                if Settings.commandModeActive {
+                    HelpRow(symbol: "pencil.and.outline", title: "Edit with your voice") {
+                        Text("Select text, hold **\(model.commandHotkey.label)** and say what to change (\u{201C}make this shorter\u{201D}). With nothing selected, what you ask for is written at the cursor.")
+                    }
+                }
+                HelpRow(symbol: "arrow.uturn.backward", title: "When it gets a word wrong") {
+                    Text("Fix it in your app, copy it, then pick **Fix Last Dictation\u{2026}** in the menubar. LocalFlow learns the word and starts hearing it correctly.")
+                }
+                HelpRow(symbol: "lock.fill", title: "Everything stays here") {
+                    Text("Speech never leaves this Mac. Transcription is local, cleanup uses Apple's on-device model, and the history is a plain folder you own.")
+                }
+            } header: {
+                Text("How it works")
+            }
+
             Section("After transcribing") {
                 Toggle(cleanupLabel, isOn: $model.cleanupEnabled)
                 if model.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable && !model.ollamaReachable {
@@ -511,6 +558,31 @@ struct SettingsView: View {
     }
 }
 
+/// One line of the "How it works" section: an icon, a short title, and a
+/// sentence of explanation.
+struct HelpRow<Detail: View>: View {
+    let symbol: String
+    let title: String
+    @ViewBuilder let detail: Detail
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol)
+                .foregroundStyle(.tint)
+                .frame(width: 18)
+                .padding(.top, 1)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                detail
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.vertical, 1)
+    }
+}
+
 struct ThemeGallery: View {
     @Binding var selection: HudTheme
     private let columns = [GridItem(.adaptive(minimum: 186), spacing: 10)]
@@ -585,6 +657,7 @@ final class PreviewHudView: NSView {
     private let renderer: HudRenderer
     private var time: CGFloat = 0
     private var timer: Timer?
+    private var visibilityObservers: [NSObjectProtocol] = []
 
     init(theme: HudTheme) {
         renderer = theme.makeRenderer()
@@ -594,13 +667,47 @@ final class PreviewHudView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    deinit {
+        visibilityObservers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    /// The settings window outlives a close now, so "am I in a window" is no
+    /// longer the right animation trigger: 16 renderers must not keep
+    /// running at 30fps behind a closed window. Follow actual visibility.
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil {
+        visibilityObservers.forEach(NotificationCenter.default.removeObserver)
+        visibilityObservers = []
+        guard let window else {
             stopAnimating()
-        } else {
-            startAnimating()
+            return
         }
+        let center = NotificationCenter.default
+        for name: NSNotification.Name in [
+            NSWindow.didChangeOcclusionStateNotification,
+            NSWindow.willCloseNotification,
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification,
+        ] {
+            let closing = name == NSWindow.willCloseNotification
+            visibilityObservers.append(
+                center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        // willClose fires while the window still reports
+                        // itself visible, so treat it as "gone" outright.
+                        self?.syncAnimation(forcedOff: closing)
+                    }
+                }
+            )
+        }
+        syncAnimation(forcedOff: false)
+    }
+
+    private func syncAnimation(forcedOff: Bool) {
+        let visible = !forcedOff
+            && (window?.isVisible ?? false)
+            && (window?.occlusionState.contains(.visible) ?? false)
+        if visible { startAnimating() } else { stopAnimating() }
     }
 
     private func startAnimating() {
