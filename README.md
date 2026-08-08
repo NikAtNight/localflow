@@ -76,6 +76,7 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
     and specializes the selected model before Ready.
   - **Recent Dictations** — the last 5 transcripts; click one to copy it back
     to the clipboard (the safety net if a paste ever goes astray).
+  - **Open Dictation History** — today's log in Finder (see below).
   - **Retry Failed Dictation** — appears if a transcription errored; the
     audio is kept so your words aren't lost.
   - **Clean up transcripts** — toggle the LLM cleanup pass (Apple
@@ -192,6 +193,29 @@ to every future transcript (whole words only, case-aware) and (2) its
 correct form joins the recognition vocabulary, so the decoder gets a chance
 to hear it right at the source.
 
+## Dictation history
+
+Every dictation is appended to a daily Markdown file:
+
+```
+~/Library/Application Support/LocalFlow/History/2026-08-08.md
+```
+
+```markdown
+# Dictations 2026-08-08
+
+## 09:14:22
+
+1. Review the pull request.
+2. Merge it.
+```
+
+Application Support rather than `~/Documents` on purpose: Documents is
+iCloud-synced on most Macs, and transcripts should stay on the machine.
+Files are written owner-only (0600) and nothing is pruned automatically.
+The menubar has **Open Dictation History**; Settings has the on/off toggle,
+a folder shortcut, and **Delete All History**.
+
 ## Known limitations (v1)
 
 - English-only decoding by default (the `.en` Whisper models).
@@ -213,6 +237,7 @@ to hear it right at the source.
 | `Sources/LocalFlow/TranscriptCleaner.swift` | Cleanup contract + Apple Intelligence on-device backend |
 | `Sources/LocalFlow/OllamaCleaner.swift` | Fallback LLM cleanup via Ollama HTTP API |
 | `Sources/LocalFlow/TextInjector.swift` | Clipboard+⌘V injection with save/restore, keystroke fallback |
+| `Sources/LocalFlow/DictationHistory.swift` | Daily Markdown log of every dictation |
 | `Sources/LocalFlow/AppDelegate.swift` | Menubar UI, permissions, pipeline orchestration |
 
 ## License

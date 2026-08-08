@@ -16,6 +16,7 @@ enum Settings {
         static let inputDeviceUID = "inputDeviceUID"
         static let customVocabulary = "customVocabulary"
         static let corrections = "corrections"
+        static let saveHistory = "saveHistory"
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
         static let hudOrigin = "hudOrigin"
@@ -87,6 +88,13 @@ enum Settings {
     static var ollamaModel: String {
         get { defaults.string(forKey: Key.ollamaModel) ?? "gemma3:4b" }
         set { defaults.set(newValue, forKey: Key.ollamaModel) }
+    }
+
+    /// Append every dictation to the daily Markdown log (see
+    /// DictationHistory). On by default: it stays on this Mac.
+    static var saveHistory: Bool {
+        get { defaults.object(forKey: Key.saveHistory) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.saveHistory) }
     }
 
     static var soundCues: Bool {

@@ -78,6 +78,10 @@ final class SettingsModel: ObservableObject {
         didSet { Settings.soundCues = soundCues }
     }
 
+    @Published var saveHistory: Bool = Settings.saveHistory {
+        didSet { Settings.saveHistory = saveHistory }
+    }
+
     @Published var customVocabulary: String = Settings.customVocabulary {
         didSet {
             guard oldValue != customVocabulary else { return }
@@ -219,6 +223,7 @@ struct SettingsView: View {
     @ObservedObject var model: SettingsModel
     @State private var newCorrectionWrong = ""
     @State private var newCorrectionRight = ""
+    @State private var confirmingHistoryDeletion = false
 
     private var cleanupLabel: String {
         AppleIntelligenceCleaner.isAvailable
@@ -342,9 +347,45 @@ struct SettingsView: View {
             } header: {
                 Text("Recent dictations")
             } footer: {
-                Text("The last five, kept in memory only — cleared when LocalFlow quits.")
+                Text("The last five this session. The full history lives in the daily log below.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Save every dictation to a daily log", isOn: $model.saveHistory)
+                HStack {
+                    Button("Open History Folder") {
+                        try? FileManager.default.createDirectory(
+                            at: DictationHistory.folder,
+                            withIntermediateDirectories: true,
+                            attributes: [.posixPermissions: 0o700]
+                        )
+                        NSWorkspace.shared.open(DictationHistory.folder)
+                    }
+                    Spacer()
+                    Button("Delete All History…", role: .destructive) {
+                        confirmingHistoryDeletion = true
+                    }
+                }
+            } header: {
+                Text("History")
+            } footer: {
+                Text("One Markdown file per day in Application Support, on this Mac only (not iCloud-synced). Nothing is deleted automatically.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .confirmationDialog(
+                "Delete all saved dictations?",
+                isPresented: $confirmingHistoryDeletion,
+                titleVisibility: .visible
+            ) {
+                Button("Delete All History", role: .destructive) {
+                    try? DictationHistory.deleteAll()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Every daily log file is removed. This can't be undone.")
             }
         }
         .formStyle(.grouped)

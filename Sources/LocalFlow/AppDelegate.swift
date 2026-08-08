@@ -546,10 +546,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
                 // Keep the transcript reachable even if the paste goes
                 // wrong — "Recent Dictations" in the menu and the settings
-                // window can re-copy it.
+                // window can re-copy it. The daily history file keeps it
+                // past this session.
                 recentTranscripts.insert(RecentDictation(text: text), at: 0)
                 if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
                 settingsModel?.recentDictations = recentTranscripts
+                DictationHistory.record(text)
 
                 finishDictation(seq, with: .inject(text))
                 // The Cmd-V is posted synchronously inside inject (once the
@@ -729,6 +731,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         retryMenuItem.target = self
         retryMenuItem.isHidden = true
         menu.addItem(retryMenuItem)
+
+        let historyItem = NSMenuItem(
+            title: "Open Dictation History",
+            action: #selector(openDictationHistory),
+            keyEquivalent: ""
+        )
+        historyItem.target = self
+        historyItem.toolTip = "Daily Markdown log of every dictation, stored on this Mac"
+        menu.addItem(historyItem)
         menu.addItem(.separator())
 
         // Quick actions: the settings people flip most often, applied through
@@ -834,6 +845,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
+    }
+
+    /// Opens today's log when there is one, otherwise the folder (created
+    /// on demand so the menu item is never a dead end).
+    @objc private func openDictationHistory() {
+        let today = DictationHistory.folder
+            .appendingPathComponent(DictationHistory.fileName(for: Date()))
+        if FileManager.default.fileExists(atPath: today.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([today])
+            return
+        }
+        try? FileManager.default.createDirectory(
+            at: DictationHistory.folder,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        NSWorkspace.shared.open(DictationHistory.folder)
     }
 
     @objc private func openAccessibilitySettings() {
