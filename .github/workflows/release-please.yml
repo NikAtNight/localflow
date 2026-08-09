@@ -3,6 +3,9 @@ name: Release Please
 on:
   push:
     branches: [main]
+  # Re-run by hand after fixing something (the first run failed on a repo
+  # setting rather than on the commit history).
+  workflow_dispatch:
 
 permissions:
   contents: read
