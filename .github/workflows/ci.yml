@@ -33,10 +33,18 @@ jobs:
           # after "$OUT" was parsed into the variable NAME under the runner's
           # C locale, so `set -u` aborted the release build while the same
           # script ran fine in a UTF-8 shell locally.
-          if LC_ALL=C grep -n '[^\x00-\x7F]' scripts/*.sh; then
+          #
+          # perl, not grep: BSD grep (what macOS ships) does not understand
+          # \x escapes in a bracket expression and silently matches almost
+          # every line, so a grep-based version of this check passed locally
+          # against GNU/ugrep and then failed CI on a clean tree.
+          OFFENDERS="$(perl -ne 'print "$ARGV:$.: $_" if /[^\x00-\x7F]/' scripts/*.sh)"
+          if [[ -n "$OFFENDERS" ]]; then
+            echo "$OFFENDERS"
             echo "error: non-ASCII characters found in shell scripts (see above)" >&2
             exit 1
           fi
+          echo "scripts are ASCII-clean"
 
       - name: Build
         run: swift build
