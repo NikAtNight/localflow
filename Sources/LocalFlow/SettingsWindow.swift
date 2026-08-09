@@ -39,6 +39,7 @@ final class SettingsModel: ObservableObject {
     var onVocabularyChange: ((String) -> Void)?
     var onCorrectionsChange: (() -> Void)?
     var onCommandModeChange: (() -> Void)?
+    var onAutomaticUpdatesChange: (() -> Void)?
 
     private let loginAgent = SMAppService.agent(plistName: "app.talix.localflow.plist")
 
@@ -88,6 +89,14 @@ final class SettingsModel: ObservableObject {
 
     @Published var saveHistory: Bool = Settings.saveHistory {
         didSet { Settings.saveHistory = saveHistory }
+    }
+
+    @Published var automaticUpdates: Bool = Settings.automaticUpdates {
+        didSet {
+            guard oldValue != automaticUpdates else { return }
+            Settings.automaticUpdates = automaticUpdates
+            onAutomaticUpdatesChange?()
+        }
     }
 
     @Published var commandModeEnabled: Bool = Settings.commandModeEnabled {
@@ -336,6 +345,24 @@ struct SettingsView: View {
                 }
                 Toggle("Sound cues", isOn: $model.soundCues)
                 Toggle("Start at login", isOn: $model.startAtLogin)
+            }
+
+            Section {
+                Toggle("Install updates automatically", isOn: $model.automaticUpdates)
+                    .disabled(!UpdateController.isSupported)
+                if !UpdateController.isSupported {
+                    Text("This is a locally built copy, so it can't self-update. Released builds check daily and install in the background.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Updates")
+            } footer: {
+                if UpdateController.isSupported {
+                    Text("Checks once a day and installs the next time you quit. Updates are signed, and one that fails verification is discarded rather than installed. \u{201C}Check for Updates\u{2026}\u{201D} in the menubar looks right now.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section {

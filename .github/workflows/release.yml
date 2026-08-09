@@ -179,13 +179,58 @@ jobs:
               echo "::warning::DMG is not stapled (un-notarized build)."
           fi
 
+      # Sparkle installs from a ZIP, not the DMG, and needs an appcast whose
+      # entry is EdDSA-signed with the key whose public half is baked into
+      # Info.plist. Without a valid signature the running app refuses the
+      # update, which is the point.
+      - name: Build Sparkle appcast
+        if: steps.version.outputs.is_release == 'true' && steps.signing.outputs.sign == 'true'
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          RELEASE_NOTES: ${{ github.event.release.body }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SPARKLE_PRIVATE_KEY:-}" ]]; then
+            echo "::warning::SPARKLE_PRIVATE_KEY not set - shipping without an appcast, so existing installs will not auto-update."
+            exit 0
+          fi
+
+          BIN="$(find .build/artifacts -type d -name bin -path '*sparkle*' -print -quit)"
+          if [[ -z "$BIN" ]]; then
+            echo "error: Sparkle tools not found in .build/artifacts" >&2
+            exit 1
+          fi
+
+          # generate_appcast wants a directory of archives to describe.
+          mkdir -p sparkle-updates
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/LocalFlow.app "sparkle-updates/LocalFlow-${APP_VERSION}.zip"
+
+          # Release notes become the "what's new" body Sparkle shows.
+          if [[ -n "${RELEASE_NOTES:-}" ]]; then
+            printf '%s\n' "$RELEASE_NOTES" > "sparkle-updates/LocalFlow-${APP_VERSION}.html"
+          fi
+
+          "$BIN/generate_appcast" \
+            --ed-key-file - \
+            --download-url-prefix "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/" \
+            --link "https://github.com/${{ github.repository }}" \
+            sparkle-updates <<< "$SPARKLE_PRIVATE_KEY"
+
+          cp sparkle-updates/appcast.xml dist/appcast.xml
+          cp "sparkle-updates/LocalFlow-${APP_VERSION}.zip" dist/
+          echo "Appcast entries:"
+          grep -c "<item>" dist/appcast.xml
+          grep -o 'sparkle:edSignature="[^"]\{0,12\}' dist/appcast.xml | head -1
+
       - name: Checksum
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           cd dist
-          shasum -a 256 "LocalFlow-${APP_VERSION}.dmg" > SHA256SUMS.txt
+          shasum -a 256 *.dmg *.zip 2>/dev/null > SHA256SUMS.txt || shasum -a 256 *.dmg > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       # Cryptographic proof that this DMG came out of this workflow, from
@@ -213,7 +258,11 @@ jobs:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          gh release upload "${{ steps.version.outputs.tag }}" \
-            "dist/LocalFlow-${APP_VERSION}.dmg" \
-            "dist/SHA256SUMS.txt" \
+          ASSETS=("dist/LocalFlow-${APP_VERSION}.dmg" "dist/SHA256SUMS.txt")
+          # appcast.xml must be attached for the feed URL
+          # (/releases/latest/download/appcast.xml) to resolve, and the ZIP is
+          # what the appcast points existing installs at.
+          [[ -f dist/appcast.xml ]] && ASSETS+=("dist/appcast.xml")
+          [[ -f "dist/LocalFlow-${APP_VERSION}.zip" ]] && ASSETS+=("dist/LocalFlow-${APP_VERSION}.zip")
+          gh release upload "${{ steps.version.outputs.tag }}" "${ASSETS[@]}" \
             --repo "${{ github.repository }}" --clobber

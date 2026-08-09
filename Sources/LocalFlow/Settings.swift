@@ -20,6 +20,7 @@ enum Settings {
         static let commandHotkey = "commandHotkey"
         static let commandModeEnabled = "commandModeEnabled"
         static let snippets = "snippets"
+        static let automaticUpdates = "automaticUpdates"
         static let loginItemSetupDone = "loginItemSetupDone"
         static let hudTheme = "hudTheme"
         static let hudOrigin = "hudOrigin"
@@ -134,6 +135,14 @@ enum Settings {
                 forKey: Key.snippets
             )
         }
+    }
+
+    /// Check for and install new versions in the background. Sparkle keeps
+    /// its own copy of this in SUEnableAutomaticChecks; this is the value
+    /// the Settings toggle reads and writes.
+    static var automaticUpdates: Bool {
+        get { defaults.object(forKey: Key.automaticUpdates) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.automaticUpdates) }
     }
 
     /// Append every dictation to the daily Markdown log (see

@@ -51,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // if it ever resolves), and must not dam every later paste forever.
     private static let injectionStallSeconds: TimeInterval = 90
 
+    private let updates = UpdateController()
     private let hotkey = HotkeyManager()
     private let commandHotkey = HotkeyManager()
     private var commandHotkeyActive = false
@@ -146,6 +147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         observeSystemTransitions()
         registerLoginItemOnce()
+        updates.start()
         // Bundle icon matches whichever listening theme is active; the
         // make-app icon is only the classic-wave default.
         ThemeIcon.apply(HudTheme.current)
@@ -186,6 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsModel.onVocabularyChange = { _ in refreshVocabulary() }
         settingsModel.onCorrectionsChange = { refreshVocabulary() }
         settingsModel.onCommandModeChange = { [weak self] in self?.startCommandHotkey() }
+        settingsModel.onAutomaticUpdatesChange = { [weak self] in self?.updates.applyAutomaticPreference() }
         settingsModel.onThemeChange = { [weak self] in
             guard let self else { return }
             if !self.isRecording { self.overlay.preview() }
@@ -914,6 +917,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         permissionsItem.target = self
         menu.addItem(permissionsItem)
+
+        let updateItem = NSMenuItem(
+            title: "Check for Updates…",
+            action: #selector(UpdateController.checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updateItem.target = updates
+        menu.addItem(updateItem)
 
         let quitItem = NSMenuItem(title: "Quit LocalFlow", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)

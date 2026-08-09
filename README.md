@@ -60,6 +60,21 @@ delete `~/Library/Application Support/LocalFlow/`.
 > normally. If you build it yourself the result is ad-hoc signed, and macOS
 > will block the first launch until you right-click the app and pick **Open**.
 
+### Updates
+
+Released builds update themselves with [Sparkle](https://sparkle-project.org).
+LocalFlow checks once a day, downloads in the background, and installs the
+next time you quit. "Check for Updates…" in the menubar looks immediately,
+and the whole thing can be turned off in Settings.
+
+Updates are only installed if two independent signatures check out: an EdDSA
+signature on the appcast entry, so a hijacked feed cannot serve a malicious
+build, and the Developer ID code signature, which must match the running app.
+Anything that fails is discarded rather than installed.
+
+Locally built copies are self-signed, so they cannot self-update and the
+option is disabled for them. Build with `make-app.sh` to upgrade those.
+
 ### Verifying what you downloaded
 
 Every release DMG carries build provenance, so you can prove it was built by

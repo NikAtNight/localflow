@@ -32,6 +32,25 @@ fi
 mkdir -p "$APP/Contents/Library/LaunchAgents"
 cp Resources/app.talix.localflow.plist "$APP/Contents/Library/LaunchAgents/"
 
+# Sparkle ships as a binary framework. `swift build` links against it but
+# does not embed it, so the bundle has to carry its own copy and the binary
+# needs an rpath pointing at it. Without this the app dies at launch with a
+# dyld "Library not loaded" error.
+SPARKLE_FRAMEWORK="$(find .build/artifacts -type d -name 'Sparkle.framework' -path '*macos*' -print -quit || true)"
+if [[ -n "$SPARKLE_FRAMEWORK" ]]; then
+    mkdir -p "$APP/Contents/Frameworks"
+    # ditto preserves the framework's symlink layout and signature xattrs.
+    ditto "$SPARKLE_FRAMEWORK" "$APP/Contents/Frameworks/Sparkle.framework"
+    # SwiftPM usually emits this rpath already; add it only when missing so a
+    # real install_name_tool failure is not swallowed by an "already exists".
+    if ! otool -l "$APP/Contents/MacOS/LocalFlow" | grep -q '@executable_path/../Frameworks'; then
+        install_name_tool -add_rpath @executable_path/../Frameworks "$APP/Contents/MacOS/LocalFlow"
+    fi
+    echo "Embedded Sparkle.framework"
+else
+    echo "warning: Sparkle.framework not found - run 'swift build' first; updates will be unavailable"
+fi
+
 # App icon - rendered on demand; re-run scripts/make-icon.sh to redesign.
 if [ ! -f Resources/AppIcon.icns ]; then
     ./scripts/make-icon.sh
@@ -52,6 +71,17 @@ if [[ "$IDENTITIES" == *"$SIGN_ID"* ]]; then
     # requirement); the local self-signed identity does not, and enabling it
     # there would only add a way for dev builds to differ from shipped ones.
     if [[ "$SIGN_ID" == "Developer ID Application"* ]]; then
+        # Nested code signs first, inside out. Sparkle carries an XPC pair,
+        # the Autoupdate helper, and Updater.app; each is independently
+        # verified at install time, and an unsigned one fails notarization.
+        if [[ -d "$APP/Contents/Frameworks/Sparkle.framework" ]]; then
+            while IFS= read -r nested; do
+                codesign --force --sign "$SIGN_ID" --options runtime --timestamp "$nested"
+            done < <(find "$APP/Contents/Frameworks/Sparkle.framework" \
+                \( -name '*.xpc' -o -name '*.app' -o -name 'Autoupdate' -o -name 'Updater' \) -print)
+            codesign --force --sign "$SIGN_ID" --options runtime --timestamp \
+                "$APP/Contents/Frameworks/Sparkle.framework"
+        fi
         codesign --force --sign "$SIGN_ID" \
             --identifier app.talix.localflow \
             --options runtime \
@@ -60,6 +90,9 @@ if [[ "$IDENTITIES" == *"$SIGN_ID"* ]]; then
             "$APP"
         echo "Signed for distribution: $SIGN_ID"
     else
+        if [[ -d "$APP/Contents/Frameworks/Sparkle.framework" ]]; then
+            codesign --force --sign "$SIGN_ID" --deep "$APP/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
+        fi
         codesign --force --sign "$SIGN_ID" --identifier app.talix.localflow "$APP"
     fi
 elif [[ -n "${SIGN_IDENTITY:-}" ]]; then

@@ -22,6 +22,18 @@
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<!-- Sparkle. The feed is the appcast attached to the newest GitHub
+	     release; that /releases/latest/download/ URL is a stable redirect.
+	     SUPublicEDKey is the public half of the key the release workflow
+	     signs updates with, so a hijacked feed cannot install anything. -->
+	<key>SUFeedURL</key>
+	<string>https://github.com/NikAtNight/localflow/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>4/wQ6XehB3rZhDeckFB1O5atGbo7TkxxYcDsC175bos=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>LocalFlow records audio while you hold the dictation hotkey so it can transcribe your speech on-device.</string>
 </dict>
