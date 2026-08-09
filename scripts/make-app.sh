@@ -4,7 +4,7 @@
 # itself instead of your terminal.
 #
 # Environment overrides (used by the release workflow; all optional):
-#   SIGN_IDENTITY   codesign identity, e.g. "Developer ID Application: … (TEAMID)".
+#   SIGN_IDENTITY   codesign identity, e.g. "Developer ID Application: ... (TEAMID)".
 #                   Defaults to the local self-signed identity.
 #   APP_VERSION     stamped into CFBundleShortVersionString / CFBundleVersion.
 #   SKIP_PREWARM=1  skip the CoreML warm-up (no model cache on CI runners).
@@ -12,7 +12,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-echo "Building (release)…"
+echo "Building (release)..."
 swift build -c release
 
 APP="build/LocalFlow.app"
@@ -32,7 +32,7 @@ fi
 mkdir -p "$APP/Contents/Library/LaunchAgents"
 cp Resources/app.talix.localflow.plist "$APP/Contents/Library/LaunchAgents/"
 
-# App icon — rendered on demand; re-run scripts/make-icon.sh to redesign.
+# App icon - rendered on demand; re-run scripts/make-icon.sh to redesign.
 if [ ! -f Resources/AppIcon.icns ]; then
     ./scripts/make-icon.sh
 fi
@@ -40,7 +40,7 @@ cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # Sign with the stable self-signed identity so TCC grants (Microphone,
 # Accessibility) survive rebuilds. Fallback: ad-hoc with an explicit
-# identifier-based designated requirement — same effect, but any unsigned
+# identifier-based designated requirement - same effect, but any unsigned
 # binary claiming the identifier could inherit the grants.
 SIGN_ID="${SIGN_IDENTITY:-Talix Dev Signing}"
 ENTITLEMENTS="Resources/LocalFlow.entitlements"
@@ -68,7 +68,7 @@ elif [[ -n "${SIGN_IDENTITY:-}" ]]; then
     echo "error: requested signing identity '$SIGN_ID' not found in the keychain" >&2
     exit 1
 else
-    echo "warning: '$SIGN_ID' identity not found — ad-hoc signing with pinned requirement"
+    echo "warning: '$SIGN_ID' identity not found - ad-hoc signing with pinned requirement"
     codesign --force --sign - \
         --identifier app.talix.localflow \
         -r='designated => identifier "app.talix.localflow"' \
@@ -86,14 +86,14 @@ if [[ "${SKIP_PREWARM:-0}" == "1" ]]; then
     exit 0
 fi
 
-echo "Pre-warming CoreML model cache (can take a few minutes on a new binary)…"
+echo "Pre-warming CoreML model cache (can take a few minutes on a new binary)..."
 WARM_BASE="$(mktemp -t localflow-warm)"
 WARM_AIFF="$WARM_BASE.aiff"
 if say -o "$WARM_AIFF" "warm up" 2>/dev/null &&
    "$APP/Contents/MacOS/LocalFlow" --transcribe "$WARM_AIFF" --no-cleanup >/dev/null 2>&1; then
     echo "Model cache warm."
 else
-    echo "warning: pre-warm skipped/failed — first in-app dictation will be slow"
+    echo "warning: pre-warm skipped/failed - first in-app dictation will be slow"
 fi
 rm -f "$WARM_AIFF" "$WARM_BASE"
 
@@ -101,7 +101,7 @@ echo
 echo "Built $APP"
 
 if [[ "${1:-}" == "--install" ]]; then
-    echo "Installing to /Applications…"
+    echo "Installing to /Applications..."
     # Stop through launchd, not pkill: a SIGTERM'd agent counts as an
     # unsuccessful exit, so KeepAlive would relaunch the OLD binary during
     # the sleep below and the fresh copy would exit at its already-running

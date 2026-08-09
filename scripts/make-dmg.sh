@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 
 APP="build/LocalFlow.app"
 if [[ ! -d "$APP" ]]; then
-    echo "error: $APP not found — run scripts/make-app.sh first" >&2
+    echo "error: $APP not found - run scripts/make-app.sh first" >&2
     exit 1
 fi
 
@@ -30,7 +30,7 @@ trap 'rm -rf "$STAGE"' EXIT
 ditto "$APP" "$STAGE/LocalFlow.app"
 ln -s /Applications "$STAGE/Applications"
 
-echo "Building $OUT…"
+echo "Building $OUT..."
 hdiutil create \
     -volname "LocalFlow $VERSION" \
     -srcfolder "$STAGE" \

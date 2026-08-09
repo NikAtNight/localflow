@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-echo "Rendering icon…"
+echo "Rendering icon..."
 swift scripts/generate-icon.swift "$TMP/icon_1024.png"
 
 ICONSET="$TMP/AppIcon.iconset"

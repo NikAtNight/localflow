@@ -25,6 +25,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-swiftpm-
 
+      - name: Lint shell scripts
+        run: |
+          set -euo pipefail
+          bash -n scripts/*.sh
+          # Non-ASCII in these scripts is not cosmetic. An ellipsis directly
+          # after "$OUT" was parsed into the variable NAME under the runner's
+          # C locale, so `set -u` aborted the release build while the same
+          # script ran fine in a UTF-8 shell locally.
+          if LC_ALL=C grep -n '[^\x00-\x7F]' scripts/*.sh; then
+            echo "error: non-ASCII characters found in shell scripts (see above)" >&2
+            exit 1
+          fi
+
       - name: Build
         run: swift build
 
