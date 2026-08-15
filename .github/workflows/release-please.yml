@@ -21,7 +21,7 @@ jobs:
       # on main and works out the next version from commit messages. Merging
       # that PR tags and publishes the release, which is what triggers
       # release.yml to build, sign, notarize, and attach the DMG.
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         with:
           config-file: .github/release-please-config.json
           manifest-file: .github/.release-please-manifest.json
