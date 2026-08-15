@@ -238,7 +238,7 @@ jobs:
       #   gh attestation verify LocalFlow-<v>.dmg --repo <owner>/<repo>
       # Notarization proves Apple checked it; this proves where it came from.
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/LocalFlow-${{ steps.version.outputs.version }}.dmg
 
