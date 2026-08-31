@@ -67,14 +67,23 @@ final class LocalTextModelPolicy {
 
     private let apple: any AppleTextModelBackend
     private let ollama: any OllamaTextModelBackend
+    private let now: @MainActor () -> Date
+    private let prewarmCooldown: TimeInterval
     private var prewarmOperations: [String: PrewarmOperation] = [:]
     private var lastPrewarmByModel: [String: Date] = [:]
 
     private(set) var ollamaReachability = OllamaReachability.unknown
 
-    init(apple: any AppleTextModelBackend, ollama: any OllamaTextModelBackend) {
+    init(
+        apple: any AppleTextModelBackend,
+        ollama: any OllamaTextModelBackend,
+        now: @escaping @MainActor () -> Date = { Date() },
+        prewarmCooldown: TimeInterval = 60
+    ) {
         self.apple = apple
         self.ollama = ollama
+        self.now = now
+        self.prewarmCooldown = prewarmCooldown
     }
 
     func cleanup(
@@ -135,7 +144,7 @@ final class LocalTextModelPolicy {
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            return fallback
+            throw CommandMode.CommandError.unavailable
         }
     }
 
@@ -191,9 +200,9 @@ final class LocalTextModelPolicy {
             return
         }
 
-        let now = Date()
+        let now = now()
         if let lastPrewarm = lastPrewarmByModel[model],
-           now.timeIntervalSince(lastPrewarm) < 60 {
+           now.timeIntervalSince(lastPrewarm) < prewarmCooldown {
             return
         }
         lastPrewarmByModel[model] = now

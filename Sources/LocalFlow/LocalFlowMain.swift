@@ -2,17 +2,17 @@ import AppKit
 
 // LocalFlow — local push-to-talk dictation for macOS.
 // Hold the hotkey, speak, release: WhisperKit transcribes on-device,
-// optional Ollama pass cleans the text, result is pasted into the focused app.
+// optional local model cleanup prepares the text for the focused app.
 
 @main
 struct LocalFlowMain {
     // NSApplication.delegate is weak — hold the delegate for the app's lifetime.
     @MainActor private static var delegate: AppDelegate?
 
-    static func main() {
+    static func main() async {
         let arguments = CommandLine.arguments
         if let flagIndex = arguments.firstIndex(of: "--transcribe"), flagIndex + 1 < arguments.count {
-            transcribeFile(
+            await transcribeFile(
                 arguments[flagIndex + 1],
                 cleanupEnabled: !arguments.contains("--no-cleanup")
             )
@@ -22,7 +22,7 @@ struct LocalFlowMain {
             // Optional trailing arg: a device UID to record from (defaults
             // to the saved setting / system default).
             let uid = flagIndex + 1 < arguments.count ? arguments[flagIndex + 1] : nil
-            MainActor.assumeIsolated { recordTest(deviceUID: uid) }
+            await MainActor.run { recordTest(deviceUID: uid) }
             return
         }
 
@@ -30,15 +30,17 @@ struct LocalFlowMain {
         // twice — easy to hit by launching a fresh build while the login
         // item is still running. (Checked after --transcribe: the CLI mode
         // may run alongside the app.)
-        let alreadyRunning = NSRunningApplication
-            .runningApplications(withBundleIdentifier: "app.talix.localflow")
-            .contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        let alreadyRunning = await MainActor.run {
+            NSRunningApplication
+                .runningApplications(withBundleIdentifier: "app.talix.localflow")
+                .contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        }
         if alreadyRunning {
             FileHandle.standardError.write(Data("LocalFlow is already running — exiting this instance.\n".utf8))
             return
         }
 
-        MainActor.assumeIsolated {
+        await MainActor.run {
             let app = NSApplication.shared
             let appDelegate = AppDelegate()
             delegate = appDelegate
@@ -51,55 +53,42 @@ struct LocalFlowMain {
     /// Headless mode for testing and latency benchmarking:
     ///   LocalFlow --transcribe recording.wav
     /// Loads the configured Whisper model, transcribes the file with the same
-    /// pipeline the app uses (including optional Ollama cleanup), and prints
+    /// pipeline the app uses (including optional local model cleanup), and prints
     /// per-stage timings to stderr and the final text to stdout.
-    private static func transcribeFile(_ path: String, cleanupEnabled: Bool) {
-        let done = DispatchSemaphore(value: 0)
-        Task {
-            defer { done.signal() }
-            do {
-                let stderr = FileHandle.standardError
-                let transcriber = Transcriber()
+    private static func transcribeFile(_ path: String, cleanupEnabled: Bool) async {
+        do {
+            let stderr = FileHandle.standardError
+            let transcriber = Transcriber()
 
-                var stageStart = Date()
-                await transcriber.setVocabulary(Settings.effectiveVocabulary)
-                try await transcriber.load(model: Settings.whisperModel)
-                stderr.write(Data("model load: \(elapsedMs(since: stageStart))ms (\(Settings.whisperModel))\n".utf8))
+            var stageStart = Date()
+            await transcriber.setVocabulary(Settings.effectiveVocabulary)
+            try await transcriber.load(model: Settings.whisperModel)
+            stderr.write(Data("model load: \(elapsedMs(since: stageStart))ms (\(Settings.whisperModel))\n".utf8))
 
+            stageStart = Date()
+            var text = try await transcriber.transcribe(file: path)
+            stderr.write(Data("transcribe: \(elapsedMs(since: stageStart))ms\n".utf8))
+            text = VoiceFormatter.apply(
+                TranscriptCorrections.apply(text, corrections: Settings.corrections)
+            )
+
+            if cleanupEnabled, Settings.cleanupEnabled {
                 stageStart = Date()
-                var text = try await transcriber.transcribe(file: path)
-                stderr.write(Data("transcribe: \(elapsedMs(since: stageStart))ms\n".utf8))
-                text = VoiceFormatter.apply(
-                    TranscriptCorrections.apply(text, corrections: Settings.corrections)
+                let result = try await LocalTextModelPolicy.shared.cleanup(
+                    text,
+                    model: Settings.ollamaModel,
+                    profile: .general
                 )
-
-                if cleanupEnabled, Settings.cleanupEnabled {
-                    stageStart = Date()
-                    if AppleIntelligenceCleaner.isAvailable {
-                        do {
-                            text = try await AppleIntelligenceCleaner.clean(text)
-                            stderr.write(Data("apple intelligence cleanup: \(elapsedMs(since: stageStart))ms\n".utf8))
-                        } catch {
-                            stderr.write(Data("apple intelligence cleanup failed, using raw transcript: \(error.localizedDescription)\n".utf8))
-                        }
-                    } else {
-                        do {
-                            text = try await OllamaCleaner.clean(text, model: Settings.ollamaModel)
-                            stderr.write(Data("ollama cleanup: \(elapsedMs(since: stageStart))ms (\(Settings.ollamaModel))\n".utf8))
-                        } catch {
-                            // Ollama died mid-call — keep the raw transcript rather than lose it.
-                            stderr.write(Data("ollama cleanup failed, using raw transcript: \(error.localizedDescription)\n".utf8))
-                        }
-                    }
-                }
-
-                print(text)
-            } catch {
-                FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
-                exit(1)
+                text = result.text
+                let outcome = result.succeeded ? "complete" : "raw fallback"
+                stderr.write(Data("local cleanup: \(elapsedMs(since: stageStart))ms (\(outcome))\n".utf8))
             }
+
+            print(text)
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+            exit(1)
         }
-        done.wait()
     }
 
     private static func elapsedMs(since start: Date) -> Int {
