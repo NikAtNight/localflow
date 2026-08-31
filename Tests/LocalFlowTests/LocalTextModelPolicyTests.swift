@@ -274,7 +274,7 @@ final class OllamaClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
         XCTAssertEqual(request.timeoutInterval, 45, accuracy: 0.001)
 
-        let json = try XCTUnwrap(request.httpBody)
+        let json = try Self.bodyData(from: request)
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: json) as? [String: Any])
         XCTAssertEqual(object["model"] as? String, "s1-mini")
         XCTAssertEqual(object["keep_alive"] as? String, "30m")
@@ -359,6 +359,28 @@ final class OllamaClientTests: XCTestCase {
             headerFields: ["Content-Type": "application/json"]
         )!
         return (response, Data(json.utf8))
+    }
+
+    private static func bodyData(from request: URLRequest) throws -> Data {
+        if let body = request.httpBody { return body }
+
+        let stream = try XCTUnwrap(request.httpBodyStream)
+        stream.open()
+        defer { stream.close() }
+
+        var body = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                stream.read(
+                    bytes.bindMemory(to: UInt8.self).baseAddress!,
+                    maxLength: bytes.count
+                )
+            }
+            if count < 0 { throw stream.streamError ?? URLError(.cannotDecodeContentData) }
+            if count == 0 { return body }
+            body.append(contentsOf: buffer.prefix(count))
+        }
     }
 }
 
