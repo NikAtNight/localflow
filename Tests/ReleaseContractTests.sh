@@ -14,6 +14,10 @@ INFO_PLIST="$TEST_ROOT/Info.plist"
 DETECTION_REPO="$TEST_ROOT/release-detection"
 DETECTION_SCRIPT="$TEST_ROOT/detect-merged-release.sh"
 SOURCE_SCRIPT="$TEST_ROOT/verify-release-source.sh"
+PUBLICATION_REPO="$TEST_ROOT/publication-worktree"
+PUBLICATION_ORIGIN="$TEST_ROOT/publication-origin.git"
+PUBLICATION_SCRIPT="$TEST_ROOT/publication-step.sh"
+GH_LOG="$TEST_ROOT/gh-mutations"
 OUTPUT_FILE="$TEST_ROOT/github-output"
 STDOUT_FILE="$TEST_ROOT/stdout"
 STDERR_FILE="$TEST_ROOT/stderr"
@@ -29,6 +33,7 @@ MATCHING_PUBLIC_KEY='11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo='
 MISMATCHED_PRIVATE_KEY='TM0Imyj/ltqdtsNG7BFOD1uKMZ81q6Yk2oz27U+4pvs='
 LEGACY_MATCHING_PRIVATE_KEY='MHyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afj9damAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea'
 LEGACY_MISMATCHED_PRIVATE_KEY='MHyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afjz1AF8PoQ4lakrcKp00bfrycmCzPLsSWjMDNVfEq9GYM'
+LEGACY_CORRUPT_PRIVATE_KEY='MXyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afj9damAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea'
 
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
@@ -217,6 +222,72 @@ run_source_verification() {
     LAST_STATUS=$?
 }
 
+extract_publication_script() {
+    local step_name="$1"
+    local script
+    script="$(awk -v step_name="$step_name" '
+        $0 == "      - name: " step_name { in_step=1; next }
+        in_step && /^      - name:/ { exit }
+        in_step && /^        run: \|$/ { in_run=1; next }
+        in_run && /^          / { sub(/^          /, ""); print; next }
+        in_run && /^[[:space:]]*$/ { print; next }
+        in_run { exit }
+    ' "$RELEASE_WORKFLOW")"
+    script="${script//'${{ github.repository }}'/test/repo}"
+    script="${script//'${{ steps.contract.outputs.version }}'/1.1.0}"
+    printf '%s\n' "$script" > "$PUBLICATION_SCRIPT"
+    chmod +x "$PUBLICATION_SCRIPT"
+}
+
+reset_publication_fixture() {
+    reset_detection_fixture
+    rm -rf "$PUBLICATION_REPO" "$PUBLICATION_ORIGIN"
+    git init -q --bare "$PUBLICATION_ORIGIN"
+    git -C "$PUBLICATION_ORIGIN" symbolic-ref HEAD refs/heads/main
+    git -C "$DETECTION_REPO" remote add origin "$PUBLICATION_ORIGIN"
+    git -C "$DETECTION_REPO" push -q -u origin main
+    git clone -q "$PUBLICATION_ORIGIN" "$PUBLICATION_REPO"
+
+    printf 'main advanced while an older release was building\n' >> "$DETECTION_REPO/notes.txt"
+    git -C "$DETECTION_REPO" add notes.txt
+    git -C "$DETECTION_REPO" -c user.name=Tests -c user.email=tests@example.com \
+        commit -qm 'advance main during release build'
+    git -C "$DETECTION_REPO" push -q origin main
+
+    mkdir -p "$TEST_ROOT/fake-bin" "$TEST_ROOT/runner"
+    : > "$GH_LOG"
+    printf '%s\n' \
+        '#!/bin/bash' \
+        'set -euo pipefail' \
+        'case "$*" in' \
+        '  "api --paginate "*) exit 0 ;;' \
+        '  *"--json isDraft"*) printf "true\\n" ;;' \
+        '  *"--json targetCommitish"*) printf "%s\\n" "$COMMIT_SHA" ;;' \
+        '  *"--json assets"*) printf "%s\\n" "LocalFlow-${APP_VERSION}.dmg" "LocalFlow-${APP_VERSION}.zip" "SHA256SUMS.txt" "appcast.xml" "setup-s1-mini.sh" ;;' \
+        '  "release create "*|"release upload "*|"release edit "*) printf "%s\\n" "$*" >> "$GH_LOG" ;;' \
+        '  *) printf "unexpected gh call: %s\\n" "$*" >&2; exit 1 ;;' \
+        'esac' > "$TEST_ROOT/fake-bin/gh"
+    chmod +x "$TEST_ROOT/fake-bin/gh"
+}
+
+run_publication_step() {
+    : > "$STDOUT_FILE"
+    : > "$STDERR_FILE"
+    (
+        cd "$PUBLICATION_REPO"
+        env \
+            PATH="$TEST_ROOT/fake-bin:$PATH" \
+            GH_LOG="$GH_LOG" \
+            GH_TOKEN=test-token \
+            RUNNER_TEMP="$TEST_ROOT/runner" \
+            APP_VERSION=1.1.0 \
+            RELEASE_TAG=v1.1.0 \
+            COMMIT_SHA="$DETECTION_COMMIT_SHA" \
+            bash "$PUBLICATION_SCRIPT"
+    ) > "$STDOUT_FILE" 2> "$STDERR_FILE"
+    LAST_STATUS=$?
+}
+
 write_appcast() {
     local archive_name="${1:-LocalFlow-1.2.3.zip}"
     local signature="${2-test-signature}"
@@ -351,6 +422,12 @@ test_mismatched_legacy_sparkle_key() {
     assert_failure_containing 'SUPublicEDKey'
 }
 
+test_corrupt_legacy_sparkle_private_material() {
+    reset_tool_fixture
+    SPARKLE_PRIVATE_KEY="$LEGACY_CORRUPT_PRIVATE_KEY" run_preflight
+    assert_failure_containing 'private/public mismatch'
+}
+
 test_prerelease_version_mapping() {
     reset_tool_fixture
     RELEASE_TAG='v1.2.3-beta.4' run_preflight
@@ -476,6 +553,22 @@ test_release_is_reusable_workflow_only() {
     fi
     if grep -Eq 'github\.event\.client_payload|\$\{\{ inputs\.' "$RELEASE_WORKFLOW"; then
         fail 'release workflow must not accept caller-provided release state'
+    fi
+}
+
+test_release_runs_share_one_concurrency_group() {
+    local concurrency
+    concurrency="$(awk '
+        /^concurrency:$/ { active=1 }
+        /^jobs:$/ { active=0 }
+        active { print }
+    ' "$RELEASE_WORKFLOW")"
+    case "$concurrency" in
+        *'group:'*'cancel-in-progress: false'*) ;;
+        *) fail 'release workflow must serialize runs without canceling the active release'; return ;;
+    esac
+    if grep -Fq '${{' <<< "$concurrency"; then
+        fail 'production releases must share one constant concurrency group'
     fi
 }
 
@@ -664,6 +757,38 @@ test_release_docs_describe_only_trusted_automatic_flow() {
     fi
 }
 
+test_draft_mutation_rechecks_fresh_main_tip() {
+    reset_publication_fixture
+    extract_publication_script 'Create verified draft release'
+    run_publication_step
+    if [[ "$LAST_STATUS" -eq 0 ]]; then
+        sed 's/^/    gh mutation: /' "$GH_LOG" >&2
+        fail 'stale release run mutated a draft after main advanced'
+        return
+    fi
+    assert_failure_containing 'origin/main tip' || return
+    if [[ -s "$GH_LOG" ]]; then
+        sed 's/^/    gh mutation: /' "$GH_LOG" >&2
+        fail 'stale release run mutated a draft after main advanced'
+    fi
+}
+
+test_publication_rechecks_fresh_main_tip() {
+    reset_publication_fixture
+    extract_publication_script 'Publish complete release'
+    run_publication_step
+    if [[ "$LAST_STATUS" -eq 0 ]]; then
+        sed 's/^/    gh mutation: /' "$GH_LOG" >&2
+        fail 'stale release run published after main advanced'
+        return
+    fi
+    assert_failure_containing 'origin/main tip' || return
+    if [[ -s "$GH_LOG" ]]; then
+        sed 's/^/    gh mutation: /' "$GH_LOG" >&2
+        fail 'stale release run published after main advanced'
+    fi
+}
+
 if [[ ! -x "$VALIDATOR" ]]; then
     printf 'not ok 1 - release validator exists\n' >&2
     printf '    expected executable: %s\n' "$VALIDATOR" >&2
@@ -691,6 +816,7 @@ run_test 'tagged preflight accepts the private key matching SUPublicEDKey' test_
 run_test 'tagged preflight rejects a private key that does not match SUPublicEDKey' test_mismatched_sparkle_key
 run_test 'tagged preflight accepts Sparkle legacy private-plus-public exports' test_matching_legacy_sparkle_key
 run_test 'tagged preflight rejects a legacy export whose public key does not match' test_mismatched_legacy_sparkle_key
+run_test 'tagged preflight rejects corrupt legacy private material with a matching public suffix' test_corrupt_legacy_sparkle_private_material
 run_test 'supported pre-release tags map to plist-safe versions' test_prerelease_version_mapping
 run_test 'unsupported pre-release labels fail closed' test_unsupported_prerelease
 run_test 'oversized bundle version components fail closed' test_unsafe_bundle_version
@@ -707,6 +833,7 @@ run_test 'existing draft release targets the requested commit' test_existing_dra
 run_test 'existing tag targets the requested commit' test_existing_tag_targets_requested_commit
 run_test 'release workflow validates artifacts before publication' test_release_workflow_validates_before_publication
 run_test 'release is callable only as a reusable workflow' test_release_is_reusable_workflow_only
+run_test 'production releases share one non-canceling concurrency group' test_release_runs_share_one_concurrency_group
 run_test 'Release Please calls the reusable release workflow' test_release_please_calls_release_workflow
 run_test 'release reads only trusted dispatch context' test_release_reads_trusted_dispatch_context
 run_test 'destination checks precede upload and publication' test_destination_checks_precede_upload_and_publish
@@ -723,6 +850,8 @@ run_test 'release detection rejects a version rollback' test_release_detection_r
 run_test 'release detection rejects a stable-to-prerelease rollback' test_release_detection_rejects_prerelease_rollback
 run_test 'release source verification rejects a version rollback' test_release_source_rejects_version_rollback
 run_test 'release documentation describes only the trusted automatic flow' test_release_docs_describe_only_trusted_automatic_flow
+run_test 'draft creation and upload recheck the freshly fetched main tip' test_draft_mutation_rechecks_fresh_main_tip
+run_test 'publication rechecks the freshly fetched main tip' test_publication_rechecks_fresh_main_tip
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
