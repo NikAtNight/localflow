@@ -21,7 +21,7 @@ enum Settings {
     // as global state; UserDefaults itself provides synchronized access.
     private static var defaults: UserDefaults { .standard }
 
-    private enum Key {
+    enum Key {
         static let hotkey = "hotkey"
         static let whisperModel = "whisperModel"
         static let cleanupEnabled = "cleanupEnabled"
@@ -56,6 +56,8 @@ enum Settings {
         ("openai_whisper-large-v3-v20240930_turbo", "Large v3 Turbo (best accuracy, default)"),
     ]
 
+    static let defaultWhisperModel = "openai_whisper-large-v3-v20240930_turbo"
+
     static var hotkey: HotkeyManager.Key {
         get {
             if let raw = defaults.string(forKey: Key.hotkey),
@@ -68,7 +70,7 @@ enum Settings {
     }
 
     static var whisperModel: String {
-        get { defaults.string(forKey: Key.whisperModel) ?? "openai_whisper-large-v3-v20240930_turbo" }
+        get { defaults.string(forKey: Key.whisperModel) ?? defaultWhisperModel }
         set { defaults.set(newValue, forKey: Key.whisperModel) }
     }
 
@@ -97,9 +99,15 @@ enum Settings {
     /// free-form custom terms plus every correction's right-hand side. A
     /// word the user had to fix is by definition a word worth biasing toward.
     static var effectiveVocabulary: String {
+        effectiveVocabulary(
+            customVocabulary: customVocabulary,
+            correctedTerms: corrections.map(\.right)
+        )
+    }
+
+    static func effectiveVocabulary(customVocabulary: String, correctedTerms: [String]) -> String {
         let base = customVocabulary.trimmingCharacters(in: .whitespacesAndNewlines)
-        let corrected = corrections.map(\.right)
-        return ((base.isEmpty ? [] : [base]) + corrected).joined(separator: ", ")
+        return ((base.isEmpty ? [] : [base]) + correctedTerms).joined(separator: ", ")
     }
 
     static var cleanupEnabled: Bool {

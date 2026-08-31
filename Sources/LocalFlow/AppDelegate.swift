@@ -53,25 +53,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // dictation's audio.
     private var retrySamples: [[Float]] = []
 
-    // Dictations must paste in SPOKEN order, but cleanup time varies (a
-    // short later dictation can clear the LLM before a long earlier one).
-    // Every dictation takes a sequence number in `process`; its result
-    // waits here until all earlier numbers have resolved.
-    private enum DictationOutcome {
-        case inject(String)
-        case skip // silence, empty transcript, or a failed transcription
-    }
-    private var injectionQueue: [Int: DictationOutcome] = [:]
-    private var injectionSeqCounter = 0
-    private var nextInjectionSeq = 0
-    // True while a between-pastes beat is pending; the delayed step owns
-    // the next drain, so an outcome arriving mid-beat must not jump it.
-    private var injectionDrainPending = false
-    private var headStallTimeout: DispatchWorkItem?
-    // A dictation should resolve in seconds; one stuck this long with later
-    // results waiting behind it is hung (its text is in Recent Dictations
-    // if it ever resolves), and must not dam every later paste forever.
+    // A command or dictation should resolve in seconds. Once a later result
+    // is waiting, cancel a stalled head so it cannot retain audio or block
+    // every later paste forever.
     private static let injectionStallSeconds: TimeInterval = 90
+    private lazy var injectionCoordinator = InjectionCoordinator(
+        stallTimeout: Self.injectionStallSeconds,
+        onInject: { [weak self] text in
+            self?.injectCompletedText(text)
+        },
+        onCancel: { [weak self] sequence, kind in
+            self?.cancelInjectionOperation(sequence, kind: kind)
+        },
+        onProcessingCountChange: { [weak self] count in
+            self?.processingCountDidChange(count)
+        }
+    )
+    private var commandTasks: [Int: Task<Void, Never>] = [:]
+    private var commandHudGenerations: [Int: Int] = [:]
 
     private let updates = UpdateController()
     private let hotkey = HotkeyManager()
@@ -257,16 +256,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let model = Settings.ollamaModel
             Task { await self.textModelPolicy.prewarm(model: model) }
         }
-        // Vocabulary and corrections feed the same decoder bias; either
-        // changing rebuilds the effective term list.
-        let refreshVocabulary = { [weak self] in
-            guard let self else { return }
-            let transcriber = self.transcriber
-            let terms = Settings.effectiveVocabulary
+        settingsModel.onVocabularyChange = { [weak self] terms in
+            guard let transcriber = self?.transcriber else { return }
             Task { await transcriber.setVocabulary(terms) }
         }
-        settingsModel.onVocabularyChange = { _ in refreshVocabulary() }
-        settingsModel.onCorrectionsChange = { refreshVocabulary() }
         settingsModel.onCommandModeChange = { [weak self] in
             // Enabling may hinge on Ollama; the probe re-runs the hotkey
             // start once reachability is known.
@@ -714,29 +707,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// frontmost app and run the edit. Ordered through the same injection
     /// queue as dictations so results never overtake each other.
     private func runCommand(instruction: String, seq: Int, hudGeneration: Int?) {
+        guard injectionCoordinator.isPending(seq) else { return }
         TextInjector.copySelection { [weak self] selection in
-            guard let self else { return }
-            Task {
+            guard let self, self.injectionCoordinator.isPending(seq) else { return }
+            let task = Task {
                 defer { self.mirrorOllamaReachability() }
                 do {
                     let result = try await CommandMode.run(instruction: instruction, selection: selection)
+                    guard self.injectionCoordinator.isPending(seq) else { return }
                     guard !result.isEmpty else {
-                        self.finishDictation(seq, with: .skip)
+                        self.completeCommand(seq, with: .skip)
                         self.dismissHud(hudGeneration)
-                        self.finishProcessing()
                         return
                     }
                     self.recentTranscripts.insert(RecentDictation(text: result), at: 0)
                     if self.recentTranscripts.count > 5 { self.recentTranscripts.removeLast() }
                     self.settingsModel?.recentDictations = self.recentTranscripts
                     DictationHistory.record(result)
-                    self.finishDictation(seq, with: .inject(result))
+                    self.completeCommand(seq, with: .inject(result))
                     self.dismissHud(hudGeneration)
                     DiagLog.log("command mode applied (selection=%d chars, result=%d chars)",
                           selection?.count ?? 0, result.count)
-                    self.finishProcessing()
                 } catch {
-                    self.finishDictation(seq, with: .skip)
+                    guard self.injectionCoordinator.isPending(seq) else { return }
+                    self.completeCommand(seq, with: .skip)
                     self.dismissHud(hudGeneration)
                     self.playCue("Basso")
                     self.state = .failed(UserFacingIssue(
@@ -744,9 +738,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         details: error.localizedDescription
                     ))
                     self.scheduleFailureRecovery()
-                    self.finishProcessing()
                 }
             }
+            self.commandTasks[seq] = task
         }
     }
 
@@ -810,9 +804,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         asCommand: Bool = false,
         dictationGeneration: Int? = nil
     ) {
-        let seq = injectionSeqCounter
-        injectionSeqCounter += 1
-
         // Silent bookends are Whisper's main hallucination trigger and pure
         // wasted encode time.
         let samples = AudioRecorder.trimmingSilence(rawSamples)
@@ -824,49 +815,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let dictationGeneration {
                 dictationPipeline.cancel(generation: dictationGeneration)
             }
-            finishDictation(seq, with: .skip)
             reportHeardNothing()
             dismissHud(hudGeneration)
             return
         }
 
-        processingCount += 1
-        if !isRecording { state = .processing }
         if asCommand {
+            let seq = injectionCoordinator.begin(kind: .command)
+            if let hudGeneration { commandHudGenerations[seq] = hudGeneration }
             let context = captureDictationContext()
-            Task {
+            let task = Task {
                 do {
                     let raw = try await transcriber.transcribe(
                         samples: samples,
                         lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS
                     )
+                    guard self.injectionCoordinator.isPending(seq) else { return }
                     guard !raw.isEmpty else {
-                        finishDictation(seq, with: .skip)
-                        reportHeardNothing()
-                        dismissHud(hudGeneration)
-                        finishProcessing()
+                        self.completeCommand(seq, with: .skip)
+                        self.reportHeardNothing()
+                        self.dismissHud(hudGeneration)
                         return
                     }
                     let instruction = TranscriptCorrections.apply(
                         raw,
                         corrections: context.corrections
                     )
-                    runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration)
+                    self.runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration)
                 } catch {
-                    processingCount -= 1
-                    finishDictation(seq, with: .skip)
-                    dismissHud(hudGeneration)
-                    playCue("Basso")
-                    state = .failed(UserFacingIssue(
+                    guard self.injectionCoordinator.isPending(seq) else { return }
+                    self.completeCommand(seq, with: .skip)
+                    self.dismissHud(hudGeneration)
+                    self.playCue("Basso")
+                    self.state = .failed(UserFacingIssue(
                         summary: "Couldn't transcribe the command",
                         details: error.localizedDescription
                     ))
-                    scheduleFailureRecovery()
+                    self.scheduleFailureRecovery()
                 }
             }
+            commandTasks[seq] = task
             return
         }
 
+        let seq = injectionCoordinator.begin(kind: .dictation)
         let generation: Int
         if let dictationGeneration {
             generation = dictationGeneration
@@ -905,7 +897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
             settingsModel?.recentDictations = recentTranscripts
             DictationHistory.record(text)
-            finishDictation(pending.sequence, with: .inject(text))
+            injectionCoordinator.complete(pending.sequence, with: .inject(text))
             dismissHud(pending.hudGeneration)
 
             let ms = Int(Date().timeIntervalSince(pending.releasedAt) * 1000)
@@ -917,18 +909,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pending.cleanupEnabled ? "on" : "off",
                 text.utf8.count
             )
-            finishProcessing()
 
         case .emptyTranscript:
             DiagLog.log("transcription produced no text (%.1fs of audio)", pending.duration)
-            finishDictation(pending.sequence, with: .skip)
+            injectionCoordinator.complete(pending.sequence, with: .skip)
             reportHeardNothing()
             dismissHud(pending.hudGeneration)
-            finishProcessing()
 
         case .failed(_, let message):
-            processingCount -= 1
-            finishDictation(pending.sequence, with: .skip)
+            injectionCoordinator.complete(pending.sequence, with: .skip)
             dismissHud(pending.hudGeneration)
             retrySamples.append(pending.samples)
             if retrySamples.count > 3 { retrySamples.removeFirst() }
@@ -969,80 +958,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return result
     }
 
-    /// Records a dictation's outcome and drains everything now unblocked,
-    /// in sequence order. The paste itself happens in the drain (never
-    /// directly from `process`), so spoken order is always paste order,
-    /// even when a later dictation clears cleanup before an earlier one.
-    private func finishDictation(_ seq: Int, with outcome: DictationOutcome) {
-        guard seq >= nextInjectionSeq else {
-            // Resolved after the stall timeout already skipped past it.
-            // Pasting minutes late into whatever has focus is worse than
-            // not pasting; the text is in Recent Dictations.
-            DiagLog.log("dictation #%d resolved after being skipped, not pasting", seq)
-            return
-        }
-        injectionQueue[seq] = outcome
-        drainInjectionQueue()
+    private func completeCommand(_ sequence: Int, with outcome: InjectionCoordinator.Outcome) {
+        commandTasks.removeValue(forKey: sequence)
+        commandHudGenerations.removeValue(forKey: sequence)
+        injectionCoordinator.complete(sequence, with: outcome)
     }
 
-    /// Pastes resolved dictations from the queue head, one per beat: firing
-    /// two Cmd-Vs back-to-back replaces the clipboard before the frontmost
-    /// app services the first, which pastes the second text twice and loses
-    /// the first. Skip outcomes drain instantly. When later results are
-    /// waiting behind an unresolved head (a hung transcription or cleanup
-    /// call), a stall timeout eventually skips it so the queue never dams.
-    private func drainInjectionQueue() {
-        guard !injectionDrainPending else { return }
-        headStallTimeout?.cancel()
-        headStallTimeout = nil
-        while let next = injectionQueue.removeValue(forKey: nextInjectionSeq) {
-            nextInjectionSeq += 1
-            guard case .inject(let text) = next else { continue }
-            // The success cue waits for the injector's verdict — hearing
-            // it while nothing was pasted is worse than hearing it late.
-            TextInjector.inject(text) { [weak self] landed in
-                guard let self else { return }
-                if landed {
-                    self.playCue("Bottle")
-                    self.lastError = nil
-                } else {
-                    DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
-                    self.playCue("Basso")
-                    self.state = .failed(UserFacingIssue(
-                        summary: "Paste may not have landed",
-                        details: "The transcript is available under Recent Dictations in the menu."
-                    ))
-                    self.scheduleFailureRecovery()
-                }
+    private func cancelInjectionOperation(
+        _ sequence: Int,
+        kind: InjectionCoordinator.OperationKind
+    ) {
+        switch kind {
+        case .command:
+            commandTasks.removeValue(forKey: sequence)?.cancel()
+            let hudGeneration = commandHudGenerations.removeValue(forKey: sequence)
+            dismissHud(hudGeneration)
+        case .dictation:
+            guard let entry = pendingDictations.first(where: { $0.value.sequence == sequence }) else {
+                break
             }
-            injectionDrainPending = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                guard let self else { return }
-                self.injectionDrainPending = false
-                self.drainInjectionQueue()
-            }
-            return
+            pendingDictations.removeValue(forKey: entry.key)
+            dictationPipeline.cancel(generation: entry.key)
+            dismissHud(entry.value.hudGeneration)
         }
-        guard !injectionQueue.isEmpty else { return }
-        let stalled = nextInjectionSeq
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.nextInjectionSeq == stalled, !self.injectionQueue.isEmpty else { return }
-            DiagLog.log("dictation #%d never resolved, skipping it to unblock %d queued paste(s)",
-                  stalled, self.injectionQueue.count)
-            self.nextInjectionSeq += 1
-            self.drainInjectionQueue()
-        }
-        headStallTimeout = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.injectionStallSeconds, execute: work)
+        DiagLog.log("%@ #%d stalled; cancelled to unblock later output",
+              kind == .command ? "command" : "dictation", sequence)
     }
 
-    /// A transcription task ended — return the UI to idle unless something
-    /// else (a new recording, another in-flight transcription) is going on.
-    private func finishProcessing() {
-        processingCount -= 1
-        guard processingCount == 0, !isRecording else { return }
-        if case .failed = state { return } // let a failure message linger
-        state = restingState
+    private func injectCompletedText(_ text: String) {
+        // The success cue waits for the injector's verdict. Hearing it while
+        // nothing was pasted is worse than hearing it late.
+        TextInjector.inject(text) { [weak self] landed in
+            guard let self else { return }
+            if landed {
+                self.playCue("Bottle")
+                self.lastError = nil
+            } else {
+                DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
+                self.playCue("Basso")
+                self.state = .failed(UserFacingIssue(
+                    summary: "Paste may not have landed",
+                    details: "The transcript is available under Recent Dictations in the menu."
+                ))
+                self.scheduleFailureRecovery()
+            }
+        }
+    }
+
+    private func processingCountDidChange(_ count: Int) {
+        let increased = count > processingCount
+        processingCount = count
+        guard !isRecording else { return }
+        if increased {
+            state = .processing
+        } else if count == 0 {
+            if case .failed = state { return }
+            state = restingState
+        }
     }
 
     /// Nothing worth pasting was captured (too short, silence, or an empty
@@ -1125,9 +1097,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         // Quick actions: the settings people flip most often, applied through
-        // the SAME live paths the settings window uses (SettingsModel setters
-        // persist and fire the AppDelegate hooks). Checkmarks and the mic list
-        // are refreshed in menuWillOpen.
+        // the same SettingsModel entry point as the settings window. Checkmarks
+        // and the mic list are refreshed in menuWillOpen.
         hotkeyMenuItem = NSMenuItem(title: "Hold to Talk", action: nil, keyEquivalent: "")
         let hotkeyMenu = NSMenu()
         for key in HotkeyManager.Key.allCases {
@@ -1287,8 +1258,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stored.removeAll { $0.wrong.caseInsensitiveCompare(proposal.wrong) == .orderedSame }
             stored.append(proposal)
         }
-        Settings.corrections = stored
-        settingsModel?.corrections = stored.map { CorrectionPair(wrong: $0.wrong, right: $0.right) }
+        settingsModel.corrections = stored.map { CorrectionPair(wrong: $0.wrong, right: $0.right) }
         DiagLog.log("learned %d correction(s) from an edited dictation", proposals.count)
     }
 
@@ -1323,23 +1293,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(url)
     }
 
-    // Quick-action selections route through SettingsModel so persistence and
-    // the live-apply hooks are shared with the settings window — no duplicated
-    // apply logic.
+    // Quick-action selections name the menu as their source while sharing
+    // persistence and live effects with the settings window.
 
     @objc private func selectHotkey(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? HotkeyManager.Key else { return }
-        settingsModel.hotkey = key
+        settingsModel.apply(.hotkey(key), from: .menu)
     }
 
     @objc private func selectWhisperModel(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
-        settingsModel.whisperModel = name
+        settingsModel.apply(.whisperModel(name), from: .menu)
     }
 
     @objc private func selectMicrophone(_ sender: NSMenuItem) {
         // A nil representedObject is the "System Default" row.
-        settingsModel.micUID = sender.representedObject as? String
+        settingsModel.apply(.microphone(sender.representedObject as? String), from: .menu)
     }
 }
 
