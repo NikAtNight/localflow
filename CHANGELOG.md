@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.1.1](https://github.com/NikAtNight/localflow/compare/v1.1.0...v1.1.1) (2026-08-31)
+
+
+### Fixes
+
+* finalize published release labels ([f89a3bb](https://github.com/NikAtNight/localflow/commit/f89a3bbdac3b116948c1af14014d0b8e2b62ced2))
+* finalize published release labels ([0bdac60](https://github.com/NikAtNight/localflow/commit/0bdac60e10efa35b378c53c0ab364d73ce38298f))
+* sign release disk images ([febfdbe](https://github.com/NikAtNight/localflow/commit/febfdbefcbf8ae69c8ce8e2dc2e9a909bea26bb2))
+* sign release disk images ([0c68f85](https://github.com/NikAtNight/localflow/commit/0c68f854aac9a5efe6266f5ae5f41cdae61b9cde))
+
 ## [1.1.0](https://github.com/NikAtNight/localflow/compare/v1.0.0...v1.1.0) (2026-08-31)
 
 
