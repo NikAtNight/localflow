@@ -20,13 +20,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build, sign, notarize, publish
+  source:
+    name: Verify source revision
     runs-on: macos-26
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.source.outputs.ref }}
     steps:
       - name: Select source revision
         id: source
@@ -45,7 +45,38 @@ jobs:
 
       - uses: actions/checkout@v7
         with:
-          ref: ${{ steps.source.outputs.ref }}
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source is on main
+        env:
+          COMMIT_SHA: ${{ steps.source.outputs.ref }}
+        run: |
+          set -euo pipefail
+          OBJECT_TYPE="$(git cat-file -t "$COMMIT_SHA" 2>/dev/null || true)"
+          if [[ "$OBJECT_TYPE" != "commit" ]]; then
+            echo "error: commit_sha does not identify a commit on origin/main" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$COMMIT_SHA" "origin/main"; then
+            echo "error: commit_sha is not reachable from origin/main" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build, sign, notarize, publish
+    needs: source
+    runs-on: macos-26
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.source.outputs.commit_sha }}
+          persist-credentials: false
 
       - name: Cache SwiftPM
         uses: actions/cache@v6
@@ -66,7 +97,7 @@ jobs:
         id: contract
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-          COMMIT_SHA: ${{ steps.source.outputs.ref }}
+          COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -254,7 +285,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           APP_VERSION: ${{ steps.contract.outputs.version }}
           RELEASE_TAG: ${{ steps.contract.outputs.tag }}
-          COMMIT_SHA: ${{ steps.source.outputs.ref }}
+          COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
         run: |
           set -euo pipefail
           NOTES_FILE="$RUNNER_TEMP/release-notes.md"
@@ -270,12 +301,35 @@ jobs:
           fi
 
           EXISTING="$(gh api --paginate "repos/${{ github.repository }}/releases" \
-            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | [.id, .draft] | @tsv" \
-            | head -1)"
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | [.id, .draft] | @tsv")"
           if [[ -n "$EXISTING" && "$EXISTING" != *$'\ttrue' ]]; then
             echo "error: refusing to replace already-published release $RELEASE_TAG" >&2
             exit 1
           fi
+          if [[ -n "$EXISTING" ]]; then
+            EXISTING_TARGET="$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)"
+            if ! [[ "$EXISTING_TARGET" == "$COMMIT_SHA" ]]; then
+              echo "error: draft release $RELEASE_TAG targets $EXISTING_TARGET, not $COMMIT_SHA" >&2
+              exit 1
+            fi
+          fi
+
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="$AUTH_HEADER"
+          REMOTE_TAG="$(git ls-remote --tags --refs origin "refs/tags/$RELEASE_TAG")"
+          if [[ -n "$REMOTE_TAG" ]]; then
+            git fetch --no-tags origin \
+              "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            TAG_TARGET="$(git rev-parse "$RELEASE_TAG^{commit}")"
+            if ! [[ "$TAG_TARGET" == "$COMMIT_SHA" ]]; then
+              echo "error: tag $RELEASE_TAG targets $TAG_TARGET, not $COMMIT_SHA" >&2
+              exit 1
+            fi
+          fi
+          unset AUTH_HEADER GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
           if [[ -z "$EXISTING" ]]; then
             CREATE_ARGS=(--draft --target "$COMMIT_SHA" --title "$RELEASE_TAG" --notes-file "$NOTES_FILE")
             if [[ "$RELEASE_TAG" == *-* ]]; then
@@ -298,8 +352,36 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.contract.outputs.tag }}
+          COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
         run: |
           set -euo pipefail
+          IS_DRAFT="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
+          if [[ "$IS_DRAFT" != "true" ]]; then
+            echo "error: refusing to replace already-published release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          EXISTING_TARGET="$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)"
+          if ! [[ "$EXISTING_TARGET" == "$COMMIT_SHA" ]]; then
+            echo "error: draft release $RELEASE_TAG targets $EXISTING_TARGET, not $COMMIT_SHA" >&2
+            exit 1
+          fi
+
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="$AUTH_HEADER"
+          REMOTE_TAG="$(git ls-remote --tags --refs origin "refs/tags/$RELEASE_TAG")"
+          if [[ -n "$REMOTE_TAG" ]]; then
+            git fetch --no-tags origin \
+              "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            TAG_TARGET="$(git rev-parse "$RELEASE_TAG^{commit}")"
+            if ! [[ "$TAG_TARGET" == "$COMMIT_SHA" ]]; then
+              echo "error: tag $RELEASE_TAG targets $TAG_TARGET, not $COMMIT_SHA" >&2
+              exit 1
+            fi
+          fi
+          unset AUTH_HEADER GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+
           EXPECTED=$'LocalFlow-${{ steps.contract.outputs.version }}.dmg\nLocalFlow-${{ steps.contract.outputs.version }}.zip\nSHA256SUMS.txt\nappcast.xml\nsetup-s1-mini.sh'
           ACTUAL="$(gh release view "$RELEASE_TAG" --json assets \
             --jq '.assets[].name' | sort)"
