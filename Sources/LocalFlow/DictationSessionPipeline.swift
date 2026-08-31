@@ -372,12 +372,15 @@ final class DictationSessionPipeline {
                 generationOrder.removeFirst()
                 continue
             }
-            guard let outcome = completed.removeValue(forKey: generation) else { return }
+            guard let outcome = completed.removeValue(forKey: generation) else {
+                if !completed.isEmpty {
+                    scheduleStallTimeout(for: generation)
+                }
+                return
+            }
             generationOrder.removeFirst()
             onOutcome(outcome)
         }
-        guard let generation = generationOrder.first, !completed.isEmpty else { return }
-        scheduleStallTimeout(for: generation)
     }
 
     private func scheduleStallTimeout(for generation: Int) {
