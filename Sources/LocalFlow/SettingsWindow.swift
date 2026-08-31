@@ -25,9 +25,8 @@ struct SnippetPair: Identifiable, Equatable {
 
 // MARK: - Model
 
-/// Observable mirror of Settings for the settings window. Writes persist
-/// immediately; side effects that need the app's live objects (hotkey tap,
-/// recorder, model load) run through hooks AppDelegate installs at launch.
+/// Observable settings-window state. SettingsApplication validates and
+/// persists live changes before AppDelegate hooks update running objects.
 @MainActor
 final class SettingsModel: ObservableObject {
     var onHotkeyChange: ((HotkeyManager.Key) -> Void)?
@@ -42,6 +41,8 @@ final class SettingsModel: ObservableObject {
     var onAutomaticUpdatesChange: (() -> Void)?
 
     private let loginAgent = SMAppService.agent(plistName: "app.talix.localflow.plist")
+    private lazy var settingsApplication = makeSettingsApplication()
+    private var isSynchronizingApplicationValues = false
 
     @Published var theme: HudTheme = HudTheme.current {
         didSet {
@@ -53,25 +54,22 @@ final class SettingsModel: ObservableObject {
 
     @Published var hotkey: HotkeyManager.Key = Settings.hotkey {
         didSet {
-            guard oldValue != hotkey else { return }
-            Settings.hotkey = hotkey
-            onHotkeyChange?(hotkey)
+            guard oldValue != hotkey, !isSynchronizingApplicationValues else { return }
+            apply(.hotkey(hotkey), from: .settingsWindow)
         }
     }
 
     @Published var whisperModel: String = Settings.whisperModel {
         didSet {
-            guard oldValue != whisperModel else { return }
-            Settings.whisperModel = whisperModel
-            onModelChange?()
+            guard oldValue != whisperModel, !isSynchronizingApplicationValues else { return }
+            apply(.whisperModel(whisperModel), from: .settingsWindow)
         }
     }
 
     @Published var micUID: String? = Settings.inputDeviceUID {
         didSet {
-            guard oldValue != micUID else { return }
-            Settings.inputDeviceUID = micUID
-            onMicChange?(micUID)
+            guard oldValue != micUID, !isSynchronizingApplicationValues else { return }
+            apply(.microphone(micUID), from: .settingsWindow)
         }
     }
 
@@ -100,9 +98,8 @@ final class SettingsModel: ObservableObject {
 
     @Published var automaticUpdates: Bool = Settings.automaticUpdates {
         didSet {
-            guard oldValue != automaticUpdates else { return }
-            Settings.automaticUpdates = automaticUpdates
-            onAutomaticUpdatesChange?()
+            guard oldValue != automaticUpdates, !isSynchronizingApplicationValues else { return }
+            apply(.automaticUpdates(automaticUpdates), from: .settingsWindow)
         }
     }
 
@@ -197,22 +194,10 @@ final class SettingsModel: ObservableObject {
         }
     }
 
-    private var suppressLoginSideEffect = false
-
     @Published var startAtLogin: Bool = false {
         didSet {
-            guard oldValue != startAtLogin, !suppressLoginSideEffect else { return }
-            do {
-                if startAtLogin {
-                    try loginAgent.register()
-                } else {
-                    try loginAgent.unregister()
-                }
-                Settings.loginItemSetupDone = true
-            } catch {
-                DiagLog.log("login item toggle failed: %@", error.localizedDescription)
-                setStartAtLoginWithoutRegistering(loginAgent.status == .enabled)
-            }
+            guard oldValue != startAtLogin, !isSynchronizingApplicationValues else { return }
+            apply(.startAtLogin(startAtLogin), from: .settingsWindow)
         }
     }
 
@@ -224,14 +209,57 @@ final class SettingsModel: ObservableObject {
     @Published var lastIssue: UserFacingIssue?
 
     init() {
-        // Seed from current status without re-registering the agent on every launch.
-        setStartAtLoginWithoutRegistering(loginAgent.status == .enabled)
+        synchronizeApplicationValues()
     }
 
-    private func setStartAtLoginWithoutRegistering(_ enabled: Bool) {
-        suppressLoginSideEffect = true
-        startAtLogin = enabled
-        suppressLoginSideEffect = false
+    private func makeSettingsApplication() -> SettingsApplication {
+        let loginAgent = self.loginAgent
+        return SettingsApplication(
+            defaults: .standard,
+            supportedWhisperModels: Settings.whisperModels.map(\.name),
+            defaultWhisperModel: Settings.defaultWhisperModel,
+            effects: .init(
+                applyHotkey: { [weak self] in self?.onHotkeyChange?($0) },
+                reloadWhisperModel: { [weak self] _ in self?.onModelChange?() },
+                selectMicrophone: { [weak self] in self?.onMicChange?($0) },
+                applyAutomaticUpdates: { [weak self] _ in self?.onAutomaticUpdatesChange?() }
+            ),
+            loginItem: .init(
+                isEnabled: { loginAgent.status == .enabled },
+                setEnabled: { enabled in
+                    if enabled {
+                        try loginAgent.register()
+                    } else {
+                        try loginAgent.unregister()
+                    }
+                }
+            )
+        )
+    }
+
+    /// Menu actions can use this entry point to share validation, persistence,
+    /// and live effects with the settings window.
+    @discardableResult
+    func apply(
+        _ change: SettingsApplication.Change,
+        from source: SettingsApplication.Source
+    ) -> Result<Void, SettingsApplication.Failure> {
+        let result = settingsApplication.apply(change, from: source)
+        if case .failure(.loginItemChangeFailed) = result {
+            DiagLog.log("login item toggle failed")
+        }
+        synchronizeApplicationValues()
+        return result
+    }
+
+    private func synchronizeApplicationValues() {
+        isSynchronizingApplicationValues = true
+        hotkey = settingsApplication.values.hotkey
+        whisperModel = settingsApplication.values.whisperModel
+        micUID = settingsApplication.values.microphoneUID
+        automaticUpdates = settingsApplication.values.automaticUpdates
+        startAtLogin = settingsApplication.values.startAtLogin
+        isSynchronizingApplicationValues = false
     }
 
     func refresh() {
@@ -241,9 +269,9 @@ final class SettingsModel: ObservableObject {
         } else {
             systemDefaultName = nil
         }
-        // Reflect changes made elsewhere (first-run auto-registration, etc.).
-        let enabled = loginAgent.status == .enabled
-        if startAtLogin != enabled { setStartAtLoginWithoutRegistering(enabled) }
+        // Reflect changes made elsewhere, including first-run registration.
+        settingsApplication.refreshLoginItemState()
+        synchronizeApplicationValues()
         // Feed the model pickers whatever is installed right now; models
         // pulled while the window was closed appear on the next open.
         Task { [weak self] in
