@@ -31,6 +31,7 @@ final class InjectionCoordinator {
     private var sequenceCounter = 0
     private var drainPending = false
     private var headStallTimeout: DispatchWorkItem?
+    private var stalledHeadSequence: Int?
 
     init(
         stallTimeout: TimeInterval,
@@ -73,9 +74,11 @@ final class InjectionCoordinator {
 
     private func drain() {
         guard !drainPending else { return }
-        cancelHeadTimeout()
 
         while let operation = operations[nextSequence], let outcome = operation.outcome {
+            if stalledHeadSequence == nextSequence {
+                cancelHeadTimeout()
+            }
             operations.removeValue(forKey: nextSequence)
             nextSequence += 1
 
@@ -102,8 +105,15 @@ final class InjectionCoordinator {
         guard hasResolvedFollower else { return }
 
         let stalledSequence = nextSequence
+        if stalledHeadSequence == stalledSequence, headStallTimeout != nil {
+            return
+        }
+        cancelHeadTimeout()
         let work = DispatchWorkItem { [weak self] in
-            guard let self,
+            guard let self, self.stalledHeadSequence == stalledSequence else { return }
+            self.headStallTimeout = nil
+            self.stalledHeadSequence = nil
+            guard
                   let stalled = self.operations[stalledSequence],
                   stalled.outcome == nil,
                   self.nextSequence == stalledSequence else { return }
@@ -114,6 +124,7 @@ final class InjectionCoordinator {
             self.onProcessingCountChange(self.operations.count)
             self.drain()
         }
+        stalledHeadSequence = stalledSequence
         headStallTimeout = work
         DispatchQueue.main.asyncAfter(deadline: .now() + stallTimeout, execute: work)
     }
@@ -121,5 +132,6 @@ final class InjectionCoordinator {
     private func cancelHeadTimeout() {
         headStallTimeout?.cancel()
         headStallTimeout = nil
+        stalledHeadSequence = nil
     }
 }
