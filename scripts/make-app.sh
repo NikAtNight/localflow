@@ -6,7 +6,10 @@
 # Environment overrides (used by the release workflow; all optional):
 #   SIGN_IDENTITY   codesign identity, e.g. "Developer ID Application: ... (TEAMID)".
 #                   Defaults to the local self-signed identity.
-#   APP_VERSION     stamped into CFBundleShortVersionString / CFBundleVersion.
+#   APP_VERSION         version used in archive names and logs.
+#   APP_SHORT_VERSION   CFBundleShortVersionString value.
+#   APP_BUNDLE_VERSION  CFBundleVersion value.
+#   UPDATER_ENABLED     true for a release with a signed Sparkle appcast.
 #   SKIP_PREWARM=1  skip the CoreML warm-up (no model cache on CI runners).
 set -euo pipefail
 
@@ -22,10 +25,22 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/LocalFlow "$APP/Contents/MacOS/LocalFlow"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
-if [[ -n "${APP_VERSION:-}" ]]; then
+if [[ -n "${APP_SHORT_VERSION:-}" && -n "${APP_BUNDLE_VERSION:-}" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_SHORT_VERSION" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUNDLE_VERSION" "$APP/Contents/Info.plist"
+    echo "Stamped version ${APP_VERSION:-$APP_SHORT_VERSION} ($APP_BUNDLE_VERSION)"
+elif [[ -n "${APP_VERSION:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_VERSION" "$APP/Contents/Info.plist"
     echo "Stamped version $APP_VERSION"
+fi
+
+UPDATES_ACTIVE="${UPDATER_ENABLED:-true}"
+if [[ "$UPDATES_ACTIVE" != "1" && "$UPDATES_ACTIVE" != "true" ]]; then
+    /usr/libexec/PlistBuddy -c 'Set :SUEnableAutomaticChecks false' "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Delete :SUFeedURL' "$APP/Contents/Info.plist" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c 'Delete :SUPublicEDKey' "$APP/Contents/Info.plist" 2>/dev/null || true
+    echo "Disabled updates for this development build"
 fi
 
 # LaunchAgent (SMAppService.agent): relaunches the app after a crash.
@@ -48,7 +63,11 @@ if [[ -n "$SPARKLE_FRAMEWORK" ]]; then
     fi
     echo "Embedded Sparkle.framework"
 else
-    echo "warning: Sparkle.framework not found - run 'swift build' first; updates will be unavailable"
+    if [[ "$UPDATES_ACTIVE" == "1" || "$UPDATES_ACTIVE" == "true" ]]; then
+        echo "error: Sparkle.framework not found; release updates would not launch" >&2
+        exit 1
+    fi
+    echo "warning: Sparkle.framework not found; updates are disabled"
 fi
 
 # App icon - rendered on demand; re-run scripts/make-icon.sh to redesign.

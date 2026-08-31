@@ -1,16 +1,14 @@
 name: Release
 
 on:
-  # Publish a GitHub Release (tag it v1.2.3) to build and attach the DMG.
-  release:
-    types: [published]
-  # A release created by Release Please's GITHUB_TOKEN cannot trigger another
-  # workflow. Pass its tag here to build and attach the real release assets.
-  # Leave the tag blank to produce an unpublished development build.
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to build and attach assets to
+        description: Version tag to create after the release passes validation
+        required: false
+        type: string
+      commit_sha:
+        description: Commit to build for the tag; defaults to the dispatched ref
         required: false
         type: string
 
@@ -18,54 +16,36 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: true
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    name: Build, sign, notarize
-    # Apple silicon: LocalFlow ships arm64-only (see README requirements),
-    # and the on-device cleanup model needs a recent SDK.
+    name: Build, sign, notarize, publish
     runs-on: macos-26
     permissions:
-      contents: write # attach the DMG to the release
-      id-token: write # Sigstore signing for build provenance
+      contents: write
+      id-token: write
       attestations: write
     steps:
-      - name: Determine version
-        id: version
+      - name: Select source revision
+        id: source
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ inputs.tag }}
-          COMMIT_SHA: ${{ github.sha }}
+          INPUT_COMMIT_SHA: ${{ inputs.commit_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == "release" ]]; then
-            TAG="$RELEASE_TAG"
-            VERSION="${TAG#v}"
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          elif [[ -n "$INPUT_TAG" ]]; then
-            TAG="$INPUT_TAG"
-            VERSION="${TAG#v}"
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          else
-            VERSION="0.0.0-dev.${COMMIT_SHA:0:7}"
-            TAG=""
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-          fi
-          if [[ -n "$TAG" && ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "error: release tag must be a v-prefixed semantic version" >&2
+          COMMIT_SHA="${INPUT_COMMIT_SHA:-$DISPATCH_SHA}"
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: commit_sha must be a full lowercase Git commit SHA" >&2
             exit 1
           fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "ref=${TAG:-$COMMIT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Building $VERSION"
+          echo "ref=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v7
         with:
-          ref: ${{ steps.version.outputs.ref }}
+          ref: ${{ steps.source.outputs.ref }}
 
       - name: Cache SwiftPM
         uses: actions/cache@v6
@@ -77,30 +57,39 @@ jobs:
           restore-keys: ${{ runner.os }}-release-swiftpm-
 
       - name: Run tests
-        run: swift test
+        run: |
+          set -euo pipefail
+          bash Tests/ReleaseContractTests.sh
+          swift test
+
+      - name: Validate release contract
+        id: contract
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          COMMIT_SHA: ${{ steps.source.outputs.ref }}
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: ./scripts/validate-release.sh preflight
 
       - name: Import signing certificate
         id: signing
+        if: steps.contract.outputs.sign == 'true'
         env:
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
         run: |
           set -euo pipefail
-          if [[ -z "${MAC_CERT_P12_BASE64:-}" || -z "${MAC_CERT_PASSWORD:-}" ]]; then
-            echo "No signing certificate in secrets: building ad-hoc." >&2
-            echo "Downloaded ad-hoc builds are blocked by Gatekeeper until the" >&2
-            echo "user right-clicks Open, and cannot be notarized." >&2
-            echo "sign=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
           KEYCHAIN_PASSWORD="$(uuidgen)"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 3600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 
-          echo "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          printf '%s' "$MAC_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
             -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/cert.p12"
@@ -111,18 +100,17 @@ jobs:
           IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
             | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
           if [[ -z "$IDENTITY" ]]; then
-            echo "error: no Developer ID Application identity in the imported certificate" >&2
+            echo "error: imported certificate has no Developer ID Application identity" >&2
             exit 1
           fi
           echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
-          echo "sign=true" >> "$GITHUB_OUTPUT"
-          echo "Imported: $IDENTITY"
 
       - name: Build app bundle
         env:
-          APP_VERSION: ${{ steps.version.outputs.version }}
-          # No model cache on a fresh runner, and pre-warming would download
-          # gigabytes of CoreML weights for no benefit to the shipped build.
+          APP_VERSION: ${{ steps.contract.outputs.version }}
+          APP_SHORT_VERSION: ${{ steps.contract.outputs.short_version }}
+          APP_BUNDLE_VERSION: ${{ steps.contract.outputs.bundle_version }}
+          UPDATER_ENABLED: ${{ steps.contract.outputs.updater }}
           SKIP_PREWARM: "1"
           SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
         run: ./scripts/make-app.sh
@@ -130,52 +118,42 @@ jobs:
       - name: Verify the on-device cleanup model is linked
         run: |
           set -euo pipefail
-          # FoundationModels is behind `#if canImport`. An older SDK compiles
-          # cleanly and silently ships a build with no Apple Intelligence
-          # cleanup and no command mode, so assert it actually linked.
           if ! otool -L build/LocalFlow.app/Contents/MacOS/LocalFlow | grep -q FoundationModels; then
-            echo "error: FoundationModels is not linked — the runner's SDK is too old." >&2
-            echo "Command mode and on-device cleanup would be missing from this build." >&2
+            echo "error: FoundationModels is not linked; command mode and cleanup would be missing" >&2
             exit 1
           fi
-          echo "FoundationModels linked."
 
-      - name: Notarize
-        if: steps.signing.outputs.sign == 'true'
+      - name: Notarize app
+        if: steps.contract.outputs.sign == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          if [[ -z "${APPLE_ID:-}" || -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
-            echo "::warning::Notarization credentials missing — shipping signed but un-notarized."
-            exit 0
-          fi
-          ditto -c -k --sequesterRsrc --keepParent build/LocalFlow.app "$RUNNER_TEMP/LocalFlow.zip"
+          ditto -c -k --sequesterRsrc --keepParent \
+            build/LocalFlow.app "$RUNNER_TEMP/LocalFlow.zip"
           xcrun notarytool submit "$RUNNER_TEMP/LocalFlow.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait --timeout 30m
-          # Staple so Gatekeeper clears the app without a network round trip.
           xcrun stapler staple build/LocalFlow.app
 
       - name: Package DMG
         env:
-          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.contract.outputs.version }}
         run: ./scripts/make-dmg.sh
 
       - name: Notarize DMG
-        if: steps.signing.outputs.sign == 'true'
+        if: steps.contract.outputs.sign == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.contract.outputs.version }}
         run: |
           set -euo pipefail
-          if [[ -z "${APPLE_ID:-}" ]]; then exit 0; fi
           DMG="dist/LocalFlow-${APP_VERSION}.dmg"
           xcrun notarytool submit "$DMG" \
             --apple-id "$APPLE_ID" \
@@ -184,123 +162,157 @@ jobs:
             --wait --timeout 30m
           xcrun stapler staple "$DMG"
 
-      - name: Verify artifacts
+      - name: Verify signed artifacts
         env:
-          APP_VERSION: ${{ steps.version.outputs.version }}
-          SIGNED: ${{ steps.signing.outputs.sign }}
+          APP_VERSION: ${{ steps.contract.outputs.version }}
+          SIGNED: ${{ steps.contract.outputs.sign }}
         run: |
           set -euo pipefail
           DMG="dist/LocalFlow-${APP_VERSION}.dmg"
           codesign --verify --deep --strict --verbose=2 build/LocalFlow.app
           if [[ "$SIGNED" == "true" ]]; then
-            # The check that actually predicts the user's experience: would
-            # Gatekeeper let this run after download?
             spctl --assess --type execute --verbose=4 build/LocalFlow.app
-            xcrun stapler validate build/LocalFlow.app || \
-              echo "::warning::App is not stapled (un-notarized build)."
-            xcrun stapler validate "$DMG" || \
-              echo "::warning::DMG is not stapled (un-notarized build)."
+            xcrun stapler validate build/LocalFlow.app
+            xcrun stapler validate "$DMG"
           fi
 
-      # Sparkle installs from a ZIP, not the DMG, and needs an appcast whose
-      # entry is EdDSA-signed with the key whose public half is baked into
-      # Info.plist. Without a valid signature the running app refuses the
-      # update, which is the point.
       - name: Build Sparkle appcast
-        if: steps.version.outputs.is_release == 'true' && steps.signing.outputs.sign == 'true'
+        if: steps.contract.outputs.updater == 'true'
         env:
-          APP_VERSION: ${{ steps.version.outputs.version }}
-          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          APP_VERSION: ${{ steps.contract.outputs.version }}
+          RELEASE_TAG: ${{ steps.contract.outputs.tag }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-          RELEASE_NOTES: ${{ github.event.release.body }}
-          GH_TOKEN: ${{ github.token }}
+          APPCAST_TOOL: ${{ steps.contract.outputs.appcast_tool }}
         run: |
           set -euo pipefail
-          if [[ -z "${SPARKLE_PRIVATE_KEY:-}" ]]; then
-            echo "::warning::SPARKLE_PRIVATE_KEY not set - shipping without an appcast, so existing installs will not auto-update."
-            exit 0
-          fi
-
-          BIN="$(find .build/artifacts -type d -name bin -path '*sparkle*' -print -quit)"
-          if [[ -z "$BIN" ]]; then
-            echo "error: Sparkle tools not found in .build/artifacts" >&2
-            exit 1
-          fi
-
-          # generate_appcast wants a directory of archives to describe.
           mkdir -p sparkle-updates
           ditto -c -k --sequesterRsrc --keepParent \
             build/LocalFlow.app "sparkle-updates/LocalFlow-${APP_VERSION}.zip"
 
-          # Manual tag dispatches do not carry the release event body, so
-          # fetch the notes from the existing GitHub release in that case.
-          NOTES="${RELEASE_NOTES:-}"
-          if [[ -z "$NOTES" ]]; then
-            NOTES="$(gh release view "$RELEASE_TAG" --json body --jq .body)"
-          fi
-          if [[ -n "$NOTES" ]]; then
-            printf '%s\n' "$NOTES" > "sparkle-updates/LocalFlow-${APP_VERSION}.html"
+          if [[ -f CHANGELOG.md ]]; then
+            awk -v version="$APP_VERSION" '
+              $0 ~ "^## \\[" version "\\]" { found=1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > "sparkle-updates/LocalFlow-${APP_VERSION}.html"
           fi
 
-          "$BIN/generate_appcast" \
+          "$APPCAST_TOOL" \
             --ed-key-file - \
-            --download-url-prefix "https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/" \
+            --download-url-prefix "https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/" \
             --link "https://github.com/${{ github.repository }}" \
             sparkle-updates <<< "$SPARKLE_PRIVATE_KEY"
 
           cp sparkle-updates/appcast.xml dist/appcast.xml
           cp "sparkle-updates/LocalFlow-${APP_VERSION}.zip" dist/
-          echo "Appcast entries:"
-          grep -c "<item>" dist/appcast.xml
-          grep -o 'sparkle:edSignature="[^"]\{0,12\}' dist/appcast.xml | head -1
 
-      - name: Checksum
+      - name: Build checksums
         env:
-          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.contract.outputs.version }}
+          UPDATER_ENABLED: ${{ steps.contract.outputs.updater }}
         run: |
           set -euo pipefail
           cp scripts/setup-s1-mini.sh dist/setup-s1-mini.sh
           chmod 755 dist/setup-s1-mini.sh
           cd dist
-          shasum -a 256 *.dmg *.zip setup-s1-mini.sh 2>/dev/null > SHA256SUMS.txt || \
-            shasum -a 256 *.dmg setup-s1-mini.sh > SHA256SUMS.txt
+          FILES=("LocalFlow-${APP_VERSION}.dmg" setup-s1-mini.sh)
+          if [[ "$UPDATER_ENABLED" == "true" ]]; then
+            FILES+=("LocalFlow-${APP_VERSION}.zip")
+          fi
+          shasum -a 256 "${FILES[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      # Cryptographic proof that this DMG came out of this workflow, from
-      # this commit. Users verify with:
-      #   gh attestation verify LocalFlow-<v>.dmg --repo <owner>/<repo>
-      # Notarization proves Apple checked it; this proves where it came from.
+      - name: Validate release artifacts
+        env:
+          RELEASE_TAG: ${{ steps.contract.outputs.tag }}
+          APP_VERSION: ${{ steps.contract.outputs.version }}
+          APP_BUNDLE_PATH: build/LocalFlow.app
+          VERIFY_CHECKSUMS: "true"
+        run: ./scripts/validate-release.sh artifacts
+
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: dist/LocalFlow-${{ steps.version.outputs.version }}.dmg
+          subject-path: dist/LocalFlow-${{ steps.contract.outputs.version }}.dmg
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
-          name: LocalFlow-${{ steps.version.outputs.version }}
+          name: LocalFlow-${{ steps.contract.outputs.version }}
           path: |
             dist/*.dmg
+            dist/*.zip
+            dist/appcast.xml
             dist/SHA256SUMS.txt
             dist/setup-s1-mini.sh
+          if-no-files-found: error
           retention-days: 14
 
-      - name: Attach DMG to the release
-        if: steps.version.outputs.is_release == 'true'
+      - name: Create verified draft release
+        if: steps.contract.outputs.is_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP_VERSION: ${{ steps.contract.outputs.version }}
+          RELEASE_TAG: ${{ steps.contract.outputs.tag }}
+          COMMIT_SHA: ${{ steps.source.outputs.ref }}
         run: |
           set -euo pipefail
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          if [[ -f CHANGELOG.md ]]; then
+            awk -v version="$APP_VERSION" '
+              $0 ~ "^## \\[" version "\\]" { found=1; next }
+              found && /^## / { exit }
+              found { print }
+            ' CHANGELOG.md > "$NOTES_FILE"
+          fi
+          if [[ ! -s "$NOTES_FILE" ]]; then
+            printf 'LocalFlow %s\n' "$APP_VERSION" > "$NOTES_FILE"
+          fi
+
+          EXISTING="$(gh api --paginate "repos/${{ github.repository }}/releases" \
+            --jq ".[] | select(.tag_name == \"$RELEASE_TAG\") | [.id, .draft] | @tsv" \
+            | head -1)"
+          if [[ -n "$EXISTING" && "$EXISTING" != *$'\ttrue' ]]; then
+            echo "error: refusing to replace already-published release $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ -z "$EXISTING" ]]; then
+            CREATE_ARGS=(--draft --target "$COMMIT_SHA" --title "$RELEASE_TAG" --notes-file "$NOTES_FILE")
+            if [[ "$RELEASE_TAG" == *-* ]]; then
+              CREATE_ARGS+=(--prerelease)
+            fi
+            gh release create "$RELEASE_TAG" "${CREATE_ARGS[@]}"
+          fi
+
           ASSETS=(
             "dist/LocalFlow-${APP_VERSION}.dmg"
+            "dist/LocalFlow-${APP_VERSION}.zip"
+            "dist/appcast.xml"
             "dist/SHA256SUMS.txt"
             "dist/setup-s1-mini.sh"
           )
-          # appcast.xml must be attached for the feed URL
-          # (/releases/latest/download/appcast.xml) to resolve, and the ZIP is
-          # what the appcast points existing installs at.
-          [[ -f dist/appcast.xml ]] && ASSETS+=("dist/appcast.xml")
-          [[ -f "dist/LocalFlow-${APP_VERSION}.zip" ]] && ASSETS+=("dist/LocalFlow-${APP_VERSION}.zip")
-          gh release upload "${{ steps.version.outputs.tag }}" "${ASSETS[@]}" \
-            --repo "${{ github.repository }}" --clobber
+          gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --clobber
+
+      - name: Publish complete release
+        if: steps.contract.outputs.is_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.contract.outputs.tag }}
+        run: |
+          set -euo pipefail
+          EXPECTED=$'LocalFlow-${{ steps.contract.outputs.version }}.dmg\nLocalFlow-${{ steps.contract.outputs.version }}.zip\nSHA256SUMS.txt\nappcast.xml\nsetup-s1-mini.sh'
+          ACTUAL="$(gh release view "$RELEASE_TAG" --json assets \
+            --jq '.assets[].name' | sort)"
+          if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+            echo "error: draft release assets do not match the required set" >&2
+            diff -u <(printf '%s\n' "$EXPECTED") <(printf '%s\n' "$ACTUAL") || true
+            exit 1
+          fi
+
+          PUBLISH_ARGS=(--draft=false)
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            PUBLISH_ARGS+=(--prerelease)
+          else
+            PUBLISH_ARGS+=(--latest)
+          fi
+          gh release edit "$RELEASE_TAG" "${PUBLISH_ARGS[@]}"

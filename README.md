@@ -386,16 +386,17 @@ a folder shortcut, and **Delete All History**.
 
 ## Cutting a release
 
-Release Please maintains the version PR. Merging it creates the tag and
-GitHub Release, then dispatches `.github/workflows/release.yml` with that tag.
-The macOS runner tests, signs, notarizes, and packages the app, then attaches
-the DMG, Sparkle ZIP and appcast, checksums, and provenance to the release.
-A manual workflow dispatch with a tag rebuilds an existing release; leaving
-the tag blank produces an unpublished development artifact.
+Release Please maintains the version PR. Merging it dispatches
+`.github/workflows/release.yml` for that version and commit. The macOS runner
+tests, signs, notarizes, and packages the app. It validates the DMG, Sparkle
+ZIP and appcast, checksums, and setup script before publishing the tag and
+GitHub Release. A failed build may leave a private draft release, but it never
+leaves an incomplete public release. A manual workflow dispatch with a new
+tag creates that release; leaving the tag blank produces an unpublished
+development artifact with updates disabled.
 
-Signing and notarization need these repository secrets. Without them the
-workflow still builds and attaches a DMG, but it is ad-hoc signed and
-Gatekeeper makes users right-click → Open:
+Tagged releases require all of these repository secrets. The workflow stops
+before publication if one is missing. Development artifacts remain unsigned.
 
 | Secret | What it is |
 |---|---|

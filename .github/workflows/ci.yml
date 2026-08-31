@@ -46,6 +46,9 @@ jobs:
           fi
           echo "scripts are ASCII-clean"
 
+      - name: Test release contract
+        run: bash Tests/ReleaseContractTests.sh
+
       - name: Build
         run: swift build
 
