@@ -84,7 +84,7 @@ find_appcast_tool() {
 }
 
 validate_source_plist() {
-    local plist="$REPO_ROOT/Resources/Info.plist"
+    local plist="${SPARKLE_INFO_PLIST:-$REPO_ROOT/Resources/Info.plist}"
     [[ -f "$plist" ]] || fail "Resources/Info.plist is missing"
     plutil -lint "$plist" >/dev/null || fail "Resources/Info.plist is invalid"
 
@@ -94,6 +94,34 @@ validate_source_plist() {
     public_key="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$plist" 2>/dev/null || true)"
     [[ "$feed_url" == https://* ]] || fail "Info.plist must contain an HTTPS SUFeedURL"
     [[ -n "$public_key" ]] || fail "Info.plist must contain SUPublicEDKey"
+
+    SOURCE_SPARKLE_PUBLIC_KEY="$public_key"
+}
+
+validate_sparkle_signing_key() {
+    local derived_public_key
+    if ! derived_public_key="$(SPARKLE_PRIVATE_KEY="$SPARKLE_PRIVATE_KEY" swift -e '
+        import CryptoKit
+        import Foundation
+
+        guard let encodedKey = ProcessInfo.processInfo.environment["SPARKLE_PRIVATE_KEY"] else {
+            exit(1)
+        }
+        let normalizedKey = encodedKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let secret = Data(base64Encoded: normalizedKey), secret.count == 32 else {
+            exit(1)
+        }
+
+        guard let privateKey = try? Curve25519.Signing.PrivateKey(rawRepresentation: secret) else {
+            exit(1)
+        }
+        print(privateKey.publicKey.rawRepresentation.base64EncodedString())
+    ' 2>/dev/null)"; then
+        fail "SPARKLE_PRIVATE_KEY must be a valid modern Sparkle Ed25519 seed"
+    fi
+
+    [[ "$derived_public_key" == "$SOURCE_SPARKLE_PUBLIC_KEY" ]] || \
+        fail "SPARKLE_PRIVATE_KEY does not match Info.plist SUPublicEDKey"
 }
 
 preflight() {
@@ -133,6 +161,7 @@ preflight() {
     [[ -x "$appcast_tool" ]] || fail "generate_appcast is required for a tagged release"
 
     validate_source_plist
+    validate_sparkle_signing_key
 
     write_output is_release true
     write_output sign true

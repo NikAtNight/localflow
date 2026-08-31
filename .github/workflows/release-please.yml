@@ -27,7 +27,8 @@ jobs:
       - uses: actions/checkout@v7
         if: github.event_name == 'push'
         with:
-          fetch-depth: 2
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Detect merged release PR
         if: github.event_name == 'push'
@@ -38,13 +39,48 @@ jobs:
         run: |
           set -euo pipefail
           MANIFEST=.github/.release-please-manifest.json
+          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+             ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            echo "error: BEFORE_SHA does not identify an available commit" >&2
+            exit 1
+          fi
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || \
+             ! git cat-file -e "$COMMIT_SHA^{commit}" 2>/dev/null; then
+            echo "error: COMMIT_SHA does not identify an available commit" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$BEFORE_SHA" "$COMMIT_SHA"; then
+            echo "error: BEFORE_SHA is not an ancestor of COMMIT_SHA" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$COMMIT_SHA" ]]; then
+            echo "error: the checkout does not match COMMIT_SHA" >&2
+            exit 1
+          fi
+          if ! git cat-file -e "$BEFORE_SHA:$MANIFEST" 2>/dev/null || \
+             ! git cat-file -e "$COMMIT_SHA:$MANIFEST" 2>/dev/null; then
+            echo "error: release manifest is unavailable across the pushed revision range" >&2
+            exit 1
+          fi
+
           if git diff --quiet "$BEFORE_SHA" "$COMMIT_SHA" -- "$MANIFEST"; then
             echo "A normal main-branch push; no release build to dispatch."
             echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
+          else
+            DIFF_STATUS=$?
+            if [[ "$DIFF_STATUS" -ne 1 ]]; then
+              echo "error: could not verify the release manifest transition" >&2
+              exit 1
+            fi
           fi
 
-          VERSION="$(jq -er '.["."]' "$MANIFEST")"
+          BEFORE_VERSION="$(git show "$BEFORE_SHA:$MANIFEST" | jq -er '.["."]')"
+          VERSION="$(git show "$COMMIT_SHA:$MANIFEST" | jq -er '.["."]')"
+          if [[ "$VERSION" == "$BEFORE_VERSION" ]]; then
+            echo "error: release manifest changed without advancing the root version" >&2
+            exit 1
+          fi
           TAG="v$VERSION"
           if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z]+\.[0-9]+)?$ ]]; then
             echo "error: release manifest contains an unsupported version: $VERSION" >&2
@@ -57,12 +93,10 @@ jobs:
         if: steps.merged-release.outputs.created == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ steps.merged-release.outputs.tag }}
-          COMMIT_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           gh api --method POST \
             "repos/${{ github.repository }}/dispatches" \
             -f event_type=release-build \
-            -f "client_payload[tag]=$RELEASE_TAG" \
-            -f "client_payload[commit_sha]=$COMMIT_SHA"
+            -f "client_payload[before_sha]=$BEFORE_SHA"

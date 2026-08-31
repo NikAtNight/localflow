@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.client_payload.tag || github.event.client_payload.commit_sha || github.run_id }}
+  group: release-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
@@ -19,41 +19,78 @@ jobs:
       contents: read
     outputs:
       commit_sha: ${{ steps.source.outputs.ref }}
+      release_tag: ${{ steps.source.outputs.tag }}
     steps:
-      - name: Select source revision
-        id: source
-        env:
-          INPUT_COMMIT_SHA: ${{ github.event.client_payload.commit_sha }}
-          DISPATCH_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          COMMIT_SHA="${INPUT_COMMIT_SHA:-$DISPATCH_SHA}"
-          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "error: commit_sha must be a full lowercase Git commit SHA" >&2
-            exit 1
-          fi
-          echo "ref=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v7
         with:
           ref: main
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Verify source is on main
+      - name: Verify release manifest transition
+        id: source
         env:
-          COMMIT_SHA: ${{ steps.source.outputs.ref }}
+          BEFORE_SHA: ${{ github.event.client_payload.before_sha }}
+          DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          MANIFEST=.github/.release-please-manifest.json
+          COMMIT_SHA="$DISPATCH_SHA"
+          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: before_sha must be a full lowercase Git commit SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "error: dispatch SHA must be a full lowercase Git commit SHA" >&2
+            exit 1
+          fi
           OBJECT_TYPE="$(git cat-file -t "$COMMIT_SHA" 2>/dev/null || true)"
           if [[ "$OBJECT_TYPE" != "commit" ]]; then
-            echo "error: commit_sha does not identify a commit on origin/main" >&2
+            echo "error: dispatch SHA does not identify a commit on origin/main" >&2
             exit 1
           fi
           if ! git merge-base --is-ancestor "$COMMIT_SHA" "origin/main"; then
-            echo "error: commit_sha is not reachable from origin/main" >&2
+            echo "error: dispatch SHA is not reachable from origin/main" >&2
             exit 1
           fi
+          if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            echo "error: before_sha does not identify an available commit" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$BEFORE_SHA" "$COMMIT_SHA"; then
+            echo "error: before_sha is not an ancestor of the dispatch SHA" >&2
+            exit 1
+          fi
+          if ! git cat-file -e "$BEFORE_SHA:$MANIFEST" 2>/dev/null || \
+             ! git cat-file -e "$COMMIT_SHA:$MANIFEST" 2>/dev/null; then
+            echo "error: release manifest is unavailable across the claimed transition" >&2
+            exit 1
+          fi
+          if git diff --quiet "$BEFORE_SHA" "$COMMIT_SHA" -- "$MANIFEST"; then
+            echo "error: release manifest did not change across the claimed transition" >&2
+            exit 1
+          else
+            DIFF_STATUS=$?
+            if [[ "$DIFF_STATUS" -ne 1 ]]; then
+              echo "error: could not verify the release manifest transition" >&2
+              exit 1
+            fi
+          fi
+
+          BEFORE_VERSION="$(git show "$BEFORE_SHA:$MANIFEST" | jq -er '.["."]')"
+          VERSION="$(git show "$COMMIT_SHA:$MANIFEST" | jq -er '.["."]')"
+          if [[ "$VERSION" == "$BEFORE_VERSION" ]]; then
+            echo "error: release manifest changed without advancing the root version" >&2
+            exit 1
+          fi
+          RELEASE_TAG="v$VERSION"
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+            echo "error: release manifest contains an unsupported version: $VERSION" >&2
+            exit 1
+          fi
+
+          echo "ref=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build, sign, notarize, publish
@@ -87,7 +124,7 @@ jobs:
       - name: Validate release contract
         id: contract
         env:
-          RELEASE_TAG: ${{ github.event.client_payload.tag }}
+          RELEASE_TAG: ${{ needs.source.outputs.release_tag }}
           COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
