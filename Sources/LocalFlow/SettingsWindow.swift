@@ -180,8 +180,11 @@ final class SettingsModel: ObservableObject {
         guard !wrong.isEmpty, !right.isEmpty else { return }
         // Re-teaching a word replaces the old fix instead of stacking a
         // duplicate rule.
-        corrections.removeAll { $0.wrong.caseInsensitiveCompare(wrong) == .orderedSame }
-        corrections.append(CorrectionPair(wrong: wrong, right: right))
+        var updated = corrections.filter {
+            $0.wrong.caseInsensitiveCompare(wrong) != .orderedSame
+        }
+        updated.append(CorrectionPair(wrong: wrong, right: right))
+        corrections = updated
     }
 
     func removeCorrection(_ id: UUID) {
