@@ -1,22 +1,14 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: Version tag to create after the release passes validation
-        required: false
-        type: string
-      commit_sha:
-        description: Commit to build for the tag; defaults to the dispatched ref
-        required: false
-        type: string
+  repository_dispatch:
+    types: [release-build]
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref }}
+  group: release-${{ github.event.client_payload.tag || github.event.client_payload.commit_sha || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -31,8 +23,7 @@ jobs:
       - name: Select source revision
         id: source
         env:
-          INPUT_TAG: ${{ inputs.tag }}
-          INPUT_COMMIT_SHA: ${{ inputs.commit_sha }}
+          INPUT_COMMIT_SHA: ${{ github.event.client_payload.commit_sha }}
           DISPATCH_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
@@ -96,7 +87,7 @@ jobs:
       - name: Validate release contract
         id: contract
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.client_payload.tag }}
           COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}

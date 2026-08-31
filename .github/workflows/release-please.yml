@@ -14,7 +14,6 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     permissions:
-      actions: write # dispatch the signed artifact build after publishing
       contents: write # maintain the release PR branch and changelog commit
       pull-requests: write # maintain the release PR
     steps:
@@ -65,7 +64,8 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          gh workflow run release.yml \
-            --ref main \
-            -f tag="$RELEASE_TAG" \
-            -f commit_sha="$COMMIT_SHA"
+          gh api --method POST \
+            "repos/${{ github.repository }}/dispatches" \
+            -f event_type=release-build \
+            -f "client_payload[tag]=$RELEASE_TAG" \
+            -f "client_payload[commit_sha]=$COMMIT_SHA"
