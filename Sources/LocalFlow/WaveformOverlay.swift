@@ -75,6 +75,7 @@ final class WaveformOverlay {
             bare.addSubview(hudView)
             container = bare
         } else if newTheme == .liquidGlass {
+            #if compiler(>=6.2)
             if #available(macOS 26.0, *) {
                 let glass = NSGlassEffectView(frame: bounds)
                 glass.style = .regular
@@ -87,35 +88,31 @@ final class WaveformOverlay {
                 glass.contentView = hudView
                 container = glass
             } else {
-                let blur = NSVisualEffectView(frame: bounds)
-                blur.material = .hudWindow
-                blur.state = .active
-                blur.blendingMode = .behindWindow
-                blur.wantsLayer = true
-                blur.layer?.cornerRadius = size.height / 2
-                blur.layer?.cornerCurve = .continuous
-                blur.layer?.masksToBounds = true
-                blur.layer?.borderWidth = 1
-                blur.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
-                blur.addSubview(hudView)
-                container = blur
+                container = makeBlurContainer(bounds: bounds, size: size)
             }
+            #else
+            container = makeBlurContainer(bounds: bounds, size: size)
+            #endif
         } else {
-            let blur = NSVisualEffectView(frame: bounds)
-            blur.material = .hudWindow
-            blur.state = .active
-            blur.blendingMode = .behindWindow
-            blur.wantsLayer = true
-            blur.layer?.cornerRadius = size.height / 2
-            blur.layer?.cornerCurve = .continuous
-            blur.layer?.masksToBounds = true
-            blur.layer?.borderWidth = 1
-            blur.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
-            blur.addSubview(hudView)
-            container = blur
+            container = makeBlurContainer(bounds: bounds, size: size)
         }
 
         panel.contentView = container
+    }
+
+    private func makeBlurContainer(bounds: NSRect, size: NSSize) -> NSView {
+        let blur = NSVisualEffectView(frame: bounds)
+        blur.material = .hudWindow
+        blur.state = .active
+        blur.blendingMode = .behindWindow
+        blur.wantsLayer = true
+        blur.layer?.cornerRadius = size.height / 2
+        blur.layer?.cornerCurve = .continuous
+        blur.layer?.masksToBounds = true
+        blur.layer?.borderWidth = 1
+        blur.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        blur.addSubview(hudView)
+        return blur
     }
 
     /// Thread-safe: callable from the audio capture thread.
