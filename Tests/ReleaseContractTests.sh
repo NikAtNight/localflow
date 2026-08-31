@@ -399,6 +399,15 @@ test_artifact_validation_precedes_both_publication_steps() {
         fail 'artifact validation must run before upload and publication'
 }
 
+test_release_please_is_push_main_only() {
+    local release_please="$REPO_ROOT/.github/workflows/release-please.yml"
+    assert_file_contains "$release_please" 'push:' || return
+    assert_file_contains "$release_please" 'branches: [main]' || return
+    if grep -Fq 'workflow_dispatch:' "$release_please"; then
+        fail 'Release Please must not accept workflow_dispatch'
+    fi
+}
+
 if [[ ! -x "$VALIDATOR" ]]; then
     printf 'not ok 1 - release validator exists\n' >&2
     printf '    expected executable: %s\n' "$VALIDATOR" >&2
@@ -442,6 +451,7 @@ run_test 'Release Please dispatches the release tag and commit payload' test_rel
 run_test 'release reads tag and commit from the dispatch payload' test_release_reads_dispatch_payload
 run_test 'destination checks precede upload and publication' test_destination_checks_precede_upload_and_publish
 run_test 'artifact validation precedes both publication phases' test_artifact_validation_precedes_both_publication_steps
+run_test 'Release Please only runs on pushes to main' test_release_please_is_push_main_only
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
