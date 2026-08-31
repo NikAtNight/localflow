@@ -87,6 +87,44 @@ final class LocalTextModelPolicyFailureAndPrewarmTests: XCTestCase {
 
         XCTAssertEqual(ollama.prewarmModels, ["s1-mini", "s1-mini"])
     }
+
+    func testApplePrewarmForTheSameModelIsSuppressedDuringTheCooldown() async {
+        let clock = PolicyTestClock(now: Date(timeIntervalSinceReferenceDate: 0))
+        let apple = PolicyAppleBackendSpy(isAvailable: true)
+        let ollama = PolicyOllamaBackendSpy()
+        let policy = LocalTextModelPolicy(
+            apple: apple,
+            ollama: ollama,
+            now: { clock.now },
+            prewarmCooldown: 60
+        )
+
+        await policy.prewarm(model: "s1-mini")
+        clock.now = Date(timeIntervalSinceReferenceDate: 59)
+        await policy.prewarm(model: "s1-mini")
+
+        XCTAssertEqual(apple.prewarmCallCount, 1)
+        XCTAssertTrue(ollama.prewarmModels.isEmpty)
+    }
+
+    func testApplePrewarmForTheSameModelRunsAgainAfterTheCooldownExpires() async {
+        let clock = PolicyTestClock(now: Date(timeIntervalSinceReferenceDate: 0))
+        let apple = PolicyAppleBackendSpy(isAvailable: true)
+        let ollama = PolicyOllamaBackendSpy()
+        let policy = LocalTextModelPolicy(
+            apple: apple,
+            ollama: ollama,
+            now: { clock.now },
+            prewarmCooldown: 60
+        )
+
+        await policy.prewarm(model: "s1-mini")
+        clock.now = Date(timeIntervalSinceReferenceDate: 60)
+        await policy.prewarm(model: "s1-mini")
+
+        XCTAssertEqual(apple.prewarmCallCount, 2)
+        XCTAssertTrue(ollama.prewarmModels.isEmpty)
+    }
 }
 
 @MainActor
@@ -94,6 +132,7 @@ private final class PolicyAppleBackendSpy: AppleTextModelBackend {
     var isAvailable: Bool
     var commandResults: [Result<TextModelGeneration, Error>] = []
     private(set) var commandCallCount = 0
+    private(set) var prewarmCallCount = 0
 
     init(isAvailable: Bool) {
         self.isAvailable = isAvailable
@@ -108,7 +147,9 @@ private final class PolicyAppleBackendSpy: AppleTextModelBackend {
         return try commandResults.removeFirst().get()
     }
 
-    func prewarm() {}
+    func prewarm() {
+        prewarmCallCount += 1
+    }
 }
 
 @MainActor
