@@ -521,8 +521,9 @@ jobs:
           unset AUTH_HEADER GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 
           EXPECTED=$'LocalFlow-${{ steps.contract.outputs.version }}.dmg\nLocalFlow-${{ steps.contract.outputs.version }}.zip\nSHA256SUMS.txt\nappcast.xml\nsetup-s1-mini.sh'
+          EXPECTED="$(printf '%s\n' "$EXPECTED" | LC_ALL=C sort)"
           ACTUAL="$(gh release view "$RELEASE_TAG" --json assets \
-            --jq '.assets[].name' | sort)"
+            --jq '.assets[].name' | LC_ALL=C sort)"
           if [[ "$ACTUAL" != "$EXPECTED" ]]; then
             echo "error: draft release assets do not match the required set" >&2
             diff -u <(printf '%s\n' "$EXPECTED") <(printf '%s\n' "$ACTUAL") || true
