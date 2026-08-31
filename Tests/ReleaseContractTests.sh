@@ -17,6 +17,10 @@ SOURCE_SCRIPT="$TEST_ROOT/verify-release-source.sh"
 PUBLICATION_REPO="$TEST_ROOT/publication-worktree"
 PUBLICATION_ORIGIN="$TEST_ROOT/publication-origin.git"
 PUBLICATION_SCRIPT="$TEST_ROOT/publication-step.sh"
+RELEASE_STEP_SCRIPT="$TEST_ROOT/release-step.sh"
+DMG_SIGNING_SCRIPT="$TEST_ROOT/dmg-signing-phase.sh"
+RELEASE_TOOL_LOG="$TEST_ROOT/release-tools"
+RELEASE_FAKE_BIN="$TEST_ROOT/release-fake-bin"
 GH_LOG="$TEST_ROOT/gh-mutations"
 OUTPUT_FILE="$TEST_ROOT/github-output"
 STDOUT_FILE="$TEST_ROOT/stdout"
@@ -237,6 +241,108 @@ extract_publication_script() {
     script="${script//'${{ steps.contract.outputs.version }}'/1.1.0}"
     printf '%s\n' "$script" > "$PUBLICATION_SCRIPT"
     chmod +x "$PUBLICATION_SCRIPT"
+}
+
+extract_release_step_script() {
+    local step_name="$1"
+    awk -v step_name="$step_name" '
+        $0 == "      - name: " step_name { in_step=1; next }
+        in_step && /^      - name:/ { exit }
+        in_step && /^        run: \|$/ { in_run=1; next }
+        in_run && /^          / { sub(/^          /, ""); print; next }
+        in_run && /^[[:space:]]*$/ { print; next }
+        in_run { exit }
+    ' "$RELEASE_WORKFLOW" > "$RELEASE_STEP_SCRIPT"
+    chmod +x "$RELEASE_STEP_SCRIPT"
+}
+
+release_step_block() {
+    local step_name="$1"
+    awk -v step_name="$step_name" '
+        $0 == "      - name: " step_name { active=1; print; next }
+        active && /^      - name:/ { exit }
+        active { print }
+    ' "$RELEASE_WORKFLOW"
+}
+
+extract_dmg_signing_phase() {
+    awk '
+        /^      - name: Package DMG$/ { after_package=1; next }
+        after_package && /^      - name: Verify signed artifacts$/ { exit }
+        in_run && /^          / {
+            sub(/^          /, "")
+            if ($0 == "./scripts/make-dmg.sh") $0="make-dmg"
+            print
+            next
+        }
+        in_run && /^[[:space:]]*$/ { print; next }
+        in_run { in_run=0 }
+        after_package && /^        run: \|$/ { in_run=1; next }
+        after_package && /^        run: / {
+            sub(/^        run: /, "")
+            if ($0 == "./scripts/make-dmg.sh") $0="make-dmg"
+            print
+        }
+    ' "$RELEASE_WORKFLOW" > "$DMG_SIGNING_SCRIPT"
+    chmod +x "$DMG_SIGNING_SCRIPT"
+}
+
+reset_release_tool_fixture() {
+    rm -rf "$RELEASE_FAKE_BIN"
+    mkdir -p "$RELEASE_FAKE_BIN"
+    : > "$RELEASE_TOOL_LOG"
+
+    local tool
+    for tool in codesign spctl xcrun make-dmg; do
+        printf '%s\n' \
+            '#!/bin/bash' \
+            "printf '$tool' >> \"\$RELEASE_TOOL_LOG\"" \
+            'printf " <%s>" "$@" >> "$RELEASE_TOOL_LOG"' \
+            'printf "\n" >> "$RELEASE_TOOL_LOG"' \
+            > "$RELEASE_FAKE_BIN/$tool"
+        chmod +x "$RELEASE_FAKE_BIN/$tool"
+    done
+}
+
+run_release_script() {
+    local script="$1"
+    : > "$STDOUT_FILE"
+    : > "$STDERR_FILE"
+    (
+        cd "$REPO_ROOT"
+        env -i \
+            PATH="$RELEASE_FAKE_BIN:$PATH" \
+            HOME="${HOME:-/tmp}" \
+            RELEASE_TOOL_LOG="$RELEASE_TOOL_LOG" \
+            APP_VERSION=1.2.3 \
+            SIGNED=true \
+            SIGN_IDENTITY='Developer ID Application: LocalFlow Test (TESTTEAM01)' \
+            APPLE_ID=release@example.com \
+            APPLE_APP_SPECIFIC_PASSWORD=test-app-password \
+            APPLE_TEAM_ID=TESTTEAM01 \
+            bash "$script"
+    ) > "$STDOUT_FILE" 2> "$STDERR_FILE"
+    LAST_STATUS=$?
+}
+
+assert_logged_call() {
+    local tool="$1"
+    shift
+    local call
+    local expected
+    while IFS= read -r call; do
+        local matches=true
+        for expected in "$@"; do
+            if [[ "$call" != *" <$expected>"* ]]; then
+                matches=false
+                break
+            fi
+        done
+        [[ "$matches" == true ]] && return 0
+    done < <(grep -E "^${tool}( |$)" "$RELEASE_TOOL_LOG")
+
+    sed 's/^/    tool call: /' "$RELEASE_TOOL_LOG" >&2
+    fail "missing $tool call with arguments: $*"
 }
 
 reset_publication_fixture() {
@@ -510,6 +616,64 @@ test_app_bundle_version() {
         "$APP_BUNDLE_PATH/Contents/Info.plist"
     run_artifact_validation
     assert_failure_containing 'built app has the wrong CFBundleVersion'
+}
+
+test_dmg_is_signed_after_packaging_before_notarization() {
+    local sign_step
+    local package_line
+    local sign_line
+    local notarize_line
+
+    sign_step="$(release_step_block 'Sign DMG')"
+    if ! grep -Fq 'SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}' <<< "$sign_step"; then
+        fail 'DMG signing must use the imported Developer ID Application identity'
+        return
+    fi
+
+    extract_dmg_signing_phase
+    reset_release_tool_fixture
+    run_release_script "$DMG_SIGNING_SCRIPT"
+    assert_success || return
+    assert_logged_call codesign \
+        --sign \
+        'Developer ID Application: LocalFlow Test (TESTTEAM01)' \
+        dist/LocalFlow-1.2.3.dmg || return
+    assert_logged_call xcrun notarytool submit dist/LocalFlow-1.2.3.dmg || return
+
+    package_line="$(grep -n -m1 '^make-dmg' "$RELEASE_TOOL_LOG" | cut -d: -f1)"
+    sign_line="$(grep -n -m1 '^codesign .*<dist/LocalFlow-1\.2\.3\.dmg>' \
+        "$RELEASE_TOOL_LOG" | cut -d: -f1)"
+    notarize_line="$(grep -n -m1 '^xcrun .*<notarytool>.*<submit>.*<dist/LocalFlow-1\.2\.3\.dmg>' \
+        "$RELEASE_TOOL_LOG" | cut -d: -f1)"
+    [[ -n "$package_line" && -n "$sign_line" && -n "$notarize_line" && \
+        "$package_line" -lt "$sign_line" && "$sign_line" -lt "$notarize_line" ]] || {
+        sed 's/^/    tool call: /' "$RELEASE_TOOL_LOG" >&2
+        fail 'the workflow must package, sign, then notarize the DMG'
+    }
+}
+
+test_signed_dmg_passes_codesign_gatekeeper_and_stapler_checks() {
+    local verify_step
+    verify_step="$(release_step_block 'Verify signed artifacts')"
+    if ! grep -Fq 'SIGNED: ${{ steps.contract.outputs.sign }}' <<< "$verify_step"; then
+        fail 'signed artifact verification must use the validated signing decision'
+        return
+    fi
+
+    extract_release_step_script 'Verify signed artifacts'
+    reset_release_tool_fixture
+    run_release_script "$RELEASE_STEP_SCRIPT"
+    assert_success || return
+    assert_logged_call codesign --verify build/LocalFlow.app || return
+    assert_logged_call spctl --assess --type execute build/LocalFlow.app || return
+    assert_logged_call xcrun stapler validate build/LocalFlow.app || return
+    assert_logged_call codesign --verify dist/LocalFlow-1.2.3.dmg || return
+    assert_logged_call spctl \
+        --assess \
+        --type open \
+        --context context:primary-signature \
+        dist/LocalFlow-1.2.3.dmg || return
+    assert_logged_call xcrun stapler validate dist/LocalFlow-1.2.3.dmg
 }
 
 test_release_source_is_main_ancestry() {
@@ -828,6 +992,8 @@ run_test 'checksum manifest covers the update ZIP' test_checksum_manifest_covera
 run_test 'checksum manifest matches the release artifacts' test_checksum_contents
 run_test 'built app bundle version matches the release tag' test_app_bundle_version
 run_test 'development builds do not require release artifacts' test_development_artifacts_are_optional
+run_test 'DMG is signed with the imported identity after packaging and before notarization' test_dmg_is_signed_after_packaging_before_notarization
+run_test 'signed DMG passes codesign, Gatekeeper, and stapler verification' test_signed_dmg_passes_codesign_gatekeeper_and_stapler_checks
 run_test 'release source commit is reachable from origin/main' test_release_source_is_main_ancestry
 run_test 'existing draft release targets the requested commit' test_existing_draft_targets_requested_commit
 run_test 'existing tag targets the requested commit' test_existing_tag_targets_requested_commit
