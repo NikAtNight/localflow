@@ -274,6 +274,17 @@ jobs:
           APP_VERSION: ${{ steps.contract.outputs.version }}
         run: ./scripts/make-dmg.sh
 
+      - name: Sign DMG
+        if: steps.contract.outputs.sign == 'true'
+        env:
+          APP_VERSION: ${{ steps.contract.outputs.version }}
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: |
+          set -euo pipefail
+          DMG="dist/LocalFlow-${APP_VERSION}.dmg"
+          codesign --force --sign "$SIGN_IDENTITY" --timestamp \
+            --identifier app.talix.localflow.dmg "$DMG"
+
       - name: Notarize DMG
         if: steps.contract.outputs.sign == 'true'
         env:
@@ -300,7 +311,10 @@ jobs:
           DMG="dist/LocalFlow-${APP_VERSION}.dmg"
           codesign --verify --deep --strict --verbose=2 build/LocalFlow.app
           if [[ "$SIGNED" == "true" ]]; then
+            codesign --verify --strict --verbose=2 "$DMG"
             spctl --assess --type execute --verbose=4 build/LocalFlow.app
+            spctl --assess --type open --context context:primary-signature \
+              --verbose=4 "$DMG"
             xcrun stapler validate build/LocalFlow.app
             xcrun stapler validate "$DMG"
           fi
