@@ -131,9 +131,20 @@ enum AppleIntelligenceCleaner {
         _ rawText: String,
         profile: AppStyleProfile = .general
     ) async throws -> TranscriptCleanupResult {
+        let generation = try await generateCleanup(rawText, profile: profile)
+        guard generation.finishReason == .complete else {
+            return TranscriptCleanupResult(text: rawText, succeeded: false)
+        }
+        return TranscriptCleanup.validationResult(generation.text, raw: rawText)
+    }
+
+    static func generateCleanup(
+        _ rawText: String,
+        profile: AppStyleProfile = .general
+    ) async throws -> TextModelGeneration {
         #if canImport(FoundationModels)
         guard #available(macOS 26.0, *) else {
-            return TranscriptCleanupResult(text: rawText, succeeded: false)
+            return TextModelGeneration(text: rawText, finishReason: .complete)
         }
         // A fresh session per dictation: a reused one accumulates every
         // previous transcript as context and eventually overflows it.
@@ -142,13 +153,44 @@ enum AppleIntelligenceCleaner {
             to: rawText,
             options: GenerationOptions(temperature: 0.1)
         )
-        return TranscriptCleanup.validationResult(response.content, raw: rawText)
+        return TextModelGeneration(text: response.content, finishReason: .complete)
         #else
-        return TranscriptCleanupResult(text: rawText, succeeded: false)
+        return TextModelGeneration(text: rawText, finishReason: .complete)
         #endif
     }
 
     static func clean(_ rawText: String, profile: AppStyleProfile = .general) async throws -> String {
         try await cleanResult(rawText, profile: profile).text
+    }
+}
+
+@MainActor
+final class AppleIntelligenceTextModelBackend: AppleTextModelBackend {
+    var isAvailable: Bool {
+        AppleIntelligenceCleaner.isAvailable
+    }
+
+    func cleanup(_ text: String, profile: AppStyleProfile) async throws -> TextModelGeneration {
+        try await AppleIntelligenceCleaner.generateCleanup(text, profile: profile)
+    }
+
+    func command(system: String, prompt: String) async throws -> TextModelGeneration {
+        #if canImport(FoundationModels)
+        guard #available(macOS 26.0, *) else {
+            return TextModelGeneration(text: "", finishReason: .complete)
+        }
+        let session = LanguageModelSession(instructions: system)
+        let response = try await session.respond(
+            to: prompt,
+            options: GenerationOptions(temperature: 0.3)
+        )
+        return TextModelGeneration(text: response.content, finishReason: .complete)
+        #else
+        return TextModelGeneration(text: "", finishReason: .complete)
+        #endif
+    }
+
+    func prewarm() {
+        AppleIntelligenceCleaner.prewarm()
     }
 }
