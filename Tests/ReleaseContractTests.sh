@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VALIDATOR="$REPO_ROOT/scripts/validate-release.sh"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 RELEASE_PLEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release-please.yml"
+README="$REPO_ROOT/README.md"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/localflow-release-contract.XXXXXX")"
 DIST_DIR="$TEST_ROOT/dist"
 FRAMEWORK_PATH="$TEST_ROOT/Sparkle.framework"
@@ -12,6 +13,7 @@ APPCAST_TOOL="$TEST_ROOT/generate_appcast"
 INFO_PLIST="$TEST_ROOT/Info.plist"
 DETECTION_REPO="$TEST_ROOT/release-detection"
 DETECTION_SCRIPT="$TEST_ROOT/detect-merged-release.sh"
+SOURCE_SCRIPT="$TEST_ROOT/verify-release-source.sh"
 OUTPUT_FILE="$TEST_ROOT/github-output"
 STDOUT_FILE="$TEST_ROOT/stdout"
 STDERR_FILE="$TEST_ROOT/stderr"
@@ -25,6 +27,8 @@ LAST_STATUS=0
 MATCHING_PRIVATE_KEY='nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A='
 MATCHING_PUBLIC_KEY='11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo='
 MISMATCHED_PRIVATE_KEY='TM0Imyj/ltqdtsNG7BFOD1uKMZ81q6Yk2oz27U+4pvs='
+LEGACY_MATCHING_PRIVATE_KEY='MHyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afj9damAGCsQq31Uv+08lkBzoO4XLz2qYjJa8CGmj3B1Ea'
+LEGACY_MISMATCHED_PRIVATE_KEY='MHyDhk8oM8tCei7xwAoBPP3/J2jZgMCjpSDwBpBN6U+bTwr+KAt0aneGhOdUQlAgV7dHOgPwj5b1o46Sh+Afjz1AF8PoQ4lakrcKp00bfrycmCzPLsSWjMDNVfEq9GYM'
 
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
@@ -131,12 +135,27 @@ extract_detection_script() {
     chmod +x "$DETECTION_SCRIPT"
 }
 
+extract_source_script() {
+    awk '
+        /^      - name: Verify release manifest transition$/ { in_step=1; next }
+        in_step && /^      - name:/ { exit }
+        in_step && /^        run: \|$/ { in_run=1; next }
+        in_run && /^          / { sub(/^          /, ""); print; next }
+        in_run && /^[[:space:]]*$/ { print; next }
+        in_run { exit }
+    ' "$RELEASE_WORKFLOW" > "$SOURCE_SCRIPT"
+    chmod +x "$SOURCE_SCRIPT"
+}
+
 reset_detection_fixture() {
+    local before_version="${1:-1.0.0}"
+    local release_version="${2:-1.1.0}"
     rm -rf "$DETECTION_REPO"
     mkdir -p "$DETECTION_REPO/.github"
     git -C "$DETECTION_REPO" init -q -b main
 
-    printf '{".":"1.0.0"}\n' > "$DETECTION_REPO/.github/.release-please-manifest.json"
+    printf '{".":"%s"}\n' "$before_version" \
+        > "$DETECTION_REPO/.github/.release-please-manifest.json"
     git -C "$DETECTION_REPO" add .github/.release-please-manifest.json
     git -C "$DETECTION_REPO" -c user.name=Tests -c user.email=tests@example.com \
         commit -qm 'initial release manifest'
@@ -147,11 +166,13 @@ reset_detection_fixture() {
     git -C "$DETECTION_REPO" -c user.name=Tests -c user.email=tests@example.com \
         commit -qm 'intervening main commit'
 
-    printf '{".":"1.1.0"}\n' > "$DETECTION_REPO/.github/.release-please-manifest.json"
+    printf '{".":"%s"}\n' "$release_version" \
+        > "$DETECTION_REPO/.github/.release-please-manifest.json"
     git -C "$DETECTION_REPO" add .github/.release-please-manifest.json
     git -C "$DETECTION_REPO" -c user.name=Tests -c user.email=tests@example.com \
         commit -qm 'merge release manifest'
     DETECTION_COMMIT_SHA="$(git -C "$DETECTION_REPO" rev-parse HEAD)"
+    git -C "$DETECTION_REPO" update-ref refs/remotes/origin/main "$DETECTION_COMMIT_SHA"
 }
 
 run_release_detection() {
@@ -170,6 +191,28 @@ run_release_detection() {
             BEFORE_SHA="$before_sha" \
             COMMIT_SHA="$commit_sha" \
             bash "$DETECTION_SCRIPT"
+    ) > "$STDOUT_FILE" 2> "$STDERR_FILE"
+    LAST_STATUS=$?
+}
+
+run_source_verification() {
+    local before_sha="$1"
+    local release_sha="$2"
+    : > "$OUTPUT_FILE"
+    : > "$STDOUT_FILE"
+    : > "$STDERR_FILE"
+
+    (
+        cd "$DETECTION_REPO"
+        env -i \
+            PATH="$PATH" \
+            HOME="${HOME:-/tmp}" \
+            GITHUB_OUTPUT="$OUTPUT_FILE" \
+            BEFORE_SHA="$before_sha" \
+            COMMIT_SHA="$release_sha" \
+            RELEASE_SHA="$release_sha" \
+            DISPATCH_SHA="$release_sha" \
+            bash "$SOURCE_SCRIPT"
     ) > "$STDOUT_FILE" 2> "$STDERR_FILE"
     LAST_STATUS=$?
 }
@@ -296,6 +339,18 @@ test_mismatched_sparkle_key() {
     assert_failure_containing 'SUPublicEDKey'
 }
 
+test_matching_legacy_sparkle_key() {
+    reset_tool_fixture
+    SPARKLE_PRIVATE_KEY="$LEGACY_MATCHING_PRIVATE_KEY" run_preflight
+    assert_success
+}
+
+test_mismatched_legacy_sparkle_key() {
+    reset_tool_fixture
+    SPARKLE_PRIVATE_KEY="$LEGACY_MISMATCHED_PRIVATE_KEY" run_preflight
+    assert_failure_containing 'SUPublicEDKey'
+}
+
 test_prerelease_version_mapping() {
     reset_tool_fixture
     RELEASE_TAG='v1.2.3-beta.4' run_preflight
@@ -413,25 +468,23 @@ test_development_artifacts_are_optional() {
     assert_success
 }
 
-test_release_uses_typed_repository_dispatch() {
-    assert_file_contains "$RELEASE_WORKFLOW" 'repository_dispatch:' || return
-    if ! grep -Eq 'types:[[:space:]]*\[release-build\]|^[[:space:]]*-[[:space:]]+release-build$' "$RELEASE_WORKFLOW"; then
-        fail 'release repository dispatch must only accept release-build events'
+test_release_is_reusable_workflow_only() {
+    assert_file_contains "$RELEASE_WORKFLOW" 'workflow_call:' || return
+    if grep -Eq 'repository_dispatch:|workflow_dispatch:' "$RELEASE_WORKFLOW"; then
+        fail 'release workflow must only accept a trusted workflow_call'
         return
     fi
-    if grep -Fq 'workflow_dispatch:' "$RELEASE_WORKFLOW"; then
-        fail 'release workflow must not accept workflow_dispatch'
+    if grep -Eq 'github\.event\.client_payload|\$\{\{ inputs\.' "$RELEASE_WORKFLOW"; then
+        fail 'release workflow must not accept caller-provided release state'
     fi
 }
 
-test_release_please_dispatches_release_transition() {
-    assert_file_contains "$RELEASE_PLEASE_WORKFLOW" 'gh api' || return
+test_release_please_calls_release_workflow() {
     assert_file_contains "$RELEASE_PLEASE_WORKFLOW" \
-        'repos/${{ github.repository }}/dispatches' || return
-    assert_file_contains "$RELEASE_PLEASE_WORKFLOW" 'event_type' || return
-    assert_file_contains "$RELEASE_PLEASE_WORKFLOW" 'release-build' || return
-    assert_file_contains "$RELEASE_PLEASE_WORKFLOW" \
-        'client_payload[before_sha]=$BEFORE_SHA'
+        'uses: ./.github/workflows/release.yml' || return
+    if grep -Eq 'gh api|/dispatches|client_payload|release-build' "$RELEASE_PLEASE_WORKFLOW"; then
+        fail 'Release Please must call the reusable workflow without repository dispatch'
+    fi
 }
 
 test_release_reads_trusted_dispatch_context() {
@@ -452,17 +505,12 @@ test_release_reads_trusted_dispatch_context() {
         active { print }
     ' "$RELEASE_WORKFLOW")"
     case "$source_job" in
-        *'github.event.client_payload.before_sha'*'DISPATCH_SHA: ${{ github.sha }}'*) ;;
-        *) fail 'source verification must use the claimed before revision and trusted dispatch SHA'; return ;;
+        *'BEFORE_SHA: ${{ github.event.before }}'*'${{ github.sha }}'*) ;;
+        *) fail 'source verification must derive both revisions from the caller push context'; return ;;
     esac
-    case "$source_job" in
-        *'github.event.client_payload.tag'*|*'github.event.client_payload.commit_sha'*)
-            fail 'source verification must not trust a payload tag or commit SHA'; return ;;
-    esac
-    case "$contract_step" in
-        *'github.event.client_payload.tag'*|*'github.event.client_payload.commit_sha'*)
-            fail 'release validation must use verified source outputs, not payload release state' ;;
-    esac
+    if grep -Eq 'github\.event\.client_payload|\$\{\{ inputs\.' <<< "$source_job$contract_step"; then
+        fail 'release validation must not consume caller-provided release state'
+    fi
 }
 
 test_destination_checks_precede_upload_and_publish() {
@@ -543,6 +591,79 @@ test_missing_before_revision_fails_closed() {
     fi
 }
 
+test_release_source_requires_current_main_tip() {
+    extract_source_script
+    reset_detection_fixture
+
+    printf 'main advanced after the release call\n' >> "$DETECTION_REPO/notes.txt"
+    git -C "$DETECTION_REPO" add notes.txt
+    git -C "$DETECTION_REPO" -c user.name=Tests -c user.email=tests@example.com \
+        commit -qm 'advance main after release call'
+    git -C "$DETECTION_REPO" update-ref refs/remotes/origin/main \
+        "$(git -C "$DETECTION_REPO" rev-parse HEAD)"
+
+    run_source_verification "$DETECTION_BEFORE_SHA" "$DETECTION_COMMIT_SHA"
+    assert_failure_containing 'origin/main tip'
+}
+
+test_release_source_rejects_reverted_main_tip() {
+    extract_source_script
+    reset_detection_fixture
+    git -C "$DETECTION_REPO" update-ref refs/remotes/origin/main "$DETECTION_BEFORE_SHA"
+    run_source_verification "$DETECTION_BEFORE_SHA" "$DETECTION_COMMIT_SHA"
+    assert_failure_containing 'origin/main'
+}
+
+test_numeric_semver_increase_is_detected() {
+    extract_detection_script
+    reset_detection_fixture '1.9.0' '1.10.0'
+    run_release_detection "$DETECTION_BEFORE_SHA" "$DETECTION_COMMIT_SHA"
+    assert_success || return
+    assert_output 'created=true' || return
+    assert_output 'tag=v1.10.0'
+}
+
+test_release_detection_rejects_version_rollback() {
+    extract_detection_script
+    reset_detection_fixture '2.0.0' '1.10.0'
+    run_release_detection "$DETECTION_BEFORE_SHA" "$DETECTION_COMMIT_SHA"
+    assert_failure_containing 'greater'
+}
+
+test_release_detection_rejects_prerelease_rollback() {
+    extract_detection_script
+    reset_detection_fixture '1.2.3' '1.2.3-rc.2'
+    run_release_detection "$DETECTION_BEFORE_SHA" "$DETECTION_COMMIT_SHA"
+    assert_failure_containing 'greater'
+}
+
+test_release_source_rejects_version_rollback() {
+    extract_source_script
+    reset_detection_fixture '2.0.0' '1.10.0'
+    run_source_verification "$DETECTION_BEFORE_SHA" "$DETECTION_COMMIT_SHA"
+    assert_failure_containing 'greater'
+}
+
+test_release_docs_describe_only_trusted_automatic_flow() {
+    local release_docs
+    release_docs="$(awk '
+        /^## Cutting a release$/ { active=1 }
+        active && /^## / && $0 != "## Cutting a release" { active=0 }
+        active { print }
+    ' "$README")"
+    for expected in 'Release Please' 'automatically' 'main push' 'release.yml'; do
+        if ! grep -Fiq "$expected" <<< "$release_docs"; then
+            fail "release documentation must describe $expected"
+            return
+        fi
+    done
+    if grep -Eiq \
+        'repository[_ ]dispatch|client_payload|release-build|request.*manually|tag and (full )?commit|omit .*payload|unpublished development artifact|development artifacts remain unsigned' \
+        <<< "$release_docs"; then
+        fail 'release documentation contains obsolete direct-dispatch instructions'
+    fi
+}
+
 if [[ ! -x "$VALIDATOR" ]]; then
     printf 'not ok 1 - release validator exists\n' >&2
     printf '    expected executable: %s\n' "$VALIDATOR" >&2
@@ -568,6 +689,8 @@ run_test 'tagged preflight requires Sparkle.framework' test_missing_sparkle_fram
 run_test 'tagged preflight requires generate_appcast' test_missing_sparkle_tool
 run_test 'tagged preflight accepts the private key matching SUPublicEDKey' test_matching_sparkle_key
 run_test 'tagged preflight rejects a private key that does not match SUPublicEDKey' test_mismatched_sparkle_key
+run_test 'tagged preflight accepts Sparkle legacy private-plus-public exports' test_matching_legacy_sparkle_key
+run_test 'tagged preflight rejects a legacy export whose public key does not match' test_mismatched_legacy_sparkle_key
 run_test 'supported pre-release tags map to plist-safe versions' test_prerelease_version_mapping
 run_test 'unsupported pre-release labels fail closed' test_unsupported_prerelease
 run_test 'oversized bundle version components fail closed' test_unsafe_bundle_version
@@ -583,8 +706,8 @@ run_test 'release source commit is reachable from origin/main' test_release_sour
 run_test 'existing draft release targets the requested commit' test_existing_draft_targets_requested_commit
 run_test 'existing tag targets the requested commit' test_existing_tag_targets_requested_commit
 run_test 'release workflow validates artifacts before publication' test_release_workflow_validates_before_publication
-run_test 'release uses a typed repository dispatch trigger' test_release_uses_typed_repository_dispatch
-run_test 'Release Please dispatches the release manifest transition' test_release_please_dispatches_release_transition
+run_test 'release is callable only as a reusable workflow' test_release_is_reusable_workflow_only
+run_test 'Release Please calls the reusable release workflow' test_release_please_calls_release_workflow
 run_test 'release reads only trusted dispatch context' test_release_reads_trusted_dispatch_context
 run_test 'destination checks precede upload and publication' test_destination_checks_precede_upload_and_publish
 run_test 'artifact validation precedes both publication phases' test_artifact_validation_precedes_both_publication_steps
@@ -593,6 +716,13 @@ run_test 'release state is derived from a verified main manifest transition' tes
 run_test 'Release Please fetches the complete pushed revision range' test_release_detection_fetches_complete_push_history
 run_test 'multi-commit release pushes detect the manifest transition' test_multi_commit_release_push_is_detected
 run_test 'an unavailable before revision fails closed without dispatch' test_missing_before_revision_fails_closed
+run_test 'release source must equal the current origin/main tip' test_release_source_requires_current_main_tip
+run_test 'release source rejects a reverted origin/main tip' test_release_source_rejects_reverted_main_tip
+run_test 'numeric semantic-version increases are accepted' test_numeric_semver_increase_is_detected
+run_test 'release detection rejects a version rollback' test_release_detection_rejects_version_rollback
+run_test 'release detection rejects a stable-to-prerelease rollback' test_release_detection_rejects_prerelease_rollback
+run_test 'release source verification rejects a version rollback' test_release_source_rejects_version_rollback
+run_test 'release documentation describes only the trusted automatic flow' test_release_docs_describe_only_trusted_automatic_flow
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
