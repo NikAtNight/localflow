@@ -69,10 +69,10 @@ struct LocalFlowMain {
                 stageStart = Date()
                 var text = try await transcriber.transcribe(file: path)
                 stderr.write(Data("transcribe: \(elapsedMs(since: stageStart))ms\n".utf8))
-                text = VoiceFormatter.apply(
-                    TranscriptCorrections.apply(text, corrections: Settings.corrections)
-                )
 
+                // Match the app pipeline: S1-mini is trained on raw ASR text,
+                // while deterministic corrections and spoken formatting must
+                // run afterward so the model cannot rewrite their output.
                 if cleanupEnabled, Settings.cleanupEnabled {
                     stageStart = Date()
                     do {
@@ -83,6 +83,10 @@ struct LocalFlowMain {
                         stderr.write(Data("S1-mini cleanup failed, using raw transcript: \(error.localizedDescription)\n".utf8))
                     }
                 }
+
+                text = VoiceFormatter.apply(
+                    TranscriptCorrections.apply(text, corrections: Settings.corrections)
+                )
 
                 print(text)
             } catch {
