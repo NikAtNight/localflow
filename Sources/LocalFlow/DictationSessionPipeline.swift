@@ -364,32 +364,41 @@ final class DictationSessionPipeline {
     }
 
     private func drainCompletedOutcomes() {
-        stallTimer?.cancel()
-        stallTimer = nil
-        stalledGeneration = nil
         while let generation = generationOrder.first {
             if cancelled.remove(generation) != nil {
                 generationOrder.removeFirst()
+                if stalledGeneration == generation {
+                    cancelStallTimeout()
+                }
                 continue
             }
             guard let outcome = completed.removeValue(forKey: generation) else {
                 if !completed.isEmpty {
                     scheduleStallTimeout(for: generation)
+                } else {
+                    cancelStallTimeout()
                 }
                 return
             }
             generationOrder.removeFirst()
+            if stalledGeneration == generation {
+                cancelStallTimeout()
+            }
             onOutcome(outcome)
         }
+        cancelStallTimeout()
     }
 
     private func scheduleStallTimeout(for generation: Int) {
-        guard stalledGeneration != generation else { return }
+        guard stalledGeneration != generation || stallTimer == nil else { return }
+        cancelStallTimeout()
         stalledGeneration = generation
         let work = DispatchWorkItem { [weak self] in
             guard let self,
                   self.generationOrder.first == generation,
                   !self.completed.isEmpty else { return }
+            self.stallTimer = nil
+            self.stalledGeneration = nil
             if let session = self.sessions.removeValue(forKey: generation) {
                 session.cancelled = true
                 session.activeTask?.cancel()
@@ -405,5 +414,11 @@ final class DictationSessionPipeline {
             deadline: .now() + stalledGenerationTimeout,
             execute: work
         )
+    }
+
+    private func cancelStallTimeout() {
+        stallTimer?.cancel()
+        stallTimer = nil
+        stalledGeneration = nil
     }
 }
