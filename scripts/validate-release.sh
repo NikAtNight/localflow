@@ -108,16 +108,27 @@ validate_sparkle_signing_key() {
             exit(1)
         }
         let normalizedKey = encodedKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let secret = Data(base64Encoded: normalizedKey), secret.count == 32 else {
+        guard let secret = Data(base64Encoded: normalizedKey) else {
             exit(1)
         }
 
-        guard let privateKey = try? Curve25519.Signing.PrivateKey(rawRepresentation: secret) else {
+        let publicKey: Data
+        switch secret.count {
+        case 32:
+            guard let privateKey = try? Curve25519.Signing.PrivateKey(rawRepresentation: secret) else {
+                exit(1)
+            }
+            publicKey = privateKey.publicKey.rawRepresentation
+        case 96:
+            // The legacy Sparkle export is its 64-byte Ed25519 private key
+            // followed by the corresponding 32-byte public key.
+            publicKey = secret.suffix(32)
+        default:
             exit(1)
         }
-        print(privateKey.publicKey.rawRepresentation.base64EncodedString())
+        print(publicKey.base64EncodedString())
     ' 2>/dev/null)"; then
-        fail "SPARKLE_PRIVATE_KEY must be a valid modern Sparkle Ed25519 seed"
+        fail "SPARKLE_PRIVATE_KEY must be a valid Sparkle Ed25519 export"
     fi
 
     [[ "$derived_public_key" == "$SOURCE_SPARKLE_PUBLIC_KEY" ]] || \

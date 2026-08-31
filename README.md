@@ -386,31 +386,17 @@ a folder shortcut, and **Delete All History**.
 
 ## Cutting a release
 
-Release Please maintains the version PR. Merging it dispatches
-`.github/workflows/release.yml` for that version and commit. The macOS runner
-tests, signs, notarizes, and packages the app. It validates the DMG, Sparkle
-ZIP and appcast, checksums, and setup script before publishing the tag and
-GitHub Release. A failed build may leave a private draft release, but it never
-leaves an incomplete public release. The repository dispatch keeps the
-workflow definition on the default branch while the requested commit selects
-the source to build.
+Release Please maintains the version PR. Merging it changes the release
+manifest, and that trusted main push automatically calls
+`.github/workflows/release.yml`. The reusable workflow verifies the manifest
+transition and current main tip before the macOS runner tests, signs,
+notarizes, and packages the app. It validates the DMG, Sparkle ZIP and appcast,
+checksums, and setup script before publishing the tag and GitHub Release. A
+failed build may leave a private draft release, but it never leaves an
+incomplete public release.
 
-To request a release build manually from a clone, send the tag and full commit
-SHA in a `release-build` repository event:
-
-```bash
-gh api --method POST repos/{owner}/{repo}/dispatches \
-  -f event_type=release-build \
-  -f "client_payload[tag]=v1.2.3" \
-  -f "client_payload[commit_sha]=$(git rev-parse HEAD)"
-```
-
-Omit the two `client_payload` fields to build an unpublished development
-artifact from the current default-branch commit. Development artifacts have
-updates disabled.
-
-Tagged releases require all of these repository secrets. The workflow stops
-before publication if one is missing. Development artifacts remain unsigned.
+Release builds require all of these repository secrets. The workflow stops
+before publication if one is missing.
 
 | Secret | What it is |
 |---|---|

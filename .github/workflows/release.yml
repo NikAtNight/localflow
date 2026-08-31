@@ -1,8 +1,7 @@
 name: Release
 
 on:
-  repository_dispatch:
-    types: [release-build]
+  workflow_call:
 
 permissions:
   contents: read
@@ -30,27 +29,90 @@ jobs:
       - name: Verify release manifest transition
         id: source
         env:
-          BEFORE_SHA: ${{ github.event.client_payload.before_sha }}
-          DISPATCH_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           MANIFEST=.github/.release-please-manifest.json
-          COMMIT_SHA="$DISPATCH_SHA"
+          semver_is_greater() {
+            local before="$1"
+            local after="$2"
+            local pattern='^([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|beta|rc)\.([0-9]+))?$'
+            local before_major before_minor before_patch before_stage before_number
+            local after_major after_minor after_patch after_stage after_number
+            local component before_rank after_rank
+
+            [[ "$before" =~ $pattern ]] || return 2
+            before_major="${BASH_REMATCH[1]}"
+            before_minor="${BASH_REMATCH[2]}"
+            before_patch="${BASH_REMATCH[3]}"
+            before_stage="${BASH_REMATCH[5]:-}"
+            before_number="${BASH_REMATCH[6]:-0}"
+            [[ "$after" =~ $pattern ]] || return 2
+            after_major="${BASH_REMATCH[1]}"
+            after_minor="${BASH_REMATCH[2]}"
+            after_patch="${BASH_REMATCH[3]}"
+            after_stage="${BASH_REMATCH[5]:-}"
+            after_number="${BASH_REMATCH[6]:-0}"
+
+            for component in \
+              "$before_major" "$before_minor" "$before_patch" "$before_number" \
+              "$after_major" "$after_minor" "$after_patch" "$after_number"
+            do
+              if [[ ${#component} -gt 1 && "$component" == 0* ]]; then
+                return 2
+              fi
+            done
+            if [[ -n "$before_stage" && "$before_number" == 0 ]] || \
+               [[ -n "$after_stage" && "$after_number" == 0 ]]; then
+              return 2
+            fi
+            if [[ ${#before_major} -gt 4 || ${#after_major} -gt 4 || \
+                  ${#before_minor} -gt 2 || ${#after_minor} -gt 2 || \
+                  ${#before_patch} -gt 2 || ${#after_patch} -gt 2 || \
+                  ${#before_number} -gt 3 || ${#after_number} -gt 3 ]]; then
+              return 2
+            fi
+
+            if (( 10#$after_major > 10#$before_major )); then return 0; fi
+            if (( 10#$after_major < 10#$before_major )); then return 1; fi
+            if (( 10#$after_minor > 10#$before_minor )); then return 0; fi
+            if (( 10#$after_minor < 10#$before_minor )); then return 1; fi
+            if (( 10#$after_patch > 10#$before_patch )); then return 0; fi
+            if (( 10#$after_patch < 10#$before_patch )); then return 1; fi
+
+            if [[ -z "$before_stage" ]]; then
+              [[ -n "$after_stage" ]] && return 1
+              return 1
+            fi
+            [[ -z "$after_stage" ]] && return 0
+            case "$before_stage" in alpha) before_rank=1 ;; beta) before_rank=2 ;; rc) before_rank=3 ;; esac
+            case "$after_stage" in alpha) after_rank=1 ;; beta) after_rank=2 ;; rc) after_rank=3 ;; esac
+            if (( after_rank > before_rank )); then return 0; fi
+            if (( after_rank < before_rank )); then return 1; fi
+            (( 10#$after_number > 10#$before_number ))
+          }
+
           if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "error: before_sha must be a full lowercase Git commit SHA" >&2
             exit 1
           fi
           if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "error: dispatch SHA must be a full lowercase Git commit SHA" >&2
+            echo "error: release SHA must be a full lowercase Git commit SHA" >&2
             exit 1
           fi
           OBJECT_TYPE="$(git cat-file -t "$COMMIT_SHA" 2>/dev/null || true)"
           if [[ "$OBJECT_TYPE" != "commit" ]]; then
-            echo "error: dispatch SHA does not identify a commit on origin/main" >&2
+            echo "error: release SHA does not identify a commit on origin/main" >&2
             exit 1
           fi
           if ! git merge-base --is-ancestor "$COMMIT_SHA" "origin/main"; then
-            echo "error: dispatch SHA is not reachable from origin/main" >&2
+            echo "error: release source is not reachable from origin/main" >&2
+            exit 1
+          fi
+          ORIGIN_MAIN_SHA="$(git rev-parse origin/main)"
+          if [[ "$ORIGIN_MAIN_SHA" != "$COMMIT_SHA" ]]; then
+            echo "error: origin/main tip no longer equals the release source" >&2
             exit 1
           fi
           if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
@@ -58,7 +120,7 @@ jobs:
             exit 1
           fi
           if ! git merge-base --is-ancestor "$BEFORE_SHA" "$COMMIT_SHA"; then
-            echo "error: before_sha is not an ancestor of the dispatch SHA" >&2
+            echo "error: before_sha is not an ancestor of the release SHA" >&2
             exit 1
           fi
           if ! git cat-file -e "$BEFORE_SHA:$MANIFEST" 2>/dev/null || \
@@ -79,8 +141,15 @@ jobs:
 
           BEFORE_VERSION="$(git show "$BEFORE_SHA:$MANIFEST" | jq -er '.["."]')"
           VERSION="$(git show "$COMMIT_SHA:$MANIFEST" | jq -er '.["."]')"
-          if [[ "$VERSION" == "$BEFORE_VERSION" ]]; then
-            echo "error: release manifest changed without advancing the root version" >&2
+          if semver_is_greater "$BEFORE_VERSION" "$VERSION"; then
+            :
+          else
+            VERSION_STATUS=$?
+            if [[ "$VERSION_STATUS" -eq 2 ]]; then
+              echo "error: release manifest contains an unsupported semantic version" >&2
+            else
+              echo "error: release version $VERSION must be greater than $BEFORE_VERSION" >&2
+            fi
             exit 1
           fi
           RELEASE_TAG="v$VERSION"
