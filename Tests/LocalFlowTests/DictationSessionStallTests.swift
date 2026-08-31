@@ -59,6 +59,87 @@ final class DictationSessionStallTests: XCTestCase {
         ])
     }
 
+    func testLaterCompletionDoesNotRestartArmedStallDeadline() async {
+        let hungGeneration = 70
+        let firstLaterGeneration = 71
+        let secondLaterGeneration = 72
+        let transcriber = StallCaseTranscriber(
+            hungGeneration: hungGeneration,
+            completedText: "later transcript"
+        )
+        var outcomes: [DictationSessionOutcome] = []
+        let delivered = expectation(description: "original stall deadline delivers queued outcomes")
+        delivered.expectedFulfillmentCount = 3
+        let pipeline = DictationSessionPipeline(
+            transcribe: { request in
+                try await transcriber.transcribe(request)
+            },
+            cleanup: { request in
+                TranscriptCleanupResult(text: request.text, succeeded: true)
+            },
+            onOutcome: { outcome in
+                outcomes.append(outcome)
+                delivered.fulfill()
+            },
+            stalledGenerationTimeout: 0.4
+        )
+        defer {
+            pipeline.cancel(generation: hungGeneration)
+            pipeline.cancel(generation: firstLaterGeneration)
+            pipeline.cancel(generation: secondLaterGeneration)
+        }
+
+        pipeline.begin(generation: hungGeneration, context: context)
+        pipeline.release(
+            generation: hungGeneration,
+            fullSamples: speech,
+            tailSamples: speech
+        )
+        let headStarted = await waitForCall(generation: hungGeneration, in: transcriber)
+        XCTAssertTrue(headStarted)
+
+        pipeline.begin(generation: firstLaterGeneration, context: context)
+        pipeline.release(
+            generation: firstLaterGeneration,
+            fullSamples: speech,
+            tailSamples: speech
+        )
+        let firstLaterCompleted = await waitForCall(
+            generation: firstLaterGeneration,
+            in: transcriber
+        )
+        XCTAssertTrue(firstLaterCompleted)
+        await settleAsyncWork()
+
+        // The first later result arms a 400 ms deadline for the hung head.
+        // Complete another queued result 250 ms into that same interval.
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        pipeline.begin(generation: secondLaterGeneration, context: context)
+        pipeline.release(
+            generation: secondLaterGeneration,
+            fullSamples: speech,
+            tailSamples: speech
+        )
+        let secondLaterCompleted = await waitForCall(
+            generation: secondLaterGeneration,
+            in: transcriber
+        )
+        XCTAssertTrue(secondLaterCompleted)
+        await settleAsyncWork()
+
+        // The original deadline has about 150 ms left. A restarted timer
+        // needs another 400 ms and cannot satisfy this 250 ms window.
+        await fulfillment(of: [delivered], timeout: 0.25)
+        XCTAssertEqual(outcomes, [
+            .failed(
+                generation: hungGeneration,
+                message: "Transcription timed out while a later dictation was waiting."
+            ),
+            .finalTranscript(generation: firstLaterGeneration, text: "later transcript"),
+            .finalTranscript(generation: secondLaterGeneration, text: "later transcript")
+        ])
+    }
+
     private var speech: [Float] {
         [Float](repeating: 0.2, count: Int(AudioRecorder.sampleRate))
     }
@@ -81,6 +162,10 @@ final class DictationSessionStallTests: XCTestCase {
             await Task.yield()
         }
         return false
+    }
+
+    private func settleAsyncWork() async {
+        for _ in 0..<100 { await Task.yield() }
     }
 }
 
