@@ -3,6 +3,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VALIDATOR="$REPO_ROOT/scripts/validate-release.sh"
+RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/localflow-release-contract.XXXXXX")"
 DIST_DIR="$TEST_ROOT/dist"
 FRAMEWORK_PATH="$TEST_ROOT/Sparkle.framework"
@@ -20,7 +21,7 @@ unset RELEASE_TAG COMMIT_SHA
 unset MAC_CERT_P12_BASE64 MAC_CERT_PASSWORD
 unset APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
 unset SPARKLE_PRIVATE_KEY SPARKLE_FRAMEWORK_PATH SPARKLE_APPCAST_TOOL
-unset APP_VERSION VALIDATION_DIST_DIR
+unset APP_VERSION APP_BUNDLE_PATH VALIDATION_DIST_DIR VERIFY_CHECKSUMS
 
 fail() {
     printf '    %s\n' "$*" >&2
@@ -51,6 +52,14 @@ assert_output() {
     if ! grep -Fxq "$expected" "$OUTPUT_FILE"; then
         sed 's/^/    output: /' "$OUTPUT_FILE" >&2
         fail "missing output: $expected"
+    fi
+}
+
+assert_file_contains() {
+    local path="$1"
+    local expected="$2"
+    if ! grep -Fq "$expected" "$path"; then
+        fail "missing $expected in ${path#$REPO_ROOT/}"
     fi
 }
 
@@ -133,8 +142,21 @@ run_artifact_validation() {
         RELEASE_TAG="${RELEASE_TAG-v1.2.3}" \
         APP_VERSION="${APP_VERSION-1.2.3}" \
         DIST_DIR="${VALIDATION_DIST_DIR-$DIST_DIR}" \
+        VERIFY_CHECKSUMS="${VERIFY_CHECKSUMS-false}" \
+        APP_BUNDLE_PATH="${APP_BUNDLE_PATH-}" \
         "$VALIDATOR" artifacts > "$STDOUT_FILE" 2> "$STDERR_FILE"
     LAST_STATUS=$?
+}
+
+reset_app_bundle_fixture() {
+    APP_BUNDLE_PATH="$TEST_ROOT/LocalFlow.app"
+    rm -rf "$APP_BUNDLE_PATH"
+    mkdir -p "$APP_BUNDLE_PATH/Contents/Frameworks/Sparkle.framework"
+    cp "$REPO_ROOT/Resources/Info.plist" "$APP_BUNDLE_PATH/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleShortVersionString 1.2.3' \
+        "$APP_BUNDLE_PATH/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 1.2.3' \
+        "$APP_BUNDLE_PATH/Contents/Info.plist"
 }
 
 test_tagged_preflight() {
@@ -257,6 +279,53 @@ test_checksum_manifest_coverage() {
     assert_failure_containing 'LocalFlow-1.2.3.zip'
 }
 
+test_checksum_contents() {
+    reset_artifact_fixture
+    (
+        cd "$DIST_DIR"
+        shasum -a 256 LocalFlow-1.2.3.dmg LocalFlow-1.2.3.zip setup-s1-mini.sh > SHA256SUMS.txt
+    )
+    printf 'changed archive\n' > "$DIST_DIR/LocalFlow-1.2.3.zip"
+    VERIFY_CHECKSUMS=true run_artifact_validation
+    assert_failure_containing 'SHA256SUMS.txt does not match the release artifacts'
+}
+
+test_app_bundle_version() {
+    reset_artifact_fixture
+    reset_app_bundle_fixture
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleVersion 9.9.9' \
+        "$APP_BUNDLE_PATH/Contents/Info.plist"
+    run_artifact_validation
+    assert_failure_containing 'built app has the wrong CFBundleVersion'
+}
+
+test_release_source_is_main_ancestry() {
+    assert_file_contains "$RELEASE_WORKFLOW" 'git merge-base --is-ancestor "$COMMIT_SHA" "origin/main"'
+}
+
+test_existing_draft_targets_requested_commit() {
+    assert_file_contains "$RELEASE_WORKFLOW" \
+        'EXISTING_TARGET="$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)"' || return
+    assert_file_contains "$RELEASE_WORKFLOW" '[[ "$EXISTING_TARGET" == "$COMMIT_SHA" ]]'
+}
+
+test_existing_tag_targets_requested_commit() {
+    assert_file_contains "$RELEASE_WORKFLOW" \
+        'TAG_TARGET="$(git rev-parse "$RELEASE_TAG^{commit}")"' || return
+    assert_file_contains "$RELEASE_WORKFLOW" '[[ "$TAG_TARGET" == "$COMMIT_SHA" ]]'
+}
+
+test_release_workflow_validates_before_publication() {
+    local validate_line
+    local draft_line
+    validate_line="$(grep -n -m1 'name: Validate release artifacts' "$RELEASE_WORKFLOW" | cut -d: -f1)"
+    draft_line="$(grep -n -m1 'name: Create verified draft release' "$RELEASE_WORKFLOW" | cut -d: -f1)"
+    [[ -n "$validate_line" && -n "$draft_line" && "$validate_line" -lt "$draft_line" ]] || \
+        fail 'release artifact validation must run before draft creation'
+    assert_file_contains "$RELEASE_WORKFLOW" 'APP_BUNDLE_PATH: build/LocalFlow.app' || return
+    assert_file_contains "$RELEASE_WORKFLOW" 'VERIFY_CHECKSUMS: "true"'
+}
+
 test_development_artifacts_are_optional() {
     VALIDATION_DIST_DIR="$TEST_ROOT/missing-dist" RELEASE_TAG='' APP_VERSION='dev' \
         run_artifact_validation
@@ -294,7 +363,13 @@ run_test 'every tagged release artifact is required' test_each_required_artifact
 run_test 'appcast names the exact versioned ZIP' test_appcast_archive_name
 run_test 'appcast carries a Sparkle signature' test_appcast_signature
 run_test 'checksum manifest covers the update ZIP' test_checksum_manifest_coverage
+run_test 'checksum manifest matches the release artifacts' test_checksum_contents
+run_test 'built app bundle version matches the release tag' test_app_bundle_version
 run_test 'development builds do not require release artifacts' test_development_artifacts_are_optional
+run_test 'release source commit is reachable from origin/main' test_release_source_is_main_ancestry
+run_test 'existing draft release targets the requested commit' test_existing_draft_targets_requested_commit
+run_test 'existing tag targets the requested commit' test_existing_tag_targets_requested_commit
+run_test 'release workflow validates artifacts before publication' test_release_workflow_validates_before_publication
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
