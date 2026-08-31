@@ -524,7 +524,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard settingsModel.ollamaReachable != reachable else { return }
         settingsModel.ollamaReachable = reachable
-        startCommandHotkey()
+        if !textModelPolicy.isAppleAvailable {
+            startCommandHotkey()
+        }
     }
 
     // MARK: - Push-to-talk pipeline

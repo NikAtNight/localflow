@@ -65,14 +65,27 @@ final class LocalTextModelPolicy {
         let task: Task<Void, Never>
     }
 
+    private enum PrewarmKey: Hashable {
+        case apple
+        case ollama(String)
+    }
+
     private let apple: any AppleTextModelBackend
     private let ollama: any OllamaTextModelBackend
     private let now: @MainActor () -> Date
     private let prewarmCooldown: TimeInterval
-    private var prewarmOperations: [String: PrewarmOperation] = [:]
-    private var lastPrewarmByModel: [String: Date] = [:]
+    private var prewarmOperations: [PrewarmKey: PrewarmOperation] = [:]
+    private var lastPrewarmByKey: [PrewarmKey: Date] = [:]
 
     private(set) var ollamaReachability = OllamaReachability.unknown
+
+    var isAppleAvailable: Bool {
+        apple.isAvailable
+    }
+
+    var isCommandAvailable: Bool {
+        isAppleAvailable || ollamaReachability == .reachable
+    }
 
     init(
         apple: any AppleTextModelBackend,
@@ -189,19 +202,21 @@ final class LocalTextModelPolicy {
     }
 
     func prewarm(model: String) async {
-        if let operation = prewarmOperations[model] {
+        let key = isAppleAvailable ? PrewarmKey.apple : .ollama(model)
+
+        if let operation = prewarmOperations[key] {
             await operation.task.value
             return
         }
 
         let now = now()
-        if let lastPrewarm = lastPrewarmByModel[model],
+        if let lastPrewarm = lastPrewarmByKey[key],
            now.timeIntervalSince(lastPrewarm) < prewarmCooldown {
             return
         }
-        lastPrewarmByModel[model] = now
+        lastPrewarmByKey[key] = now
 
-        if apple.isAvailable {
+        if key == .apple {
             apple.prewarm()
             return
         }
@@ -210,10 +225,10 @@ final class LocalTextModelPolicy {
         let task = Task { [ollama] in
             await ollama.prewarm(model: model)
         }
-        prewarmOperations[model] = PrewarmOperation(id: id, task: task)
+        prewarmOperations[key] = PrewarmOperation(id: id, task: task)
         await task.value
-        if prewarmOperations[model]?.id == id {
-            prewarmOperations[model] = nil
+        if prewarmOperations[key]?.id == id {
+            prewarmOperations[key] = nil
         }
     }
 

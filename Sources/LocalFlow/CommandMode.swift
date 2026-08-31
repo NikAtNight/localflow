@@ -21,8 +21,7 @@ enum CommandMode {
     }
 
     static var isAvailable: Bool {
-        AppleIntelligenceCleaner.isAvailable
-            || LocalTextModelPolicy.shared.ollamaReachability == .reachable
+        LocalTextModelPolicy.shared.isCommandAvailable
     }
 
     private static let editInstructions = """
