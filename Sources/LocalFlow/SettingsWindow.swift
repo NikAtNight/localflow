@@ -83,6 +83,13 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    @Published var ollamaModel: String = Settings.ollamaModel {
+        didSet {
+            guard oldValue != ollamaModel else { return }
+            Settings.ollamaModel = ollamaModel
+        }
+    }
+
     @Published var soundCues: Bool = Settings.soundCues {
         didSet { Settings.soundCues = soundCues }
     }
@@ -112,6 +119,20 @@ final class SettingsModel: ObservableObject {
             guard oldValue != commandHotkey else { return }
             Settings.commandHotkey = commandHotkey
             onCommandModeChange?()
+        }
+    }
+
+    @Published var ollamaCommandModel: String = Settings.ollamaCommandModel {
+        didSet {
+            guard oldValue != ollamaCommandModel else { return }
+            Settings.ollamaCommandModel = ollamaCommandModel
+        }
+    }
+
+    @Published var commandReasoning: ReasoningLevel = Settings.commandReasoning {
+        didSet {
+            guard oldValue != commandReasoning else { return }
+            Settings.commandReasoning = commandReasoning
         }
     }
 
@@ -196,9 +217,11 @@ final class SettingsModel: ObservableObject {
     }
 
     @Published var ollamaReachable = true
+    @Published var availableOllamaModels: [String] = []
     @Published var devices: [AudioInputDevice] = []
     @Published var systemDefaultName: String?
     @Published var recentDictations: [RecentDictation] = []
+    @Published var lastIssue: UserFacingIssue?
 
     init() {
         // Seed from current status without re-registering the agent on every launch.
@@ -221,6 +244,12 @@ final class SettingsModel: ObservableObject {
         // Reflect changes made elsewhere (first-run auto-registration, etc.).
         let enabled = loginAgent.status == .enabled
         if startAtLogin != enabled { setStartAtLoginWithoutRegistering(enabled) }
+        // Feed the model pickers whatever is installed right now; models
+        // pulled while the window was closed appear on the next open.
+        Task { [weak self] in
+            let models = await OllamaCleaner.installedModels()
+            self?.availableOllamaModels = models
+        }
     }
 }
 
@@ -249,7 +278,11 @@ final class SettingsPanelController {
             let hosting = NSHostingController(rootView: SettingsView(model: model))
             let w = NSWindow(contentViewController: hosting)
             w.title = "LocalFlow Settings"
-            w.styleMask = [.titled, .closable, .miniaturizable]
+            w.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
+            w.titlebarAppearsTransparent = true
+            w.isMovableByWindowBackground = true
+            w.isOpaque = false
+            w.backgroundColor = .clear
             w.isReleasedWhenClosed = false
             window = w
             // Position is persisted explicitly rather than through
@@ -295,8 +328,43 @@ final class SettingsPanelController {
 
 // MARK: - Views
 
+private struct SettingsWindowBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        view.material = .underWindowBackground
+        view.blendingMode = .behindWindow
+        view.state = .active
+        return view
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
+
+private enum SettingsPane: String, CaseIterable, Identifiable {
+    case general = "General"
+    case dictation = "Dictation"
+    case cleanup = "Cleanup"
+    case commandMode = "Command mode"
+    case text = "Text"
+    case history = "History"
+
+    var id: Self { self }
+
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape"
+        case .dictation: return "mic"
+        case .cleanup: return "sparkles"
+        case .commandMode: return "wand.and.stars"
+        case .text: return "keyboard"
+        case .history: return "clock"
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var model: SettingsModel
+    @State private var selectedPane: SettingsPane = .general
     @State private var newCorrectionWrong = ""
     @State private var newCorrectionRight = ""
     @State private var confirmingHistoryDeletion = false
@@ -306,10 +374,156 @@ struct SettingsView: View {
     private var cleanupLabel: String {
         AppleIntelligenceCleaner.isAvailable
             ? "Clean up with Apple Intelligence (on-device)"
-            : "Clean up with Ollama (\(Settings.ollamaModel))"
+            : "Clean up with Ollama (\(model.ollamaModel))"
     }
 
     var body: some View {
+        ZStack {
+            SettingsWindowBackground()
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                paneSwitcher
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+
+                Divider()
+                if let issue = model.lastIssue {
+                    lastIssueBanner(issue)
+                    Divider()
+                }
+                selectedPaneView
+            }
+            .padding(.top, 28)
+        }
+        .frame(width: 700, height: 680)
+    }
+
+    @ViewBuilder
+    private var paneSwitcher: some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            GlassEffectContainer(spacing: 4) {
+                HStack(spacing: 4) {
+                    ForEach(SettingsPane.allCases) { pane in
+                        if pane == selectedPane {
+                            paneButton(for: pane)
+                                .glassEffect(
+                                    .clear.tint(Color.accentColor.opacity(0.18)).interactive(),
+                                    in: Capsule()
+                                )
+                        } else {
+                            paneButton(for: pane)
+                        }
+                    }
+                }
+                .padding(5)
+                .glassEffect(
+                    .regular,
+                    in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+                )
+            }
+        } else {
+            fallbackPaneSwitcher
+        }
+        #else
+        fallbackPaneSwitcher
+        #endif
+    }
+
+    private var fallbackPaneSwitcher: some View {
+        HStack(spacing: 4) {
+            ForEach(SettingsPane.allCases) { pane in
+                paneButton(for: pane)
+                    .background(
+                        pane == selectedPane ? Color.accentColor.opacity(0.14) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    )
+            }
+        }
+        .padding(5)
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+        )
+    }
+
+    private func paneButton(for pane: SettingsPane) -> some View {
+        Button {
+            selectedPane = pane
+        } label: {
+            VStack(spacing: 4) {
+                Image(systemName: pane.symbol)
+                    .font(.system(size: 17, weight: .medium))
+                Text(pane.rawValue)
+                    .font(.caption)
+                    .lineLimit(1)
+            }
+            .foregroundStyle(pane == selectedPane ? Color.accentColor : Color.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(pane.rawValue) settings")
+        .accessibilityAddTraits(pane == selectedPane ? .isSelected : [])
+    }
+
+    private func lastIssueBanner(_ issue: UserFacingIssue) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(issue.summary)
+                        .font(.callout.weight(.semibold))
+                    Text(issue.at, style: .relative)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                Text(issue.details)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+                    .help(issue.details)
+            }
+
+            Spacer(minLength: 8)
+
+            Button {
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.setString("\(issue.summary)\n\(issue.details)", forType: .string)
+            } label: {
+                Image(systemName: "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            .help("Copy error details")
+            .accessibilityLabel("Copy error details")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.07))
+    }
+
+    @ViewBuilder
+    private var selectedPaneView: some View {
+        switch selectedPane {
+        case .general: generalPane
+        case .dictation: dictationPane
+        case .cleanup: cleanupPane
+        case .commandMode: commandModePane
+        case .text: textPane
+        case .history: historyPane
+        }
+    }
+
+    private var generalPane: some View {
         Form {
             Section {
                 HelpRow(symbol: "mic.fill", title: "Dictate anywhere") {
@@ -330,20 +544,21 @@ struct SettingsView: View {
                     Text("Fix it in your app, copy it, then pick **Fix Last Dictation\u{2026}** in the menubar. LocalFlow learns the word and starts hearing it correctly.")
                 }
                 HelpRow(symbol: "lock.fill", title: "Everything stays here") {
-                    Text("Speech never leaves this Mac. Transcription is local, cleanup uses Apple's on-device model, and the history is a plain folder you own.")
+                    Text("Speech never leaves this Mac. Transcription and cleanup both run locally, and the history is a plain folder you own.")
                 }
             } header: {
                 Text("How it works")
             }
 
-            Section("After transcribing") {
-                Toggle(cleanupLabel, isOn: $model.cleanupEnabled)
-                if model.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable && !model.ollamaReachable {
-                    Text("Ollama isn't running — raw transcripts will be pasted until it's back.")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+            Section("Keyboard shortcut") {
+                Picker("Hold to dictate", selection: $model.hotkey) {
+                    ForEach(HotkeyManager.Key.allCases, id: \.self) { key in
+                        Text(key.label).tag(key)
+                    }
                 }
-                Toggle("Sound cues", isOn: $model.soundCues)
+            }
+
+            Section("Startup") {
                 Toggle("Start at login", isOn: $model.startAtLogin)
             }
 
@@ -364,7 +579,102 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
 
+    private var dictationPane: some View {
+        Form {
+            Section("Transcription") {
+                Picker("Whisper model", selection: $model.whisperModel) {
+                    ForEach(Settings.whisperModels, id: \.name) { entry in
+                        Text(entry.label).tag(entry.name)
+                    }
+                }
+
+                Picker("Microphone", selection: $model.micUID) {
+                    Text(systemDefaultMicrophoneLabel).tag(nil as String?)
+                    ForEach(model.devices, id: \.uid) { device in
+                        Text(device.name).tag(Optional(device.uid))
+                    }
+                }
+            }
+
+            Section {
+                Toggle("Keep microphone warm between dictations", isOn: $model.keepMicWarm)
+                Toggle("Sound cues", isOn: $model.soundCues)
+            } footer: {
+                Text("Holds the mic open for 2 minutes after each dictation so the next press is live instantly. While warm, the mic-in-use indicator stays on and Bluetooth headphones stay in call-quality audio.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                ThemeGallery(selection: $model.theme)
+            } header: {
+                Text("Listening theme")
+            } footer: {
+                Text("Shown while you hold the dictation key. Picking one plays a short preview on screen.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+
+    private var cleanupPane: some View {
+        Form {
+            Section("Transcript cleanup") {
+                Toggle(cleanupLabel, isOn: $model.cleanupEnabled)
+                if model.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable && !model.ollamaReachable {
+                    Label {
+                        Text("Ollama isn't running — raw transcripts will be pasted until it's back.")
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                }
+            }
+
+            Section {
+                ollamaModelPicker("Cleanup model", selection: $model.ollamaModel)
+            } header: {
+                Text("Ollama")
+            } footer: {
+                Text("s1-mini is a small model built specifically for cleaning up dictation. Any other model works as a general cleaner.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+
+    /// Installed Ollama models as a menu; falls back to a free text field
+    /// when the server is unreachable so a model can still be named before
+    /// Ollama is set up. A saved name that's no longer installed stays
+    /// selectable rather than being silently swapped.
+    @ViewBuilder
+    private func ollamaModelPicker(_ title: String, selection: Binding<String>) -> some View {
+        if model.availableOllamaModels.isEmpty {
+            TextField(title, text: selection)
+        } else {
+            let names = model.availableOllamaModels.contains(selection.wrappedValue)
+                ? model.availableOllamaModels
+                : model.availableOllamaModels + [selection.wrappedValue]
+            Picker(title, selection: selection) {
+                ForEach(names, id: \.self) { name in
+                    Text(name).tag(name)
+                }
+            }
+        }
+    }
+
+    private var commandModePane: some View {
+        Form {
             Section {
                 Toggle("Enable command mode", isOn: $model.commandModeEnabled)
                 Picker("Hold to edit", selection: $model.commandHotkey) {
@@ -373,14 +683,23 @@ struct SettingsView: View {
                     }
                 }
                 .disabled(!model.commandModeEnabled)
+
                 if model.commandModeEnabled, model.commandHotkey == model.hotkey {
-                    Text("This is the same key as dictation. Pick a different one for command mode.")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    Label {
+                        Text("This is the same key as dictation. Pick a different one for command mode.")
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 } else if model.commandModeEnabled, !CommandMode.isAvailable {
-                    Text("Command mode needs Apple Intelligence. Turn it on in System Settings.")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    Label {
+                        Text("Command mode needs Apple Intelligence (System Settings) or a running Ollama server.")
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.orange)
                 }
             } header: {
                 Text("Command mode")
@@ -390,6 +709,27 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
+            Section {
+                ollamaModelPicker("Command model", selection: $model.ollamaCommandModel)
+                Picker("Reasoning effort", selection: $model.commandReasoning) {
+                    ForEach(ReasoningLevel.allCases, id: \.self) { level in
+                        Text(level.label).tag(level)
+                    }
+                }
+            } header: {
+                Text("Ollama")
+            } footer: {
+                Text("Reasoning effort only affects models with a thinking mode. qwen3 toggles it, gpt-oss takes a level, and the default gemma3:4b ignores it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
+
+    private var textPane: some View {
+        Form {
             Section {
                 ForEach(model.snippets) { snippet in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -416,7 +756,7 @@ struct SettingsView: View {
                         .lineLimit(2...5)
                     HStack {
                         Spacer()
-                        Button("Add Snippet") {
+                        Button("Add snippet") {
                             model.addSnippet(trigger: newSnippetTrigger, expansion: newSnippetExpansion)
                             newSnippetTrigger = ""
                             newSnippetExpansion = ""
@@ -488,25 +828,13 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+        .formStyle(.grouped)
+        .scrollContentBackground(.hidden)
+    }
 
-            Section {
-                Toggle("Keep microphone warm between dictations", isOn: $model.keepMicWarm)
-            } footer: {
-                Text("Holds the mic open for 2 minutes after each dictation so the next press is live instantly. While warm, the mic-in-use indicator stays on and Bluetooth headphones stay in call-quality audio.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Section {
-                ThemeGallery(selection: $model.theme)
-            } header: {
-                Text("Listening theme")
-            } footer: {
-                Text("Shown while you hold the dictation key. Picking one plays a short preview on screen.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
+    private var historyPane: some View {
+        Form {
             Section {
                 if model.recentDictations.isEmpty {
                     Text("Nothing dictated yet this session.")
@@ -546,7 +874,7 @@ struct SettingsView: View {
             Section {
                 Toggle("Save every dictation to a daily log", isOn: $model.saveHistory)
                 HStack {
-                    Button("Open History Folder") {
+                    Button("Open history folder") {
                         try? FileManager.default.createDirectory(
                             at: DictationHistory.folder,
                             withIntermediateDirectories: true,
@@ -555,7 +883,7 @@ struct SettingsView: View {
                         NSWorkspace.shared.open(DictationHistory.folder)
                     }
                     Spacer()
-                    Button("Delete All History…", role: .destructive) {
+                    Button("Delete all history…", role: .destructive) {
                         confirmingHistoryDeletion = true
                     }
                 }
@@ -571,7 +899,7 @@ struct SettingsView: View {
                 isPresented: $confirmingHistoryDeletion,
                 titleVisibility: .visible
             ) {
-                Button("Delete All History", role: .destructive) {
+                Button("Delete all history", role: .destructive) {
                     try? DictationHistory.deleteAll()
                 }
                 Button("Cancel", role: .cancel) {}
@@ -580,8 +908,12 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 660)
-        .frame(minHeight: 560, idealHeight: 720)
+        .scrollContentBackground(.hidden)
+    }
+
+    private var systemDefaultMicrophoneLabel: String {
+        guard let systemDefaultName = model.systemDefaultName else { return "System default" }
+        return "System default (\(systemDefaultName))"
     }
 }
 

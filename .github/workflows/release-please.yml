@@ -14,6 +14,7 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     permissions:
+      actions: write # dispatch the signed artifact build after publishing
       contents: write # create the tag, release, and changelog commit
       pull-requests: write # maintain the release PR
     steps:
@@ -22,6 +23,20 @@ jobs:
       # that PR tags and publishes the release, which is what triggers
       # release.yml to build, sign, notarize, and attach the DMG.
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: .github/release-please-config.json
           manifest-file: .github/.release-please-manifest.json
+
+      - name: Build published release assets
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: release tag must be a v-prefixed semantic version" >&2
+            exit 1
+          fi
+          gh workflow run release.yml --ref "$RELEASE_TAG" -f tag="$RELEASE_TAG"

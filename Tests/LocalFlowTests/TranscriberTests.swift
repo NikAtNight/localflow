@@ -101,6 +101,64 @@ final class TranscriberTests: XCTestCase {
         XCTAssertFalse(Transcriber.isCanonicalHallucination(""))
         XCTAssertFalse(Transcriber.isCanonicalHallucination("   "))
     }
+
+    func testIncrementalPartsPreserveLongPauseParagraphs() {
+        XCTAssertEqual(
+            Transcriber.joinTranscriptParts(
+                "First thought.",
+                "Second thought.",
+                pauseSeconds: Double(Transcriber.paragraphPauseSeconds)
+            ),
+            "First thought.\n\nSecond thought."
+        )
+    }
+
+    func testIncrementalPartsKeepShortAndMidSentencePausesInline() {
+        XCTAssertEqual(
+            Transcriber.joinTranscriptParts("First thought.", "Continued", pauseSeconds: 0.75),
+            "First thought. Continued"
+        )
+        XCTAssertEqual(
+            Transcriber.joinTranscriptParts("unfinished", "thought", pauseSeconds: 2),
+            "unfinished thought"
+        )
+    }
+
+    func testIncrementalCleanupUsesTailOnlyWhenEveryConsistencyCheckPasses() {
+        XCTAssertTrue(IncrementalCleanupPlan.shouldCleanTailOnly(
+            incrementalTranscriptionSucceeded: true,
+            chunkCleanupActive: true,
+            allCommittedChunksCleaned: true,
+            tailCleanupSucceeded: true,
+            capturedProfile: .email,
+            releaseProfile: .email,
+            cleanupEnabledAtRelease: true
+        ))
+    }
+
+    func testIncrementalCleanupFallsBackForEveryUncertainState() {
+        let cases: [(incremental: Bool, active: Bool, allCleaned: Bool, tailCleaned: Bool,
+                     captured: AppStyleProfile, released: AppStyleProfile, enabled: Bool)] = [
+            (false, true, true, true, .email, .email, true),
+            (true, false, true, true, .email, .email, true),
+            (true, true, false, true, .email, .email, true),
+            (true, true, true, false, .email, .email, true),
+            (true, true, true, true, .email, .workChat, true),
+            (true, true, true, true, .email, .email, false),
+        ]
+
+        for item in cases {
+            XCTAssertFalse(IncrementalCleanupPlan.shouldCleanTailOnly(
+                incrementalTranscriptionSucceeded: item.incremental,
+                chunkCleanupActive: item.active,
+                allCommittedChunksCleaned: item.allCleaned,
+                tailCleanupSucceeded: item.tailCleaned,
+                capturedProfile: item.captured,
+                releaseProfile: item.released,
+                cleanupEnabledAtRelease: item.enabled
+            ))
+        }
+    }
 }
 
 private actor CompletionOrder {

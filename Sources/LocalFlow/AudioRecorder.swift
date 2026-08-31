@@ -111,6 +111,77 @@ final class AudioRecorder {
         return Array(samples[start..<end])
     }
 
+    /// Finds the newest sustained quiet span that is far enough behind live
+    /// audio to be a safe boundary between independent Whisper passes.
+    static func incrementalCutPoint(
+        in samples: [Float],
+        after committedEnd: Int,
+        floorDBFS: Float = -50,
+        minimumSilence: TimeInterval = 0.4,
+        trailingGuard: TimeInterval = 1.5,
+        minimumChunk: TimeInterval = 2.0
+    ) -> Int? {
+        let frame = voiceFrameSamples
+        let minimumEnd = committedEnd + Int(minimumChunk * sampleRate)
+        let firstFrame = ((minimumEnd + frame - 1) / frame) * frame
+        let lastFrameEnd = samples.count - Int(trailingGuard * sampleRate)
+        let requiredQuietFrames = max(1, Int(ceil(minimumSilence * sampleRate / Double(frame))))
+        guard firstFrame + requiredQuietFrames * frame <= lastFrameEnd else { return nil }
+
+        var quietStart: Int?
+        var quietFrames = 0
+        var latestCut: Int?
+        var index = firstFrame
+        while index + frame <= lastFrameEnd {
+            let mean = meanSquare(samples, index, frame)
+            let isQuiet = mean == 0 || Float(10 * log10(mean)) <= floorDBFS
+            if isQuiet {
+                if quietStart == nil { quietStart = index }
+                quietFrames += 1
+            } else {
+                if let quietStart, quietFrames >= requiredQuietFrames {
+                    latestCut = quietStart + quietFrames * frame / 2
+                }
+                quietStart = nil
+                quietFrames = 0
+            }
+            index += frame
+        }
+        if let quietStart, quietFrames >= requiredQuietFrames {
+            latestCut = quietStart + quietFrames * frame / 2
+        }
+        return latestCut
+    }
+
+    /// Measures the quiet run containing a chosen cut so separate passes can
+    /// preserve the same paragraph break the full transcription would make.
+    static func incrementalPauseSeconds(
+        in samples: [Float],
+        around cut: Int,
+        floorDBFS: Float = -50
+    ) -> Double {
+        let frame = voiceFrameSamples
+        var quietStart: Int?
+        var index = 0
+        while index + frame <= samples.count {
+            let mean = meanSquare(samples, index, frame)
+            let isQuiet = mean == 0 || Float(10 * log10(mean)) <= floorDBFS
+            if isQuiet {
+                if quietStart == nil { quietStart = index }
+            } else if let start = quietStart {
+                if start <= cut, cut <= index {
+                    return Double(index - start) / sampleRate
+                }
+                quietStart = nil
+            }
+            index += frame
+        }
+        if let quietStart, quietStart <= cut, cut <= index {
+            return Double(index - quietStart) / sampleRate
+        }
+        return 0
+    }
+
     private static func meanSquare(_ samples: [Float], _ start: Int, _ count: Int) -> Double {
         var sum = 0.0
         for i in start..<(start + count) {
@@ -261,6 +332,19 @@ final class AudioRecorder {
                 DispatchQueue.main.async { completion(captured) }
                 self.tearDownSession()
             }
+        }
+    }
+
+    /// Takes an immutable copy without interrupting capture. The control and
+    /// sample queues are drained in the same order as stop(), so callers see
+    /// every converted buffer that arrived before their request.
+    func snapshot(completion: @escaping ([Float]) -> Void) {
+        controlQueue.async {
+            self.sampleQueue.sync {}
+            self.lock.lock()
+            let captured = self.recordingActive ? self.samples : []
+            self.lock.unlock()
+            DispatchQueue.main.async { completion(captured) }
         }
     }
 

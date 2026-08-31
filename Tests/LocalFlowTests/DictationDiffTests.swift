@@ -123,3 +123,107 @@ final class AppStyleProfileTests: XCTestCase {
         XCTAssertTrue(combined.contains("email"))
     }
 }
+
+@MainActor
+final class S1MiniCleanupTests: XCTestCase {
+
+    func testDetectsS1MiniUnderAnySpelling() {
+        XCTAssertTrue(S1MiniCleanup.matches(model: "s1-mini"))
+        XCTAssertTrue(S1MiniCleanup.matches(model: "hf.co/superwhisper/S1-mini-GGUF:Q4_K_M"))
+        XCTAssertFalse(S1MiniCleanup.matches(model: "gemma3:4b"))
+    }
+
+    /// The normalizer was trained on a closed vocabulary of control values;
+    /// anything outside it silently degrades output.
+    func testControlLinesUseOnlyTrainedValues() {
+        let pattern = #"^\[Styling: (casual|semi-casual|semi-formal|formal)\] "# +
+            #"\[Structure: (prose|lists)\] \[Context: (general|email)\]$"#
+        for profile in [AppStyleProfile.email, .workChat, .personalChat, .code, .general] {
+            let line = S1MiniCleanup.controlLine(for: profile)
+            XCTAssertNotNil(line.range(of: pattern, options: .regularExpression), line)
+        }
+    }
+
+    func testOnlyEmailDictationsGetTheEmailContext() {
+        XCTAssertTrue(S1MiniCleanup.controlLine(for: .email).contains("[Context: email]"))
+        for profile in [AppStyleProfile.workChat, .personalChat, .code, .general] {
+            XCTAssertTrue(S1MiniCleanup.controlLine(for: profile).contains("[Context: general]"))
+        }
+    }
+
+    func testPromptIsControlLineThenTranscript() {
+        let prompt = S1MiniCleanup.prompt(for: "hello world", profile: .general)
+        XCTAssertTrue(prompt.hasPrefix("[Styling: "))
+        XCTAssertTrue(prompt.hasSuffix("]\nhello world"))
+    }
+
+    /// Regression: Ollama derives the thinking capability from the qwen3
+    /// architecture, so the request must always disable it explicitly.
+    /// Omitting the flag made s1-mini return an empty response or paste a
+    /// literal "<think>" tag as the whole dictation.
+    func testEveryCleanupRequestExplicitlyDisablesThinking() {
+        for model in ["s1-mini", "gemma3:4b"] {
+            let body = OllamaCleaner.generateRequest("hello", model: model, profile: .general)
+            XCTAssertEqual(body.think, .bool(false), model)
+            XCTAssertEqual(body.keepAlive, "30m", model)
+        }
+    }
+
+    func testS1MiniRequestUsesItsTrainedProtocol() {
+        let body = OllamaCleaner.generateRequest("hello", model: "s1-mini", profile: .email)
+        XCTAssertEqual(body.system, S1MiniCleanup.systemPrompt)
+        XCTAssertTrue(body.prompt.hasPrefix("[Styling: "))
+        XCTAssertEqual(body.options.temperature, 0)
+    }
+
+    func testInstructModelsKeepTheInstructPrompt() {
+        let body = OllamaCleaner.generateRequest("hello", model: "gemma3:4b", profile: .email)
+        XCTAssertTrue(body.system.contains("speech-to-text"))
+        XCTAssertEqual(body.prompt, "hello")
+    }
+
+    /// Command mode's Ollama fallback must never route to the normalizer:
+    /// its request goes to a dedicated instruct model, thinking still off
+    /// by default.
+    func testCommandRequestsAreInstructShapedWithThinkingOff() {
+        let body = OllamaCleaner.respondRequest(
+            system: "sys", prompt: "Instruction: shorten", model: "gemma3:4b", reasoning: .off)
+        XCTAssertEqual(body.think, .bool(false))
+        XCTAssertEqual(body.keepAlive, "30m")
+        XCTAssertEqual(body.prompt, "Instruction: shorten")
+        XCTAssertEqual(body.options.numPredict, 2_048)
+    }
+
+    /// The reasoning setting maps onto whatever `think` shape the model
+    /// family understands; a level string sent to a toggle-only model would
+    /// be rejected by the server.
+    func testReasoningLevelsMapToTheModelFamily() {
+        func think(_ model: String, _ level: ReasoningLevel) -> OllamaCleaner.ThinkValue {
+            OllamaCleaner.respondRequest(system: "s", prompt: "p", model: model, reasoning: level).think
+        }
+        XCTAssertEqual(think("gpt-oss:20b", .medium), .level("medium"))
+        XCTAssertEqual(think("gpt-oss:20b", .off), .bool(false))
+        XCTAssertEqual(think("qwen3:8b", .high), .bool(true))
+        XCTAssertEqual(think("gemma3:4b", .off), .bool(false))
+    }
+
+    func testLeakedThinkTagIsNeverPasted() {
+        XCTAssertEqual(TranscriptCleanup.validated("<think>", raw: "raw words"), "raw words")
+        XCTAssertEqual(TranscriptCleanup.validated("<think>\nstuff", raw: "raw words"), "raw words")
+        XCTAssertEqual(TranscriptCleanup.validated("clean words", raw: "raw words"), "clean words")
+    }
+
+    func testUnchangedCleanupOutputIsAValidCompletion() {
+        let result = TranscriptCleanup.validationResult("Already clean.", raw: "Already clean.")
+
+        XCTAssertTrue(result.succeeded)
+        XCTAssertEqual(result.text, "Already clean.")
+    }
+
+    func testRejectedCleanupOutputIsNotAValidCompletion() {
+        let result = TranscriptCleanup.validationResult("<think>\nstuff", raw: "raw words")
+
+        XCTAssertFalse(result.succeeded)
+        XCTAssertEqual(result.text, "raw words")
+    }
+}

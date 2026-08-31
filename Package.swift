@@ -7,7 +7,10 @@ let package = Package(
         .macOS(.v14)
     ],
     dependencies: [
-        .package(url: "https://github.com/argmaxinc/WhisperKit.git", from: "1.0.0"),
+        // Renamed from argmaxinc/WhisperKit at 1.0.0. The old URL still
+        // redirects here, but depending on a redirect is fragile: it breaks
+        // the moment a repo reoccupies the old name.
+        .package(url: "https://github.com/argmaxinc/argmax-oss-swift.git", from: "1.0.0"),
         // In-app updates. Sparkle ships as a binary framework, so
         // scripts/make-app.sh embeds and signs it into the bundle.
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.6.0")
@@ -16,7 +19,7 @@ let package = Package(
         .executableTarget(
             name: "LocalFlow",
             dependencies: [
-                .product(name: "WhisperKit", package: "WhisperKit"),
+                .product(name: "WhisperKit", package: "argmax-oss-swift"),
                 .product(name: "Sparkle", package: "Sparkle")
             ],
             path: "Sources/LocalFlow"

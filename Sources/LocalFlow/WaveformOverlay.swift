@@ -3,8 +3,8 @@ import AppKit
 /// Floating "listening" HUD shown while the hotkey is held: a non-activating
 /// panel at the bottom-center of the screen, draggable to wherever the user
 /// wants it (the spot persists across launches). The visual itself is
-/// whichever HudTheme the user picked — a frosted capsule for most themes,
-/// borderless for the ones that draw straight over the desktop.
+/// whichever HudTheme the user picked — system glass for Liquid Glass, a
+/// frosted capsule for most themes, and no chrome for the bare themes.
 @MainActor
 final class WaveformOverlay {
     private let panel: NSPanel
@@ -66,27 +66,53 @@ final class WaveformOverlay {
         programmaticMove = false
         let bounds = NSRect(origin: .zero, size: size)
 
-        let container: NSView
-        if newTheme.isBare {
-            container = NSView(frame: bounds)
-        } else {
-            let blur = NSVisualEffectView(frame: bounds)
-            blur.material = .hudWindow
-            blur.state = .active
-            blur.blendingMode = .behindWindow
-            blur.wantsLayer = true
-            blur.layer?.cornerRadius = size.height / 2
-            blur.layer?.cornerCurve = .continuous
-            blur.layer?.masksToBounds = true
-            blur.layer?.borderWidth = 1
-            blur.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
-            container = blur
-        }
-
         hudView = HudView(frame: bounds, renderer: newTheme.makeRenderer())
         hudView.autoresizingMask = [.width, .height]
-        container.addSubview(hudView)
+
+        let container: NSView
+        if newTheme.isBare {
+            let bare = NSView(frame: bounds)
+            bare.addSubview(hudView)
+            container = bare
+        } else if newTheme == .liquidGlass {
+            #if compiler(>=6.2)
+            if #available(macOS 26.0, *) {
+                let glass = NSGlassEffectView(frame: bounds)
+                glass.style = .regular
+                glass.cornerRadius = size.height / 2
+                glass.tintColor = NSColor.white.withAlphaComponent(0.025)
+                glass.wantsLayer = true
+                glass.layer?.cornerRadius = size.height / 2
+                glass.layer?.cornerCurve = .continuous
+                glass.layer?.masksToBounds = true
+                glass.contentView = hudView
+                container = glass
+            } else {
+                container = makeBlurContainer(bounds: bounds, size: size)
+            }
+            #else
+            container = makeBlurContainer(bounds: bounds, size: size)
+            #endif
+        } else {
+            container = makeBlurContainer(bounds: bounds, size: size)
+        }
+
         panel.contentView = container
+    }
+
+    private func makeBlurContainer(bounds: NSRect, size: NSSize) -> NSView {
+        let blur = NSVisualEffectView(frame: bounds)
+        blur.material = .hudWindow
+        blur.state = .active
+        blur.blendingMode = .behindWindow
+        blur.wantsLayer = true
+        blur.layer?.cornerRadius = size.height / 2
+        blur.layer?.cornerCurve = .continuous
+        blur.layer?.masksToBounds = true
+        blur.layer?.borderWidth = 1
+        blur.layer?.borderColor = NSColor.white.withAlphaComponent(0.14).cgColor
+        blur.addSubview(hudView)
+        return blur
     }
 
     /// Thread-safe: callable from the audio capture thread.
@@ -258,7 +284,7 @@ private final class HudView: NSView {
     override var isFlipped: Bool { true }
 
     /// Lifecycle states drawn on top of (or instead of) the theme renderer,
-    /// so all 16 themes get them without per-renderer changes:
+    /// so all 17 themes get them without per-renderer changes:
     /// warming = mic starting but no audio yet, live = normal waveform,
     /// processing = transcription running after release.
     enum Phase {
