@@ -36,7 +36,6 @@ final class SettingsModel: ObservableObject {
     var onKeepWarmChange: (() -> Void)?
     var onThemeChange: (() -> Void)?
     var onVocabularyChange: ((String) -> Void)?
-    var onCorrectionsChange: (() -> Void)?
     var onCommandModeChange: (() -> Void)?
     var onAutomaticUpdatesChange: (() -> Void)?
 
@@ -156,9 +155,8 @@ final class SettingsModel: ObservableObject {
 
     @Published var customVocabulary: String = Settings.customVocabulary {
         didSet {
-            guard oldValue != customVocabulary else { return }
-            Settings.customVocabulary = customVocabulary
-            onVocabularyChange?(customVocabulary)
+            guard oldValue != customVocabulary, !isSynchronizingApplicationValues else { return }
+            apply(.customVocabulary(customVocabulary), from: .settingsWindow)
         }
     }
 
@@ -166,9 +164,13 @@ final class SettingsModel: ObservableObject {
         CorrectionPair(wrong: $0.wrong, right: $0.right)
     } {
         didSet {
-            guard oldValue != corrections else { return }
-            Settings.corrections = corrections.map { ($0.wrong, $0.right) }
-            onCorrectionsChange?()
+            guard oldValue != corrections, !isSynchronizingApplicationValues else { return }
+            apply(
+                .corrections(corrections.map {
+                    SettingsApplication.Correction(wrong: $0.wrong, right: $0.right)
+                }),
+                from: .settingsWindow
+            )
         }
     }
 
@@ -228,7 +230,8 @@ final class SettingsModel: ObservableObject {
                 applyCleanupEnabled: { [weak self] _ in self?.onCleanupToggle?() },
                 applyCommandModeEnabled: { [weak self] _ in self?.onCommandModeChange?() },
                 applyTheme: { [weak self] _ in self?.onThemeChange?() },
-                applySoundCues: { _ in }
+                applySoundCues: { _ in },
+                refreshDecoderVocabulary: { [weak self] in self?.onVocabularyChange?($0) }
             ),
             loginItem: .init(
                 isEnabled: { loginAgent.status == .enabled },
@@ -271,6 +274,14 @@ final class SettingsModel: ObservableObject {
         commandModeEnabled = settingsApplication.values.commandModeEnabled
         theme = settingsApplication.values.theme
         soundCues = settingsApplication.values.soundCues
+        customVocabulary = settingsApplication.values.customVocabulary
+        let applicationCorrections = settingsApplication.values.corrections
+        if corrections.map({ SettingsApplication.Correction(wrong: $0.wrong, right: $0.right) })
+            != applicationCorrections {
+            corrections = applicationCorrections.map {
+                CorrectionPair(wrong: $0.wrong, right: $0.right)
+            }
+        }
         isSynchronizingApplicationValues = false
     }
 

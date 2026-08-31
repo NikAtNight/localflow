@@ -4,6 +4,11 @@ import Foundation
 /// Both the settings window and menu actions use this path.
 @MainActor
 final class SettingsApplication {
+    struct Correction: Equatable {
+        let wrong: String
+        let right: String
+    }
+
     struct Values: Equatable {
         var hotkey: HotkeyManager.Key
         var whisperModel: String
@@ -16,6 +21,8 @@ final class SettingsApplication {
         var commandModeEnabled: Bool
         var theme: HudTheme
         var soundCues: Bool
+        var customVocabulary: String
+        var corrections: [Correction]
     }
 
     enum Change: Equatable {
@@ -30,6 +37,8 @@ final class SettingsApplication {
         case commandModeEnabled(Bool)
         case theme(HudTheme)
         case soundCues(Bool)
+        case customVocabulary(String)
+        case corrections([Correction])
     }
 
     enum Source {
@@ -53,6 +62,7 @@ final class SettingsApplication {
         let applyCommandModeEnabled: (Bool) -> Void
         let applyTheme: (HudTheme) -> Void
         let applySoundCues: (Bool) -> Void
+        let refreshDecoderVocabulary: (String) -> Void
 
         init(
             applyHotkey: @escaping (HotkeyManager.Key) -> Void,
@@ -64,7 +74,8 @@ final class SettingsApplication {
             applyCleanupEnabled: @escaping (Bool) -> Void = { _ in },
             applyCommandModeEnabled: @escaping (Bool) -> Void = { _ in },
             applyTheme: @escaping (HudTheme) -> Void = { _ in },
-            applySoundCues: @escaping (Bool) -> Void = { _ in }
+            applySoundCues: @escaping (Bool) -> Void = { _ in },
+            refreshDecoderVocabulary: @escaping (String) -> Void = { _ in }
         ) {
             self.applyHotkey = applyHotkey
             self.reloadWhisperModel = reloadWhisperModel
@@ -76,6 +87,7 @@ final class SettingsApplication {
             self.applyCommandModeEnabled = applyCommandModeEnabled
             self.applyTheme = applyTheme
             self.applySoundCues = applySoundCues
+            self.refreshDecoderVocabulary = refreshDecoderVocabulary
         }
     }
 
@@ -123,6 +135,8 @@ final class SettingsApplication {
         )
         let theme = Self.loadTheme(from: defaults)
         let soundCues = Self.loadBool(from: defaults, key: Settings.Key.soundCues, default: true)
+        let customVocabulary = defaults.string(forKey: Settings.Key.customVocabulary) ?? ""
+        let corrections = Self.loadCorrections(from: defaults)
 
         values = Values(
             hotkey: hotkey,
@@ -135,7 +149,9 @@ final class SettingsApplication {
             cleanupEnabled: cleanupEnabled,
             commandModeEnabled: commandModeEnabled,
             theme: theme,
-            soundCues: soundCues
+            soundCues: soundCues,
+            customVocabulary: customVocabulary,
+            corrections: corrections
         )
 
         // Repair missing or malformed values without treating startup as a
@@ -154,6 +170,8 @@ final class SettingsApplication {
         defaults.set(commandModeEnabled, forKey: Settings.Key.commandModeEnabled)
         defaults.set(theme.rawValue, forKey: Settings.Key.hudTheme)
         defaults.set(soundCues, forKey: Settings.Key.soundCues)
+        defaults.set(customVocabulary, forKey: Settings.Key.customVocabulary)
+        defaults.set(Self.encodedCorrections(corrections), forKey: Settings.Key.corrections)
     }
 
     @discardableResult
@@ -164,6 +182,7 @@ final class SettingsApplication {
             defaults.set(hotkey.rawValue, forKey: Settings.Key.hotkey)
             values.hotkey = hotkey
             effects.applyHotkey(hotkey)
+            effects.applyCommandHotkey(values.commandHotkey)
 
         case .whisperModel(let model):
             guard supportedWhisperModels.contains(model) else {
@@ -238,6 +257,18 @@ final class SettingsApplication {
             defaults.set(enabled, forKey: Settings.Key.soundCues)
             values.soundCues = enabled
             effects.applySoundCues(enabled)
+
+        case .customVocabulary(let vocabulary):
+            guard vocabulary != values.customVocabulary else { return .success(()) }
+            defaults.set(vocabulary, forKey: Settings.Key.customVocabulary)
+            values.customVocabulary = vocabulary
+            effects.refreshDecoderVocabulary(Self.effectiveVocabulary(from: values))
+
+        case .corrections(let corrections):
+            guard corrections != values.corrections else { return .success(()) }
+            defaults.set(Self.encodedCorrections(corrections), forKey: Settings.Key.corrections)
+            values.corrections = corrections
+            effects.refreshDecoderVocabulary(Self.effectiveVocabulary(from: values))
         }
 
         return .success(())
@@ -305,5 +336,24 @@ final class SettingsApplication {
             return .classic
         }
         return theme
+    }
+
+    private static func loadCorrections(from defaults: UserDefaults) -> [Correction] {
+        (defaults.stringArray(forKey: Settings.Key.corrections) ?? []).compactMap { entry in
+            let parts = entry.components(separatedBy: "\t")
+            guard parts.count == 2 else { return nil }
+            return Correction(wrong: parts[0], right: parts[1])
+        }
+    }
+
+    private static func encodedCorrections(_ corrections: [Correction]) -> [String] {
+        corrections.map { "\($0.wrong)\t\($0.right)" }
+    }
+
+    private static func effectiveVocabulary(from values: Values) -> String {
+        Settings.effectiveVocabulary(
+            customVocabulary: values.customVocabulary,
+            correctedTerms: values.corrections.map(\.right)
+        )
     }
 }

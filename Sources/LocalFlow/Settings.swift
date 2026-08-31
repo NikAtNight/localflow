@@ -99,9 +99,15 @@ enum Settings {
     /// free-form custom terms plus every correction's right-hand side. A
     /// word the user had to fix is by definition a word worth biasing toward.
     static var effectiveVocabulary: String {
+        effectiveVocabulary(
+            customVocabulary: customVocabulary,
+            correctedTerms: corrections.map(\.right)
+        )
+    }
+
+    static func effectiveVocabulary(customVocabulary: String, correctedTerms: [String]) -> String {
         let base = customVocabulary.trimmingCharacters(in: .whitespacesAndNewlines)
-        let corrected = corrections.map(\.right)
-        return ((base.isEmpty ? [] : [base]) + corrected).joined(separator: ", ")
+        return ((base.isEmpty ? [] : [base]) + correctedTerms).joined(separator: ", ")
     }
 
     static var cleanupEnabled: Bool {

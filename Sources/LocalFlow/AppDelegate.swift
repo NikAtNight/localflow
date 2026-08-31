@@ -257,16 +257,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let model = Settings.ollamaModel
             Task { await self.textModelPolicy.prewarm(model: model) }
         }
-        // Vocabulary and corrections feed the same decoder bias; either
-        // changing rebuilds the effective term list.
-        let refreshVocabulary = { [weak self] in
-            guard let self else { return }
-            let transcriber = self.transcriber
-            let terms = Settings.effectiveVocabulary
+        settingsModel.onVocabularyChange = { [weak self] terms in
+            guard let transcriber = self?.transcriber else { return }
             Task { await transcriber.setVocabulary(terms) }
         }
-        settingsModel.onVocabularyChange = { _ in refreshVocabulary() }
-        settingsModel.onCorrectionsChange = { refreshVocabulary() }
         settingsModel.onCommandModeChange = { [weak self] in
             // Enabling may hinge on Ollama; the probe re-runs the hotkey
             // start once reachability is known.
@@ -1125,9 +1119,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         // Quick actions: the settings people flip most often, applied through
-        // the SAME live paths the settings window uses (SettingsModel setters
-        // persist and fire the AppDelegate hooks). Checkmarks and the mic list
-        // are refreshed in menuWillOpen.
+        // the same SettingsModel entry point as the settings window. Checkmarks
+        // and the mic list are refreshed in menuWillOpen.
         hotkeyMenuItem = NSMenuItem(title: "Hold to Talk", action: nil, keyEquivalent: "")
         let hotkeyMenu = NSMenu()
         for key in HotkeyManager.Key.allCases {
@@ -1287,8 +1280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stored.removeAll { $0.wrong.caseInsensitiveCompare(proposal.wrong) == .orderedSame }
             stored.append(proposal)
         }
-        Settings.corrections = stored
-        settingsModel?.corrections = stored.map { CorrectionPair(wrong: $0.wrong, right: $0.right) }
+        settingsModel.corrections = stored.map { CorrectionPair(wrong: $0.wrong, right: $0.right) }
         DiagLog.log("learned %d correction(s) from an edited dictation", proposals.count)
     }
 
@@ -1323,23 +1315,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(url)
     }
 
-    // Quick-action selections route through SettingsModel so persistence and
-    // the live-apply hooks are shared with the settings window — no duplicated
-    // apply logic.
+    // Quick-action selections name the menu as their source while sharing
+    // persistence and live effects with the settings window.
 
     @objc private func selectHotkey(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? HotkeyManager.Key else { return }
-        settingsModel.hotkey = key
+        settingsModel.apply(.hotkey(key), from: .menu)
     }
 
     @objc private func selectWhisperModel(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
-        settingsModel.whisperModel = name
+        settingsModel.apply(.whisperModel(name), from: .menu)
     }
 
     @objc private func selectMicrophone(_ sender: NSMenuItem) {
         // A nil representedObject is the "System Default" row.
-        settingsModel.micUID = sender.representedObject as? String
+        settingsModel.apply(.microphone(sender.representedObject as? String), from: .menu)
     }
 }
 
