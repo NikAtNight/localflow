@@ -332,6 +332,73 @@ test_development_artifacts_are_optional() {
     assert_success
 }
 
+test_release_uses_typed_repository_dispatch() {
+    assert_file_contains "$RELEASE_WORKFLOW" 'repository_dispatch:' || return
+    if ! grep -Eq 'types:[[:space:]]*\[release-build\]|^[[:space:]]*-[[:space:]]+release-build$' "$RELEASE_WORKFLOW"; then
+        fail 'release repository dispatch must only accept release-build events'
+        return
+    fi
+    if grep -Fq 'workflow_dispatch:' "$RELEASE_WORKFLOW"; then
+        fail 'release workflow must not accept workflow_dispatch'
+    fi
+}
+
+test_release_please_dispatches_release_payload() {
+    local release_please="$REPO_ROOT/.github/workflows/release-please.yml"
+    assert_file_contains "$release_please" 'gh api' || return
+    assert_file_contains "$release_please" \
+        'repos/${{ github.repository }}/dispatches' || return
+    assert_file_contains "$release_please" 'event_type' || return
+    assert_file_contains "$release_please" 'release-build' || return
+    assert_file_contains "$release_please" 'client_payload' || return
+    assert_file_contains "$release_please" '$RELEASE_TAG' || return
+    assert_file_contains "$release_please" '$COMMIT_SHA'
+}
+
+test_release_reads_dispatch_payload() {
+    if grep -Fq '${{ inputs.' "$RELEASE_WORKFLOW"; then
+        fail 'release tag and commit must not come from workflow inputs'
+        return
+    fi
+    assert_file_contains "$RELEASE_WORKFLOW" 'github.event.client_payload.tag' || return
+    assert_file_contains "$RELEASE_WORKFLOW" 'github.event.client_payload.commit_sha' || return
+    assert_file_contains "$RELEASE_WORKFLOW" 'DISPATCH_SHA: ${{ github.sha }}'
+}
+
+test_destination_checks_precede_upload_and_publish() {
+    local draft_step
+    local publish_step
+    draft_step="$(awk '
+        /- name: Create verified draft release/ { active=1 }
+        /- name: Publish complete release/ { active=0 }
+        active { print }
+    ' "$RELEASE_WORKFLOW")"
+    publish_step="$(awk '
+        /- name: Publish complete release/ { active=1 }
+        active { print }
+    ' "$RELEASE_WORKFLOW")"
+    case "$draft_step" in
+        *'EXISTING_TARGET'*'TAG_TARGET'*'gh release upload'*) ;;
+        *) fail 'draft target and tag checks must run before upload'; return ;;
+    esac
+    case "$publish_step" in
+        *'EXISTING_TARGET'*'TAG_TARGET'*'gh release edit'*) ;;
+        *) fail 'draft target and tag checks must run before publication' ;;
+    esac
+}
+
+test_artifact_validation_precedes_both_publication_steps() {
+    local validate_line
+    local upload_line
+    local publish_line
+    validate_line="$(grep -n -m1 'name: Validate release artifacts' "$RELEASE_WORKFLOW" | cut -d: -f1)"
+    upload_line="$(grep -n -m1 'gh release upload' "$RELEASE_WORKFLOW" | cut -d: -f1)"
+    publish_line="$(grep -n -m1 'name: Publish complete release' "$RELEASE_WORKFLOW" | cut -d: -f1)"
+    [[ -n "$validate_line" && -n "$upload_line" && -n "$publish_line" && \
+        "$validate_line" -lt "$upload_line" && "$validate_line" -lt "$publish_line" ]] || \
+        fail 'artifact validation must run before upload and publication'
+}
+
 if [[ ! -x "$VALIDATOR" ]]; then
     printf 'not ok 1 - release validator exists\n' >&2
     printf '    expected executable: %s\n' "$VALIDATOR" >&2
@@ -370,6 +437,11 @@ run_test 'release source commit is reachable from origin/main' test_release_sour
 run_test 'existing draft release targets the requested commit' test_existing_draft_targets_requested_commit
 run_test 'existing tag targets the requested commit' test_existing_tag_targets_requested_commit
 run_test 'release workflow validates artifacts before publication' test_release_workflow_validates_before_publication
+run_test 'release uses a typed repository dispatch trigger' test_release_uses_typed_repository_dispatch
+run_test 'Release Please dispatches the release tag and commit payload' test_release_please_dispatches_release_payload
+run_test 'release reads tag and commit from the dispatch payload' test_release_reads_dispatch_payload
+run_test 'destination checks precede upload and publication' test_destination_checks_precede_upload_and_publish
+run_test 'artifact validation precedes both publication phases' test_artifact_validation_precedes_both_publication_steps
 
 printf '%d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 [[ "$FAIL_COUNT" -eq 0 ]]
