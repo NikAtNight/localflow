@@ -4,8 +4,15 @@ on:
   # Publish a GitHub Release (tag it v1.2.3) to build and attach the DMG.
   release:
     types: [published]
-  # Or run manually to produce an unpublished build for testing.
+  # A release created by Release Please's GITHUB_TOKEN cannot trigger another
+  # workflow. Pass its tag here to build and attach the real release assets.
+  # Leave the tag blank to produce an unpublished development build.
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and attach assets to
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,24 +32,40 @@ jobs:
       id-token: write # Sigstore signing for build provenance
       attestations: write
     steps:
-      - uses: actions/checkout@v7
-
       - name: Determine version
         id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "release" ]]; then
-            TAG="${{ github.event.release.tag_name }}"
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            TAG="$RELEASE_TAG"
+            VERSION="${TAG#v}"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            TAG="$INPUT_TAG"
             VERSION="${TAG#v}"
             echo "is_release=true" >> "$GITHUB_OUTPUT"
           else
-            VERSION="0.0.0-dev.${GITHUB_SHA:0:7}"
+            VERSION="0.0.0-dev.${COMMIT_SHA:0:7}"
             TAG=""
             echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
+          if [[ -n "$TAG" && ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "error: release tag must be a v-prefixed semantic version" >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=${TAG:-$COMMIT_SHA}" >> "$GITHUB_OUTPUT"
           echo "Building $VERSION"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.version.outputs.ref }}
 
       - name: Cache SwiftPM
         uses: actions/cache@v6
@@ -187,8 +210,10 @@ jobs:
         if: steps.version.outputs.is_release == 'true' && steps.signing.outputs.sign == 'true'
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           RELEASE_NOTES: ${{ github.event.release.body }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [[ -z "${SPARKLE_PRIVATE_KEY:-}" ]]; then
@@ -207,9 +232,14 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent \
             build/LocalFlow.app "sparkle-updates/LocalFlow-${APP_VERSION}.zip"
 
-          # Release notes become the "what's new" body Sparkle shows.
-          if [[ -n "${RELEASE_NOTES:-}" ]]; then
-            printf '%s\n' "$RELEASE_NOTES" > "sparkle-updates/LocalFlow-${APP_VERSION}.html"
+          # Manual tag dispatches do not carry the release event body, so
+          # fetch the notes from the existing GitHub release in that case.
+          NOTES="${RELEASE_NOTES:-}"
+          if [[ -z "$NOTES" ]]; then
+            NOTES="$(gh release view "$RELEASE_TAG" --json body --jq .body)"
+          fi
+          if [[ -n "$NOTES" ]]; then
+            printf '%s\n' "$NOTES" > "sparkle-updates/LocalFlow-${APP_VERSION}.html"
           fi
 
           "$BIN/generate_appcast" \
@@ -229,8 +259,11 @@ jobs:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+          cp scripts/setup-s1-mini.sh dist/setup-s1-mini.sh
+          chmod 755 dist/setup-s1-mini.sh
           cd dist
-          shasum -a 256 *.dmg *.zip 2>/dev/null > SHA256SUMS.txt || shasum -a 256 *.dmg > SHA256SUMS.txt
+          shasum -a 256 *.dmg *.zip setup-s1-mini.sh 2>/dev/null > SHA256SUMS.txt || \
+            shasum -a 256 *.dmg setup-s1-mini.sh > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       # Cryptographic proof that this DMG came out of this workflow, from
@@ -249,6 +282,7 @@ jobs:
           path: |
             dist/*.dmg
             dist/SHA256SUMS.txt
+            dist/setup-s1-mini.sh
           retention-days: 14
 
       - name: Attach DMG to the release
@@ -258,7 +292,11 @@ jobs:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          ASSETS=("dist/LocalFlow-${APP_VERSION}.dmg" "dist/SHA256SUMS.txt")
+          ASSETS=(
+            "dist/LocalFlow-${APP_VERSION}.dmg"
+            "dist/SHA256SUMS.txt"
+            "dist/setup-s1-mini.sh"
+          )
           # appcast.xml must be attached for the feed URL
           # (/releases/latest/download/appcast.xml) to resolve, and the ZIP is
           # what the appcast points existing installs at.
