@@ -112,9 +112,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         loadModel()
         if Settings.cleanupEnabled {
             probeOllama()
-            // Load the on-device model's weights now, not on the first
-            // dictation's cleanup call.
-            AppleIntelligenceCleaner.prewarm()
         }
         Task { await transcriber.setVocabulary(Settings.effectiveVocabulary) }
         // Called on the audio thread; overlay.push hops to main internally.
@@ -175,7 +172,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsModel.onCleanupToggle = { [weak self] in
             guard Settings.cleanupEnabled else { return }
             self?.probeOllama()
-            AppleIntelligenceCleaner.prewarm()
         }
         // Vocabulary and corrections feed the same decoder bias; either
         // changing rebuilds the effective term list.
@@ -406,9 +402,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func probeOllama() {
-        // Ollama is only the fallback backend, so no point probing (or
-        // warning about) it when the on-device model handles cleanup.
-        guard !AppleIntelligenceCleaner.isAvailable else { return }
         Task {
             settingsModel?.ollamaReachable = await OllamaCleaner.isAvailable()
         }
@@ -618,7 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         processingCount += 1
         if !isRecording { state = .processing }
         let cleanupWanted = Settings.cleanupEnabled
-        let ollamaModel = Settings.ollamaModel
+        let ollamaModel = Settings.cleanupModel
         let corrections = Settings.corrections
         let snippets = Settings.snippets
         // Read while the target app is still frontmost.
@@ -658,6 +651,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 if cleanupWanted {
                     text = await cleanTranscript(text, ollamaModel: ollamaModel, profile: styleProfile)
+                    // S1-mini intentionally returns an empty string for
+                    // filler-only or noise-only input. That is a successful
+                    // normalization, but there is nothing to paste or save.
+                    if text.isEmpty {
+                        DiagLog.log("S1-mini removed filler-only transcript")
+                        finishDictation(seq, with: .skip)
+                        dismissHud(hudGeneration)
+                        finishProcessing()
+                        return
+                    }
                 }
 
                 // Keep the transcript reachable even if the paste goes
@@ -696,23 +699,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Runs the enabled cleanup backend; any failure returns the input so a
-    /// dictation is never lost to the cleanup stage. Apple's on-device model
-    /// is preferred; Ollama is the fallback for systems without it.
+    /// Runs S1-mini by Superwhisper through Ollama; any failure returns the
+    /// input so a dictation is never lost to the cleanup stage. Apple
+    /// Intelligence remains available for command mode, but no longer
+    /// rewrites ordinary dictation.
     private func cleanTranscript(
         _ text: String,
         ollamaModel: String,
         profile: AppStyleProfile
     ) async -> String {
-        if AppleIntelligenceCleaner.isAvailable {
-            do {
-                return try await AppleIntelligenceCleaner.clean(text, profile: profile)
-            } catch {
-                DiagLog.log("Apple Intelligence cleanup failed (%@), pasting uncleaned text",
-                      error.localizedDescription)
-                return text
-            }
-        }
         do {
             let cleaned = try await OllamaCleaner.clean(text, model: ollamaModel, profile: profile)
             settingsModel?.ollamaReachable = true

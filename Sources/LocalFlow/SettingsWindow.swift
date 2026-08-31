@@ -304,9 +304,7 @@ struct SettingsView: View {
     @State private var newSnippetExpansion = ""
 
     private var cleanupLabel: String {
-        AppleIntelligenceCleaner.isAvailable
-            ? "Clean up with Apple Intelligence (on-device)"
-            : "Clean up with Ollama (\(Settings.ollamaModel))"
+        "Clean up with S1-mini by Superwhisper (on-device)"
     }
 
     var body: some View {
@@ -330,7 +328,7 @@ struct SettingsView: View {
                     Text("Fix it in your app, copy it, then pick **Fix Last Dictation\u{2026}** in the menubar. LocalFlow learns the word and starts hearing it correctly.")
                 }
                 HelpRow(symbol: "lock.fill", title: "Everything stays here") {
-                    Text("Speech never leaves this Mac. Transcription is local, cleanup uses Apple's on-device model, and the history is a plain folder you own.")
+                    Text("Speech never leaves this Mac. Transcription and S1-mini cleanup are local, and the history is a plain folder you own.")
                 }
             } header: {
                 Text("How it works")
@@ -338,8 +336,8 @@ struct SettingsView: View {
 
             Section("After transcribing") {
                 Toggle(cleanupLabel, isOn: $model.cleanupEnabled)
-                if model.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable && !model.ollamaReachable {
-                    Text("Ollama isn't running — raw transcripts will be pasted until it's back.")
+                if model.cleanupEnabled && !model.ollamaReachable {
+                    Text("Ollama or its S1-mini model isn't available — raw transcripts will be pasted. Run the bundled install-s1-mini.sh setup script from Terminal.")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }

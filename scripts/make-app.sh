@@ -21,6 +21,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp .build/release/LocalFlow "$APP/Contents/MacOS/LocalFlow"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp scripts/install-s1-mini.sh "$APP/Contents/Resources/install-s1-mini.sh"
 
 if [[ -n "${APP_VERSION:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_VERSION" "$APP/Contents/Info.plist"

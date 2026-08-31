@@ -44,10 +44,56 @@ enum TranscriptCleanup {
     }
 }
 
+/// The exact input contract for S1-mini by Superwhisper. S1-mini is not a
+/// general chat model: changing this system prompt or omitting the control
+/// line materially degrades its output.
+enum S1MiniCleanup {
+    static let systemPrompt = "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text."
+
+    static func controlLine(for profile: AppStyleProfile) -> String {
+        let styling: String
+        let structure: String
+        let context: String
+
+        switch profile {
+        case .email:
+            styling = "semi-formal"
+            structure = "lists"
+            context = "email"
+        case .workChat, .personalChat:
+            styling = "semi-casual"
+            structure = "lists"
+            context = "general"
+        case .code:
+            // S1-mini has no code-specific control. Prose is the least
+            // invasive structure for paths, commands, and identifiers.
+            styling = "semi-formal"
+            structure = "prose"
+            context = "general"
+        case .general:
+            styling = "semi-formal"
+            structure = "lists"
+            context = "general"
+        }
+
+        return "[Styling: \(styling)] [Structure: \(structure)] [Context: \(context)]"
+    }
+
+    static func prompt(for rawText: String, profile: AppStyleProfile) -> String {
+        controlLine(for: profile) + "\n" + rawText
+    }
+
+    /// Filler-only input is documented to return an empty string, which is a
+    /// valid cleanup result rather than a backend failure.
+    static func validatedOutput(_ cleaned: String, raw: String) -> String {
+        let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count < raw.count * 3 + 64 else { return raw }
+        return trimmed
+    }
+}
+
 /// Cleanup on Apple's on-device foundation model. No server, no install,
-/// fully local, and fast enough for dictation (a short transcript cleans in
-/// well under a second on Apple silicon). Preferred over Ollama whenever
-/// the OS provides it.
+/// fully local, and fast enough for command mode on Apple silicon.
 enum AppleIntelligenceCleaner {
     static var isAvailable: Bool {
         #if canImport(FoundationModels)

@@ -1,8 +1,8 @@
 import Foundation
 
-/// Optional second stage: sends the raw transcript to a local Ollama server
-/// for cleanup (punctuation, capitalization, filler removal). Mirrors
-/// WhisperFlow's downstream fine-tuned-Llama pass, but fully local.
+/// Optional second stage: sends the raw transcript to S1-mini by
+/// Superwhisper through a local Ollama server. S1-mini is a narrow 0.6B text
+/// normalizer rather than a general-purpose language model.
 ///
 /// Degrades gracefully: if Ollama is unreachable or errors, callers fall
 /// back to the raw transcript.
@@ -32,13 +32,16 @@ struct OllamaCleaner {
     }()
 
 
-    /// Quick reachability probe with a short timeout.
-    static func isAvailable() async -> Bool {
-        // /api/version is constant-size; /api/tags grows with every installed
-        // model and needlessly downloads that list just to test the server.
-        var request = URLRequest(url: baseURL.appendingPathComponent("api/version"))
+    /// Quick probe that verifies both the server and the configured model.
+    static func isAvailable(model: String = Settings.cleanupModel) async -> Bool {
+        struct ShowRequest: Encodable { let model: String }
+
+        var request = URLRequest(url: baseURL.appendingPathComponent("api/show"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 2
         do {
+            request.httpBody = try JSONEncoder().encode(ShowRequest(model: model))
             let (_, response) = try await session.data(for: request)
             return (response as? HTTPURLResponse)?.statusCode == 200
         } catch {
@@ -88,12 +91,13 @@ struct OllamaCleaner {
         request.timeoutInterval = 45
         request.httpBody = try JSONEncoder().encode(GenerateRequest(
             model: model,
-            system: TranscriptCleanup.instructions(for: profile),
-            prompt: rawText,
+            system: S1MiniCleanup.systemPrompt,
+            prompt: S1MiniCleanup.prompt(for: rawText, profile: profile),
             stream: false,
             think: false,
             options: .init(
-                temperature: 0.1,
+                // S1-mini is trained for deterministic greedy decoding.
+                temperature: 0,
                 // Cleanup should never need materially more tokens than the
                 // source. This prevents a misbehaving model from generating
                 // indefinitely; a length stop falls back to the raw transcript.
@@ -107,6 +111,6 @@ struct OllamaCleaner {
 
         let result = try JSONDecoder().decode(GenerateResponse.self, from: data)
         guard result.doneReason != "length" else { return rawText }
-        return TranscriptCleanup.validated(result.response, raw: rawText)
+        return S1MiniCleanup.validatedOutput(result.response, raw: rawText)
     }
 }

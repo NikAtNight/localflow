@@ -75,21 +75,12 @@ struct LocalFlowMain {
 
                 if cleanupEnabled, Settings.cleanupEnabled {
                     stageStart = Date()
-                    if AppleIntelligenceCleaner.isAvailable {
-                        do {
-                            text = try await AppleIntelligenceCleaner.clean(text)
-                            stderr.write(Data("apple intelligence cleanup: \(elapsedMs(since: stageStart))ms\n".utf8))
-                        } catch {
-                            stderr.write(Data("apple intelligence cleanup failed, using raw transcript: \(error.localizedDescription)\n".utf8))
-                        }
-                    } else {
-                        do {
-                            text = try await OllamaCleaner.clean(text, model: Settings.ollamaModel)
-                            stderr.write(Data("ollama cleanup: \(elapsedMs(since: stageStart))ms (\(Settings.ollamaModel))\n".utf8))
-                        } catch {
-                            // Ollama died mid-call — keep the raw transcript rather than lose it.
-                            stderr.write(Data("ollama cleanup failed, using raw transcript: \(error.localizedDescription)\n".utf8))
-                        }
+                    do {
+                        text = try await OllamaCleaner.clean(text, model: Settings.cleanupModel)
+                        stderr.write(Data("S1-mini cleanup: \(elapsedMs(since: stageStart))ms (\(Settings.cleanupModel))\n".utf8))
+                    } catch {
+                        // Ollama died mid-call — keep the raw transcript rather than lose it.
+                        stderr.write(Data("S1-mini cleanup failed, using raw transcript: \(error.localizedDescription)\n".utf8))
                     }
                 }
 

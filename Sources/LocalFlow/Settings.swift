@@ -10,7 +10,7 @@ enum Settings {
         static let hotkey = "hotkey"
         static let whisperModel = "whisperModel"
         static let cleanupEnabled = "cleanupEnabled"
-        static let ollamaModel = "ollamaModel"
+
         static let soundCues = "soundCues"
         static let keepMicWarm = "keepMicWarm"
         static let inputDeviceUID = "inputDeviceUID"
@@ -90,10 +90,10 @@ enum Settings {
         set { defaults.set(newValue, forKey: Key.cleanupEnabled) }
     }
 
-    static var ollamaModel: String {
-        get { defaults.string(forKey: Key.ollamaModel) ?? "gemma3:4b" }
-        set { defaults.set(newValue, forKey: Key.ollamaModel) }
-    }
+    /// The installer creates this exact Ollama model. Keeping it fixed avoids
+    /// accidentally sending S1-mini's narrow prompt contract to a legacy
+    /// general-purpose model saved in UserDefaults.
+    static let cleanupModel = "s1-mini"
 
     /// Hold-to-edit key for command mode. Must differ from `hotkey`;
     /// `commandModeActive` enforces that.

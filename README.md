@@ -3,7 +3,8 @@
 A fully local WhisperFlow-style push-to-talk dictation app for Apple Silicon Macs.
 Hold a hotkey anywhere, speak, release — your words are transcribed on-device by
 [WhisperKit](https://github.com/argmaxinc/WhisperKit) (CoreML → Neural Engine),
-optionally cleaned up by a local Ollama LLM, and pasted into whatever app has focus.
+optionally cleaned up by S1-mini by Superwhisper through local Ollama, and
+pasted into whatever app has focus.
 
 No audio ever leaves your machine.
 
@@ -13,9 +14,9 @@ No audio ever leaves your machine.
      ▼                                               ▼
 ┌─────────┐  16kHz mono  ┌───────────┐  raw text  ┌───────────┐ clean text ┌──────────┐
 │  Mic    │─────PCM─────▶│ WhisperKit│───────────▶│  Ollama   │───────────▶│  Text    │
-│ capture │              │   (STT)   │            │  cleanup  │ (optional) │ injector │
+│ capture │              │   (STT)   │            │ S1-mini   │ (optional) │ injector │
 └─────────┘              └───────────┘            └───────────┘            └──────────┘
- AVAudioEngine            CoreML / ANE             gemma3:4b               clipboard + ⌘V
+ AVAudioEngine            CoreML / ANE             Ollama, 0.6B            clipboard + ⌘V
 ```
 
 ## Requirements
@@ -35,10 +36,10 @@ Notes on the edges of that table:
 
 - **Apple Silicon is required.** Intel Macs are not supported: transcription
   runs on the Neural Engine, and without it dictation is too slow to be useful.
-- **macOS 26+ unlocks the optional extras.** Transcription, formatting,
-  snippets, and corrections all work on macOS 14. Transcript cleanup and
-  command mode use Apple's on-device foundation model, which needs macOS 26
-  with Apple Intelligence enabled in System Settings.
+- **macOS 26+ unlocks command mode.** Transcription, S1-mini cleanup,
+  formatting, snippets, and corrections all work on macOS 14. Command mode
+  uses Apple's on-device foundation model, which needs macOS 26 with Apple
+  Intelligence enabled in System Settings.
 - **Disk depends on the model.** Small English is ~500 MB; the default
   Large v3 Turbo is ~1.5 GB. Models download on first launch and are cached in
   `~/Library/Application Support/LocalFlow/`.
@@ -165,8 +166,7 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   - **Open Dictation History** — today's log in Finder (see below).
   - **Retry Failed Dictation** — appears if a transcription errored; the
     audio is kept so your words aren't lost.
-  - **Clean up transcripts** — toggle the LLM cleanup pass (Apple
-    Intelligence on-device when available, else Ollama — see below).
+  - **Clean up transcripts** — toggle the local S1-mini cleanup pass (see below).
   - **Sound Cues** — start/finish sounds, plus a low "Basso" when something
     fails (mic denied, nothing heard, transcription error).
 - In "System Default" microphone mode, plugging in or removing a mic (or
@@ -239,32 +239,38 @@ build/LocalFlow.app/Contents/MacOS/LocalFlow --transcribe /tmp/test.aiff
 Measured on this machine (M-series, small.en, warm): **~790 ms** for 7 s of
 speech, model load ~1.8 s at app startup.
 
-## Optional: LLM cleanup (the WhisperFlow "magic" pass)
+## Optional: S1-mini cleanup
 
 Whisper already punctuates reasonably well; larger Whisper models improve word
-recognition but do not replace semantic cleanup. The cleanup pass additionally
-strips filler tics ("um", standalone "like"), fixes false starts, and handles
-the judgment-call formatting (topic-shift paragraphs, list detection). It is
-**off by default** because it's the main latency cost.
+recognition but do not replace semantic cleanup. The optional second stage uses
+**S1-mini by Superwhisper**, a 0.6B model built specifically to normalize ASR
+output. It removes fillers and false starts, resolves self-corrections, formats
+spoken numbers, dates, times, currency, and email addresses, and preserves the
+speaker's meaning. It is English-only and **off by default** because it adds
+latency.
 
-Two backends, picked automatically:
-
-1. **Apple Intelligence (preferred)**: on macOS 26+ with Apple Intelligence
-   turned on in System Settings, cleanup runs on Apple's on-device foundation
-   model. Nothing to install, no server, fully local, typically well under a
-   second.
-2. **Ollama (fallback)**: used only when the on-device model isn't available.
+S1-mini runs fully locally through Ollama. The recommended Q4_K_M build is
+462 MiB. Install Ollama and the pinned, checksum-verified model:
 
 ```bash
 brew install ollama
-ollama serve                # or: brew services start ollama
-ollama pull gemma3:4b
+brew services start ollama
+"/Applications/LocalFlow.app/Contents/Resources/install-s1-mini.sh"
 ```
 
-Enable the cleanup toggle in Settings (its label shows which backend is
-active). If the backend is down or errors, LocalFlow pastes the raw
-transcript instead — dictation never blocks on the LLM. Different Ollama
-model: `defaults write app.talix.localflow ollamaModel "qwen2.5:3b"`.
+When building from source, run `./scripts/install-s1-mini.sh` instead.
+
+Enable the cleanup toggle in Settings. If Ollama is down, the model is missing,
+or cleanup errors, LocalFlow pastes the raw transcript instead, so dictation is
+never lost to the cleanup stage. The app sends S1-mini's exact required system
+prompt and control line, disables thinking, and uses deterministic temperature
+0 decoding.
+
+S1-mini is released under Apache 2.0 plus a naming clause. LocalFlow does not
+redistribute its weights; the install script downloads the pinned model from
+[the official repository](https://huggingface.co/superwhisper/s1-mini-GGUF).
+Review that repository's [LICENSE](https://huggingface.co/superwhisper/s1-mini-GGUF/blob/main/LICENSE)
+and [NOTICE](https://huggingface.co/superwhisper/s1-mini-GGUF/blob/main/NOTICE).
 
 ## Command mode (voice editing)
 
@@ -351,10 +357,11 @@ a folder shortcut, and **Delete All History**.
 | `Sources/LocalFlow/AudioRecorder.swift` | AVAudioEngine capture → 16 kHz mono Float32 |
 | `Sources/LocalFlow/WaveformOverlay.swift` | Floating live-waveform pill shown while recording |
 | `scripts/generate-icon.swift` + `scripts/make-icon.sh` | Renders the app icon (organic wave motif) → `Resources/AppIcon.icns` |
+| `scripts/install-s1-mini.sh` | Downloads, verifies, and configures S1-mini by Superwhisper for Ollama |
 | `Sources/LocalFlow/Transcriber.swift` | WhisperKit model load + transcription, vocabulary biasing, pause-paragraphing |
 | `Sources/LocalFlow/VoiceFormatter.swift` | Spoken formatting commands + automatic list detection |
-| `Sources/LocalFlow/TranscriptCleaner.swift` | Cleanup contract + Apple Intelligence on-device backend |
-| `Sources/LocalFlow/OllamaCleaner.swift` | Fallback LLM cleanup via Ollama HTTP API |
+| `Sources/LocalFlow/TranscriptCleaner.swift` | S1-mini input contract + Apple Intelligence command-mode backend |
+| `Sources/LocalFlow/OllamaCleaner.swift` | S1-mini cleanup via Ollama HTTP API |
 | `Sources/LocalFlow/TextInjector.swift` | Clipboard+⌘V injection with save/restore, keystroke fallback |
 | `Sources/LocalFlow/DictationHistory.swift` | Daily Markdown log of every dictation |
 | `Sources/LocalFlow/CommandMode.swift` | Voice editing of the current selection |
