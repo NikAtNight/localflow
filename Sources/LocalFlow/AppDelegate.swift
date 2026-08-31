@@ -512,14 +512,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func mirrorOllamaReachability() {
+        let reachable: Bool
         switch textModelPolicy.ollamaReachability {
         case .unknown:
-            break
+            return
         case .reachable:
-            settingsModel?.ollamaReachable = true
+            reachable = true
         case .unreachable:
-            settingsModel?.ollamaReachable = false
+            reachable = false
         }
+
+        guard settingsModel.ollamaReachable != reachable else { return }
+        settingsModel.ollamaReachable = reachable
+        startCommandHotkey()
     }
 
     // MARK: - Push-to-talk pipeline

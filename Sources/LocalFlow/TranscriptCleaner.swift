@@ -127,17 +127,6 @@ enum AppleIntelligenceCleaner {
         #endif
     }
 
-    static func cleanResult(
-        _ rawText: String,
-        profile: AppStyleProfile = .general
-    ) async throws -> TranscriptCleanupResult {
-        let generation = try await generateCleanup(rawText, profile: profile)
-        guard generation.finishReason == .complete else {
-            return TranscriptCleanupResult(text: rawText, succeeded: false)
-        }
-        return TranscriptCleanup.validationResult(generation.text, raw: rawText)
-    }
-
     static func generateCleanup(
         _ rawText: String,
         profile: AppStyleProfile = .general
@@ -157,10 +146,6 @@ enum AppleIntelligenceCleaner {
         #else
         return TextModelGeneration(text: rawText, finishReason: .complete)
         #endif
-    }
-
-    static func clean(_ rawText: String, profile: AppStyleProfile = .general) async throws -> String {
-        try await cleanResult(rawText, profile: profile).text
     }
 }
 

@@ -148,10 +148,9 @@ final class LocalTextModelPolicy {
         }
     }
 
-    /// Runs Ollama directly for compatibility callers that already made their
-    /// own Apple-backend choice. The high-level methods above remain the only
-    /// place that decides backend preference and fallback.
-    func ollamaCleanup(
+    /// Keeps Ollama generation and reachability transitions together after
+    /// the preferred Apple backend is unavailable or rejects a result.
+    private func ollamaCleanup(
         _ rawText: String,
         model: String,
         profile: AppStyleProfile
@@ -167,7 +166,7 @@ final class LocalTextModelPolicy {
         return validatedCleanup(generation, raw: rawText)
     }
 
-    func ollamaCommand(
+    private func ollamaCommand(
         system: String,
         prompt: String,
         model: String,
@@ -190,11 +189,6 @@ final class LocalTextModelPolicy {
     }
 
     func prewarm(model: String) async {
-        if apple.isAvailable {
-            apple.prewarm()
-            return
-        }
-
         if let operation = prewarmOperations[model] {
             await operation.task.value
             return
@@ -206,6 +200,11 @@ final class LocalTextModelPolicy {
             return
         }
         lastPrewarmByModel[model] = now
+
+        if apple.isAvailable {
+            apple.prewarm()
+            return
+        }
 
         let id = UUID()
         let task = Task { [ollama] in

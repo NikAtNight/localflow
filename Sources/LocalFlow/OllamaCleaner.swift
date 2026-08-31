@@ -167,23 +167,14 @@ final class OllamaLocalTextModelBackend: OllamaTextModelBackend {
     }
 }
 
-/// Compatibility entry points for existing UI and command-line callers. New
-/// backend choice and fallback decisions belong in `LocalTextModelPolicy`.
+/// Request builders and model discovery shared by the UI and HTTP backend.
 @MainActor
 struct OllamaCleaner {
     nonisolated static let baseURL = URL(string: "http://localhost:11434")!
     nonisolated static let keepAlive = "30m"
 
-    static var lastKnownReachable: Bool {
-        LocalTextModelPolicy.shared.ollamaReachability == .reachable
-    }
-
     static func installedModels() async -> [String] {
         await LocalTextModelPolicy.shared.installedOllamaModels()
-    }
-
-    static func isAvailable() async -> Bool {
-        await LocalTextModelPolicy.shared.probeOllama()
     }
 
     /// Ollama's `think` takes a bool for toggle-based models or a level string
@@ -277,43 +268,5 @@ struct OllamaCleaner {
             think: think,
             options: .init(temperature: 0.3, numPredict: 2_048)
         )
-    }
-
-    static func clean(
-        _ rawText: String,
-        model: String,
-        profile: AppStyleProfile = .general
-    ) async throws -> String {
-        try await cleanResult(rawText, model: model, profile: profile).text
-    }
-
-    static func cleanResult(
-        _ rawText: String,
-        model: String,
-        profile: AppStyleProfile = .general
-    ) async throws -> TranscriptCleanupResult {
-        try await LocalTextModelPolicy.shared.ollamaCleanup(
-            rawText,
-            model: model,
-            profile: profile
-        )
-    }
-
-    static func prewarm(model: String) async {
-        await LocalTextModelPolicy.shared.prewarm(model: model)
-    }
-
-    static func respond(
-        system: String,
-        prompt: String,
-        model: String,
-        reasoning: ReasoningLevel
-    ) async throws -> String {
-        try await LocalTextModelPolicy.shared.ollamaCommand(
-            system: system,
-            prompt: prompt,
-            model: model,
-            reasoning: reasoning
-        ) ?? ""
     }
 }
