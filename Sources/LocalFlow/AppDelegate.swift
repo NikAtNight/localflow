@@ -84,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let recorder = AudioRecorder()
     private let transcriber = Transcriber()
     private let overlay = WaveformOverlay()
+    private let textModelPolicy = LocalTextModelPolicy.shared
 
     private struct PendingDictation {
         let sequence: Int
@@ -113,11 +114,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else {
                 return TranscriptCleanupResult(text: request.text, succeeded: false)
             }
-            return await self.cleanTranscriptResult(
-                request.text,
-                ollamaModel: request.context.ollamaModel,
-                profile: request.context.styleProfile
-            )
+            do {
+                return try await self.cleanTranscriptResult(
+                    request.text,
+                    ollamaModel: request.context.ollamaModel,
+                    profile: request.context.styleProfile
+                )
+            } catch is CancellationError {
+                return TranscriptCleanupResult(text: request.text, succeeded: false)
+            } catch {
+                DiagLog.log("local text cleanup failed (%@); using raw transcript",
+                      error.localizedDescription)
+                return TranscriptCleanupResult(text: request.text, succeeded: false)
+            }
         },
         onOutcome: { [weak self] outcome in
             self?.handleDictationOutcome(outcome)
@@ -179,9 +188,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             probeOllama()
         }
         if Settings.cleanupEnabled {
-            // Load the on-device model's weights now, not on the first
-            // dictation's cleanup call.
-            AppleIntelligenceCleaner.prewarm()
+            let model = Settings.ollamaModel
+            Task { await textModelPolicy.prewarm(model: model) }
         }
         Task { await transcriber.setVocabulary(Settings.effectiveVocabulary) }
         // Called on the audio thread; overlay.push hops to main internally.
@@ -244,9 +252,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !Settings.keepMicWarm { self?.recorder.releaseWarmSession() }
         }
         settingsModel.onCleanupToggle = { [weak self] in
-            guard Settings.cleanupEnabled else { return }
-            self?.probeOllama()
-            AppleIntelligenceCleaner.prewarm()
+            guard let self, Settings.cleanupEnabled else { return }
+            self.probeOllama()
+            let model = Settings.ollamaModel
+            Task { await self.textModelPolicy.prewarm(model: model) }
         }
         // Vocabulary and corrections feed the same decoder bias; either
         // changing rebuilds the effective term list.
@@ -494,14 +503,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func probeOllama() {
-        // Ollama is only the fallback backend, so no point probing (or
-        // warning about) it when the on-device model handles everything.
-        guard !AppleIntelligenceCleaner.isAvailable else { return }
         Task {
-            settingsModel?.ollamaReachable = await OllamaCleaner.isAvailable()
+            settingsModel?.ollamaReachable = await textModelPolicy.probeOllama()
             // Reachability feeds Settings.commandModeActive, and the command
             // tap may have been skipped (or left running) on stale state.
-            await MainActor.run { self.startCommandHotkey() }
+            startCommandHotkey()
+        }
+    }
+
+    private func mirrorOllamaReachability() {
+        let reachable: Bool
+        switch textModelPolicy.ollamaReachability {
+        case .unknown:
+            return
+        case .reachable:
+            reachable = true
+        case .unreachable:
+            reachable = false
+        }
+
+        guard settingsModel.ollamaReachable != reachable else { return }
+        settingsModel.ollamaReachable = reachable
+        if !textModelPolicy.isAppleAvailable {
+            startCommandHotkey()
         }
     }
 
@@ -520,8 +544,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        if Settings.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable {
-            Task { await OllamaCleaner.prewarm(model: Settings.ollamaModel) }
+        if Settings.cleanupEnabled && !recordingIsCommand {
+            let model = Settings.ollamaModel
+            Task { await textModelPolicy.prewarm(model: model) }
         }
         // A denied mic yields an engine that happily records silence —
         // every dictation would "succeed" with nothing to show. Fail loudly.
@@ -674,9 +699,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func commandKeyPressed() {
         guard modelLoaded, !isRecording else { return }
-        if !AppleIntelligenceCleaner.isAvailable {
-            Task { await OllamaCleaner.prewarm(model: Settings.ollamaCommandModel) }
-        }
+        let model = Settings.ollamaCommandModel
+        Task { await textModelPolicy.prewarm(model: model) }
         recordingIsCommand = true
         hotkeyPressed()
     }
@@ -693,6 +717,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         TextInjector.copySelection { [weak self] selection in
             guard let self else { return }
             Task {
+                defer { self.mirrorOllamaReachability() }
                 do {
                     let result = try await CommandMode.run(instruction: instruction, selection: selection)
                     guard !result.isEmpty else {
@@ -922,37 +947,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ text: String,
         ollamaModel: String,
         profile: AppStyleProfile
-    ) async -> TranscriptCleanupResult {
-        if AppleIntelligenceCleaner.isAvailable {
-            do {
-                return try await AppleIntelligenceCleaner.cleanResult(text, profile: profile)
-            } catch {
-                DiagLog.log("Apple Intelligence cleanup failed (%@), pasting uncleaned text",
-                      error.localizedDescription)
-                return TranscriptCleanupResult(text: text, succeeded: false)
+    ) async throws -> TranscriptCleanupResult {
+        let result = try await textModelPolicy.cleanup(
+            text,
+            model: ollamaModel,
+            profile: profile
+        )
+        mirrorOllamaReachability()
+        if !result.succeeded {
+            let reachability: String
+            switch textModelPolicy.ollamaReachability {
+            case .unknown: reachability = "unknown"
+            case .reachable: reachability = "reachable"
+            case .unreachable: reachability = "unreachable"
             }
-        }
-        do {
-            let result = try await OllamaCleaner.cleanResult(
-                text,
-                model: ollamaModel,
-                profile: profile
+            DiagLog.log(
+                "local text cleanup returned no usable edit (ollama=%@); using raw transcript",
+                reachability
             )
-            settingsModel?.ollamaReachable = true
-            return result
-        } catch {
-            // A transport error means the server is unavailable;
-            // HTTP/decoding failures still prove it was reached.
-            if let urlError = error as? URLError {
-                if urlError.code != .cancelled {
-                    settingsModel?.ollamaReachable = false
-                }
-            } else if !(error is CancellationError) {
-                settingsModel?.ollamaReachable = true
-            }
-            DiagLog.log("Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
-            return TranscriptCleanupResult(text: text, succeeded: false)
         }
+        return result
     }
 
     /// Records a dictation's outcome and drains everything now unblocked,

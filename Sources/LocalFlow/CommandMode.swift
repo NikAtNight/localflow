@@ -1,7 +1,4 @@
 import Foundation
-#if canImport(FoundationModels)
-import FoundationModels
-#endif
 
 /// Voice editing: hold the command hotkey, say what you want done, and the
 /// selected text is rewritten in place. With nothing selected, the spoken
@@ -24,7 +21,7 @@ enum CommandMode {
     }
 
     static var isAvailable: Bool {
-        AppleIntelligenceCleaner.isAvailable || OllamaCleaner.lastKnownReachable
+        LocalTextModelPolicy.shared.isCommandAvailable
     }
 
     private static let editInstructions = """
@@ -70,24 +67,12 @@ enum CommandMode {
         prompt: String,
         fallback: String
     ) async throws -> String {
-        #if canImport(FoundationModels)
-        if #available(macOS 26.0, *), AppleIntelligenceCleaner.isAvailable {
-            let session = LanguageModelSession(instructions: instructions)
-            let response = try await session.respond(
-                to: prompt,
-                options: GenerationOptions(temperature: 0.3)
-            )
-            let text = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            // An empty answer must not wipe the user's selection.
-            return text.isEmpty ? fallback : text
-        }
-        #endif
-        let text = try await OllamaCleaner.respond(
+        try await LocalTextModelPolicy.shared.command(
             system: instructions,
             prompt: prompt,
             model: Settings.ollamaCommandModel,
-            reasoning: Settings.commandReasoning
+            reasoning: Settings.commandReasoning,
+            fallback: fallback
         )
-        return text.isEmpty ? fallback : text
     }
 }
