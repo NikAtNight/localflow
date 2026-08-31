@@ -41,14 +41,14 @@ final class SettingsModel: ObservableObject {
     var onAutomaticUpdatesChange: (() -> Void)?
 
     private let loginAgent = SMAppService.agent(plistName: "app.talix.localflow.plist")
-    private lazy var settingsApplication = makeSettingsApplication()
+    private let injectedSettingsApplication: SettingsApplication?
+    private lazy var settingsApplication = injectedSettingsApplication ?? makeSettingsApplication()
     private var isSynchronizingApplicationValues = false
 
     @Published var theme: HudTheme = HudTheme.current {
         didSet {
-            guard oldValue != theme else { return }
-            Settings.hudTheme = theme.rawValue
-            onThemeChange?()
+            guard oldValue != theme, !isSynchronizingApplicationValues else { return }
+            apply(.theme(theme), from: .settingsWindow)
         }
     }
 
@@ -75,9 +75,8 @@ final class SettingsModel: ObservableObject {
 
     @Published var cleanupEnabled: Bool = Settings.cleanupEnabled {
         didSet {
-            guard oldValue != cleanupEnabled else { return }
-            Settings.cleanupEnabled = cleanupEnabled
-            onCleanupToggle?()
+            guard oldValue != cleanupEnabled, !isSynchronizingApplicationValues else { return }
+            apply(.cleanupEnabled(cleanupEnabled), from: .settingsWindow)
         }
     }
 
@@ -89,7 +88,10 @@ final class SettingsModel: ObservableObject {
     }
 
     @Published var soundCues: Bool = Settings.soundCues {
-        didSet { Settings.soundCues = soundCues }
+        didSet {
+            guard oldValue != soundCues, !isSynchronizingApplicationValues else { return }
+            apply(.soundCues(soundCues), from: .settingsWindow)
+        }
     }
 
     @Published var saveHistory: Bool = Settings.saveHistory {
@@ -105,17 +107,15 @@ final class SettingsModel: ObservableObject {
 
     @Published var commandModeEnabled: Bool = Settings.commandModeEnabled {
         didSet {
-            guard oldValue != commandModeEnabled else { return }
-            Settings.commandModeEnabled = commandModeEnabled
-            onCommandModeChange?()
+            guard oldValue != commandModeEnabled, !isSynchronizingApplicationValues else { return }
+            apply(.commandModeEnabled(commandModeEnabled), from: .settingsWindow)
         }
     }
 
     @Published var commandHotkey: HotkeyManager.Key = Settings.commandHotkey {
         didSet {
-            guard oldValue != commandHotkey else { return }
-            Settings.commandHotkey = commandHotkey
-            onCommandModeChange?()
+            guard oldValue != commandHotkey, !isSynchronizingApplicationValues else { return }
+            apply(.commandHotkey(commandHotkey), from: .settingsWindow)
         }
     }
 
@@ -188,9 +188,8 @@ final class SettingsModel: ObservableObject {
 
     @Published var keepMicWarm: Bool = Settings.keepMicWarm {
         didSet {
-            guard oldValue != keepMicWarm else { return }
-            Settings.keepMicWarm = keepMicWarm
-            onKeepWarmChange?()
+            guard oldValue != keepMicWarm, !isSynchronizingApplicationValues else { return }
+            apply(.keepMicWarm(keepMicWarm), from: .settingsWindow)
         }
     }
 
@@ -208,7 +207,8 @@ final class SettingsModel: ObservableObject {
     @Published var recentDictations: [RecentDictation] = []
     @Published var lastIssue: UserFacingIssue?
 
-    init() {
+    init(settingsApplication: SettingsApplication? = nil) {
+        injectedSettingsApplication = settingsApplication
         synchronizeApplicationValues()
     }
 
@@ -222,7 +222,13 @@ final class SettingsModel: ObservableObject {
                 applyHotkey: { [weak self] in self?.onHotkeyChange?($0) },
                 reloadWhisperModel: { [weak self] _ in self?.onModelChange?() },
                 selectMicrophone: { [weak self] in self?.onMicChange?($0) },
-                applyAutomaticUpdates: { [weak self] _ in self?.onAutomaticUpdatesChange?() }
+                applyAutomaticUpdates: { [weak self] _ in self?.onAutomaticUpdatesChange?() },
+                applyCommandHotkey: { [weak self] _ in self?.onCommandModeChange?() },
+                applyKeepMicWarm: { [weak self] _ in self?.onKeepWarmChange?() },
+                applyCleanupEnabled: { [weak self] _ in self?.onCleanupToggle?() },
+                applyCommandModeEnabled: { [weak self] _ in self?.onCommandModeChange?() },
+                applyTheme: { [weak self] _ in self?.onThemeChange?() },
+                applySoundCues: { _ in }
             ),
             loginItem: .init(
                 isEnabled: { loginAgent.status == .enabled },
@@ -259,6 +265,12 @@ final class SettingsModel: ObservableObject {
         micUID = settingsApplication.values.microphoneUID
         automaticUpdates = settingsApplication.values.automaticUpdates
         startAtLogin = settingsApplication.values.startAtLogin
+        commandHotkey = settingsApplication.values.commandHotkey
+        keepMicWarm = settingsApplication.values.keepMicWarm
+        cleanupEnabled = settingsApplication.values.cleanupEnabled
+        commandModeEnabled = settingsApplication.values.commandModeEnabled
+        theme = settingsApplication.values.theme
+        soundCues = settingsApplication.values.soundCues
         isSynchronizingApplicationValues = false
     }
 

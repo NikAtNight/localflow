@@ -10,6 +10,12 @@ final class SettingsApplication {
         var microphoneUID: String?
         var automaticUpdates: Bool
         var startAtLogin: Bool
+        var commandHotkey: HotkeyManager.Key
+        var keepMicWarm: Bool
+        var cleanupEnabled: Bool
+        var commandModeEnabled: Bool
+        var theme: HudTheme
+        var soundCues: Bool
     }
 
     enum Change: Equatable {
@@ -18,6 +24,12 @@ final class SettingsApplication {
         case microphone(String?)
         case automaticUpdates(Bool)
         case startAtLogin(Bool)
+        case commandHotkey(HotkeyManager.Key)
+        case keepMicWarm(Bool)
+        case cleanupEnabled(Bool)
+        case commandModeEnabled(Bool)
+        case theme(HudTheme)
+        case soundCues(Bool)
     }
 
     enum Source {
@@ -35,6 +47,36 @@ final class SettingsApplication {
         let reloadWhisperModel: (String) -> Void
         let selectMicrophone: (String?) -> Void
         let applyAutomaticUpdates: (Bool) -> Void
+        let applyCommandHotkey: (HotkeyManager.Key) -> Void
+        let applyKeepMicWarm: (Bool) -> Void
+        let applyCleanupEnabled: (Bool) -> Void
+        let applyCommandModeEnabled: (Bool) -> Void
+        let applyTheme: (HudTheme) -> Void
+        let applySoundCues: (Bool) -> Void
+
+        init(
+            applyHotkey: @escaping (HotkeyManager.Key) -> Void,
+            reloadWhisperModel: @escaping (String) -> Void,
+            selectMicrophone: @escaping (String?) -> Void,
+            applyAutomaticUpdates: @escaping (Bool) -> Void,
+            applyCommandHotkey: @escaping (HotkeyManager.Key) -> Void = { _ in },
+            applyKeepMicWarm: @escaping (Bool) -> Void = { _ in },
+            applyCleanupEnabled: @escaping (Bool) -> Void = { _ in },
+            applyCommandModeEnabled: @escaping (Bool) -> Void = { _ in },
+            applyTheme: @escaping (HudTheme) -> Void = { _ in },
+            applySoundCues: @escaping (Bool) -> Void = { _ in }
+        ) {
+            self.applyHotkey = applyHotkey
+            self.reloadWhisperModel = reloadWhisperModel
+            self.selectMicrophone = selectMicrophone
+            self.applyAutomaticUpdates = applyAutomaticUpdates
+            self.applyCommandHotkey = applyCommandHotkey
+            self.applyKeepMicWarm = applyKeepMicWarm
+            self.applyCleanupEnabled = applyCleanupEnabled
+            self.applyCommandModeEnabled = applyCommandModeEnabled
+            self.applyTheme = applyTheme
+            self.applySoundCues = applySoundCues
+        }
     }
 
     struct LoginItem {
@@ -71,13 +113,29 @@ final class SettingsApplication {
         )
         let microphoneUID = Self.loadMicrophone(from: defaults)
         let automaticUpdates = Self.loadAutomaticUpdates(from: defaults)
+        let commandHotkey = Self.loadCommandHotkey(from: defaults)
+        let keepMicWarm = Self.loadBool(from: defaults, key: Settings.Key.keepMicWarm, default: true)
+        let cleanupEnabled = Self.loadBool(from: defaults, key: Settings.Key.cleanupEnabled, default: false)
+        let commandModeEnabled = Self.loadBool(
+            from: defaults,
+            key: Settings.Key.commandModeEnabled,
+            default: true
+        )
+        let theme = Self.loadTheme(from: defaults)
+        let soundCues = Self.loadBool(from: defaults, key: Settings.Key.soundCues, default: true)
 
         values = Values(
             hotkey: hotkey,
             whisperModel: whisperModel,
             microphoneUID: microphoneUID,
             automaticUpdates: automaticUpdates,
-            startAtLogin: loginItem.isEnabled()
+            startAtLogin: loginItem.isEnabled(),
+            commandHotkey: commandHotkey,
+            keepMicWarm: keepMicWarm,
+            cleanupEnabled: cleanupEnabled,
+            commandModeEnabled: commandModeEnabled,
+            theme: theme,
+            soundCues: soundCues
         )
 
         // Repair missing or malformed values without treating startup as a
@@ -90,6 +148,12 @@ final class SettingsApplication {
             defaults.removeObject(forKey: Settings.Key.inputDeviceUID)
         }
         defaults.set(automaticUpdates, forKey: Settings.Key.automaticUpdates)
+        defaults.set(commandHotkey.rawValue, forKey: Settings.Key.commandHotkey)
+        defaults.set(keepMicWarm, forKey: Settings.Key.keepMicWarm)
+        defaults.set(cleanupEnabled, forKey: Settings.Key.cleanupEnabled)
+        defaults.set(commandModeEnabled, forKey: Settings.Key.commandModeEnabled)
+        defaults.set(theme.rawValue, forKey: Settings.Key.hudTheme)
+        defaults.set(soundCues, forKey: Settings.Key.soundCues)
     }
 
     @discardableResult
@@ -138,6 +202,42 @@ final class SettingsApplication {
                 values.startAtLogin = loginItem.isEnabled()
                 return .failure(.loginItemChangeFailed)
             }
+
+        case .commandHotkey(let hotkey):
+            guard hotkey != values.commandHotkey else { return .success(()) }
+            defaults.set(hotkey.rawValue, forKey: Settings.Key.commandHotkey)
+            values.commandHotkey = hotkey
+            effects.applyCommandHotkey(hotkey)
+
+        case .keepMicWarm(let enabled):
+            guard enabled != values.keepMicWarm else { return .success(()) }
+            defaults.set(enabled, forKey: Settings.Key.keepMicWarm)
+            values.keepMicWarm = enabled
+            effects.applyKeepMicWarm(enabled)
+
+        case .cleanupEnabled(let enabled):
+            guard enabled != values.cleanupEnabled else { return .success(()) }
+            defaults.set(enabled, forKey: Settings.Key.cleanupEnabled)
+            values.cleanupEnabled = enabled
+            effects.applyCleanupEnabled(enabled)
+
+        case .commandModeEnabled(let enabled):
+            guard enabled != values.commandModeEnabled else { return .success(()) }
+            defaults.set(enabled, forKey: Settings.Key.commandModeEnabled)
+            values.commandModeEnabled = enabled
+            effects.applyCommandModeEnabled(enabled)
+
+        case .theme(let theme):
+            guard theme != values.theme else { return .success(()) }
+            defaults.set(theme.rawValue, forKey: Settings.Key.hudTheme)
+            values.theme = theme
+            effects.applyTheme(theme)
+
+        case .soundCues(let enabled):
+            guard enabled != values.soundCues else { return .success(()) }
+            defaults.set(enabled, forKey: Settings.Key.soundCues)
+            values.soundCues = enabled
+            effects.applySoundCues(enabled)
         }
 
         return .success(())
@@ -181,5 +281,29 @@ final class SettingsApplication {
 
     private static func loadAutomaticUpdates(from defaults: UserDefaults) -> Bool {
         defaults.object(forKey: Settings.Key.automaticUpdates) as? Bool ?? true
+    }
+
+    private static func loadCommandHotkey(from defaults: UserDefaults) -> HotkeyManager.Key {
+        guard let rawValue = defaults.string(forKey: Settings.Key.commandHotkey),
+              let hotkey = HotkeyManager.Key(rawValue: rawValue) else {
+            return .rightOption
+        }
+        return hotkey
+    }
+
+    private static func loadBool(
+        from defaults: UserDefaults,
+        key: String,
+        default defaultValue: Bool
+    ) -> Bool {
+        defaults.object(forKey: key) as? Bool ?? defaultValue
+    }
+
+    private static func loadTheme(from defaults: UserDefaults) -> HudTheme {
+        guard let rawValue = defaults.string(forKey: Settings.Key.hudTheme),
+              let theme = HudTheme(rawValue: rawValue) else {
+            return .classic
+        }
+        return theme
     }
 }
