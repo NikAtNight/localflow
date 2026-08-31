@@ -83,6 +83,11 @@ find_appcast_tool() {
     find "$REPO_ROOT/.build/artifacts" -type f -name generate_appcast -perm -u+x -print -quit 2>/dev/null || true
 }
 
+find_sign_update_tool() {
+    find "$REPO_ROOT/.build/artifacts/sparkle/Sparkle/bin" \
+        -type f -name sign_update -perm -u+x -print -quit 2>/dev/null || true
+}
+
 validate_source_plist() {
     local plist="${SPARKLE_INFO_PLIST:-$REPO_ROOT/Resources/Info.plist}"
     [[ -f "$plist" ]] || fail "Resources/Info.plist is missing"
@@ -99,8 +104,8 @@ validate_source_plist() {
 }
 
 validate_sparkle_signing_key() {
-    local derived_public_key
-    if ! derived_public_key="$(SPARKLE_PRIVATE_KEY="$SPARKLE_PRIVATE_KEY" swift -e '
+    local decoded_key
+    if ! decoded_key="$(SPARKLE_PRIVATE_KEY="$SPARKLE_PRIVATE_KEY" swift -e '
         import CryptoKit
         import Foundation
 
@@ -126,13 +131,55 @@ validate_sparkle_signing_key() {
         default:
             exit(1)
         }
-        print(publicKey.base64EncodedString())
+        print("\(secret.count) \(publicKey.base64EncodedString())")
     ' 2>/dev/null)"; then
         fail "SPARKLE_PRIVATE_KEY must be a valid Sparkle Ed25519 export"
     fi
 
+    local key_size="${decoded_key%% *}"
+    local derived_public_key="${decoded_key#* }"
     [[ "$derived_public_key" == "$SOURCE_SPARKLE_PUBLIC_KEY" ]] || \
         fail "SPARKLE_PRIVATE_KEY does not match Info.plist SUPublicEDKey"
+
+    [[ "$key_size" == 96 ]] || return 0
+
+    local sign_update
+    sign_update="$(find_sign_update_tool)"
+    [[ -x "$sign_update" ]] || \
+        fail "pinned Sparkle sign_update is required to validate a legacy signing key"
+
+    local probe
+    local signature
+    probe="$(mktemp "${TMPDIR:-/tmp}/localflow-sparkle-key.XXXXXX")"
+    printf 'LocalFlow Sparkle legacy key validation probe\n' > "$probe"
+    if ! signature="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | \
+        "$sign_update" --ed-key-file - -p "$probe" 2>/dev/null)"; then
+        rm -f "$probe"
+        fail "Sparkle signing key private/public mismatch"
+    fi
+
+    if ! SPARKLE_PUBLIC_KEY="$SOURCE_SPARKLE_PUBLIC_KEY" \
+        SPARKLE_TEST_SIGNATURE="$signature" \
+        swift -e '
+            import CryptoKit
+            import Foundation
+
+            let environment = ProcessInfo.processInfo.environment
+            guard let encodedPublicKey = environment["SPARKLE_PUBLIC_KEY"],
+                  let publicKeyData = Data(base64Encoded: encodedPublicKey),
+                  let publicKey = try? Curve25519.Signing.PublicKey(rawRepresentation: publicKeyData),
+                  let encodedSignature = environment["SPARKLE_TEST_SIGNATURE"],
+                  let signature = Data(base64Encoded: encodedSignature),
+                  let probe = try? Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])),
+                  publicKey.isValidSignature(signature, for: probe) else {
+                exit(1)
+            }
+        ' "$probe" 2>/dev/null
+    then
+        rm -f "$probe"
+        fail "Sparkle signing key private/public mismatch"
+    fi
+    rm -f "$probe"
 }
 
 preflight() {

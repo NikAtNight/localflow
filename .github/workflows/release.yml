@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.sha }}
+  group: localflow-production-release
   cancel-in-progress: false
 
 jobs:
@@ -187,6 +187,7 @@ jobs:
       - name: Run tests
         run: |
           set -euo pipefail
+          swift package resolve
           bash Tests/ReleaseContractTests.sh
           swift test
 
@@ -385,6 +386,25 @@ jobs:
           COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
         run: |
           set -euo pipefail
+          verify_current_main_tip() {
+            local auth_header
+            local origin_main_sha
+            auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
+            if ! GIT_CONFIG_COUNT=1 \
+                 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+                 GIT_CONFIG_VALUE_0="$auth_header" \
+                 git fetch --no-tags origin \
+                   "+refs/heads/main:refs/remotes/origin/main"; then
+              echo "error: could not refresh the origin/main tip before release mutation" >&2
+              return 1
+            fi
+            origin_main_sha="$(git rev-parse origin/main)"
+            if [[ "$origin_main_sha" != "$COMMIT_SHA" ]]; then
+              echo "error: origin/main tip no longer equals the release source" >&2
+              return 1
+            fi
+          }
+
           NOTES_FILE="$RUNNER_TEMP/release-notes.md"
           if [[ -f CHANGELOG.md ]]; then
             awk -v version="$APP_VERSION" '
@@ -428,6 +448,7 @@ jobs:
           unset AUTH_HEADER GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
 
           if [[ -z "$EXISTING" ]]; then
+            verify_current_main_tip
             CREATE_ARGS=(--draft --target "$COMMIT_SHA" --title "$RELEASE_TAG" --notes-file "$NOTES_FILE")
             if [[ "$RELEASE_TAG" == *-* ]]; then
               CREATE_ARGS+=(--prerelease)
@@ -442,6 +463,7 @@ jobs:
             "dist/SHA256SUMS.txt"
             "dist/setup-s1-mini.sh"
           )
+          verify_current_main_tip
           gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --clobber
 
       - name: Publish complete release
@@ -452,6 +474,25 @@ jobs:
           COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
         run: |
           set -euo pipefail
+          verify_current_main_tip() {
+            local auth_header
+            local origin_main_sha
+            auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
+            if ! GIT_CONFIG_COUNT=1 \
+                 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+                 GIT_CONFIG_VALUE_0="$auth_header" \
+                 git fetch --no-tags origin \
+                   "+refs/heads/main:refs/remotes/origin/main"; then
+              echo "error: could not refresh the origin/main tip before release mutation" >&2
+              return 1
+            fi
+            origin_main_sha="$(git rev-parse origin/main)"
+            if [[ "$origin_main_sha" != "$COMMIT_SHA" ]]; then
+              echo "error: origin/main tip no longer equals the release source" >&2
+              return 1
+            fi
+          }
+
           IS_DRAFT="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
           if [[ "$IS_DRAFT" != "true" ]]; then
             echo "error: refusing to replace already-published release $RELEASE_TAG" >&2
@@ -494,4 +535,5 @@ jobs:
           else
             PUBLISH_ARGS+=(--latest)
           fi
+          verify_current_main_tip
           gh release edit "$RELEASE_TAG" "${PUBLISH_ARGS[@]}"
