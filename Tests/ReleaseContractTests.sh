@@ -21,6 +21,12 @@ RELEASE_STEP_SCRIPT="$TEST_ROOT/release-step.sh"
 DMG_SIGNING_SCRIPT="$TEST_ROOT/dmg-signing-phase.sh"
 RELEASE_TOOL_LOG="$TEST_ROOT/release-tools"
 RELEASE_FAKE_BIN="$TEST_ROOT/release-fake-bin"
+RELEASE_LABEL_SCRIPT="$TEST_ROOT/mark-release-pr-published.sh"
+RELEASE_LABEL_FAKE_BIN="$TEST_ROOT/release-label-fake-bin"
+RELEASE_LABEL_ACTIONS="$TEST_ROOT/release-label-actions"
+RELEASE_LABEL_STATE="$TEST_ROOT/release-label-state"
+RELEASE_REPOSITORY_LABELS="$TEST_ROOT/repository-labels"
+RELEASE_LABEL_CANDIDATES="$TEST_ROOT/release-label-candidates.json"
 GH_LOG="$TEST_ROOT/gh-mutations"
 OUTPUT_FILE="$TEST_ROOT/github-output"
 STDOUT_FILE="$TEST_ROOT/stdout"
@@ -28,6 +34,8 @@ STDERR_FILE="$TEST_ROOT/stderr"
 PASS_COUNT=0
 FAIL_COUNT=0
 LAST_STATUS=0
+RELEASE_LABEL_COMMIT_SHA='1111111111111111111111111111111111111111'
+RELEASE_LABEL_OTHER_SHA='2222222222222222222222222222222222222222'
 
 # RFC 8032 test vectors encoded in Sparkle's modern base64 seed/public-key
 # format. They let the contract exercise real key identity without touching a
@@ -68,6 +76,12 @@ assert_failure_containing() {
     if ! grep -Fq "$expected" "$STDERR_FILE"; then
         sed 's/^/    stderr: /' "$STDERR_FILE" >&2
         fail "failure did not mention $expected"
+    fi
+}
+
+assert_failure() {
+    if [[ "$LAST_STATUS" -eq 0 ]]; then
+        fail 'expected failure, got exit status 0'
     fi
 }
 
@@ -144,6 +158,27 @@ extract_detection_script() {
     chmod +x "$DETECTION_SCRIPT"
 }
 
+extract_release_label_script() {
+    awk '
+        /^      - name: Mark release PR published$/ { in_step=1; next }
+        in_step && /^      - name:/ { exit }
+        in_step && /^        run: \|$/ { in_run=1; next }
+        in_run && /^          / { sub(/^          /, ""); print; next }
+        in_run && /^[[:space:]]*$/ { print; next }
+        in_run { exit }
+    ' "$RELEASE_PLEASE_WORKFLOW" > "$RELEASE_LABEL_SCRIPT"
+    chmod +x "$RELEASE_LABEL_SCRIPT"
+}
+
+release_please_job_block() {
+    local job_name="$1"
+    awk -v job_name="$job_name" '
+        $0 == "  " job_name ":" { active=1; print; next }
+        active && /^  [A-Za-z0-9_-]+:$/ { exit }
+        active { print }
+    ' "$RELEASE_PLEASE_WORKFLOW"
+}
+
 extract_source_script() {
     awk '
         /^      - name: Verify release manifest transition$/ { in_step=1; next }
@@ -202,6 +237,256 @@ run_release_detection() {
             bash "$DETECTION_SCRIPT"
     ) > "$STDOUT_FILE" 2> "$STDERR_FILE"
     LAST_STATUS=$?
+}
+
+reset_release_label_fixture() {
+    local candidates="$1"
+    shift
+    local fake_gh
+    local labels_json
+
+    rm -rf "$RELEASE_LABEL_FAKE_BIN"
+    mkdir -p "$RELEASE_LABEL_FAKE_BIN"
+    : > "$RELEASE_LABEL_ACTIONS"
+    : > "$RELEASE_LABEL_STATE"
+    printf 'autorelease: published\n' > "$RELEASE_REPOSITORY_LABELS"
+    local label
+    for label in "$@"; do
+        printf '%s\n' "$label" >> "$RELEASE_LABEL_STATE"
+    done
+    labels_json="$(jq -Rn '[inputs | select(length > 0) | {name: .}]' \
+        < "$RELEASE_LABEL_STATE")"
+
+    case "$candidates" in
+        one)
+            jq -n \
+                --arg sha "$RELEASE_LABEL_COMMIT_SHA" \
+                --arg other "$RELEASE_LABEL_OTHER_SHA" \
+                --argjson labels "$labels_json" \
+                '[
+                    {number: 101, state: "closed", merged_at: "2026-08-31T20:00:00Z", merge_commit_sha: $sha, base: {ref: "main"}, labels: $labels},
+                    {number: 102, state: "closed", merged_at: "2026-08-30T20:00:00Z", merge_commit_sha: $other, base: {ref: "main"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 104, state: "open", merged_at: null, merge_commit_sha: $sha, base: {ref: "main"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 105, state: "closed", merged_at: "2026-08-30T20:00:00Z", merge_commit_sha: $sha, base: {ref: "develop"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 106, state: "closed", merged_at: null, merge_commit_sha: $sha, base: {ref: "main"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 107, state: "closed", merged_at: "2026-08-30T20:00:00Z", merge_commit_sha: $sha, base: {ref: "main"}, labels: [{name: "keep-me"}]}
+                ]' > "$RELEASE_LABEL_CANDIDATES"
+            ;;
+        zero)
+            jq -n \
+                --arg sha "$RELEASE_LABEL_COMMIT_SHA" \
+                --arg other "$RELEASE_LABEL_OTHER_SHA" \
+                '[
+                    {number: 102, state: "closed", merged_at: "2026-08-30T20:00:00Z", merge_commit_sha: $other, base: {ref: "main"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 104, state: "open", merged_at: null, merge_commit_sha: $sha, base: {ref: "main"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 105, state: "closed", merged_at: "2026-08-30T20:00:00Z", merge_commit_sha: $sha, base: {ref: "develop"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 106, state: "closed", merged_at: null, merge_commit_sha: $sha, base: {ref: "main"}, labels: [{name: "autorelease: pending"}]},
+                    {number: 107, state: "closed", merged_at: "2026-08-30T20:00:00Z", merge_commit_sha: $sha, base: {ref: "main"}, labels: [{name: "keep-me"}]}
+                ]' > "$RELEASE_LABEL_CANDIDATES"
+            ;;
+        two)
+            jq -n \
+                --arg sha "$RELEASE_LABEL_COMMIT_SHA" \
+                --argjson labels "$labels_json" \
+                '[
+                    {number: 101, state: "closed", merged_at: "2026-08-31T20:00:00Z", merge_commit_sha: $sha, base: {ref: "main"}, labels: $labels},
+                    {number: 103, state: "closed", merged_at: "2026-08-31T20:00:01Z", merge_commit_sha: $sha, base: {ref: "main"}, labels: [{name: "autorelease: pending"}]}
+                ]' > "$RELEASE_LABEL_CANDIDATES"
+            ;;
+        *) fail "unknown release label fixture: $candidates"; return ;;
+    esac
+
+    IFS= read -r -d '' fake_gh <<'FAKE_GH' || true
+#!/bin/bash
+set -euo pipefail
+
+ORIGINAL_ARGS=("$@")
+ARGS="${ORIGINAL_ARGS[*]}"
+JQ_EXPRESSION=""
+for ((index=0; index < ${#ORIGINAL_ARGS[@]}; index++)); do
+    if [[ "${ORIGINAL_ARGS[index]}" == "--jq" || "${ORIGINAL_ARGS[index]}" == "-q" ]]; then
+        JQ_EXPRESSION="${ORIGINAL_ARGS[index + 1]:-}"
+    fi
+done
+
+emit_json() {
+    local value="$1"
+    if [[ -n "$JQ_EXPRESSION" ]]; then
+        jq -r "$JQ_EXPRESSION" <<< "$value"
+    else
+        printf '%s\n' "$value"
+    fi
+}
+
+labels_json() {
+    jq -Rn '[inputs | select(length > 0) | {name: .}] | {labels: .}' \
+        < "$RELEASE_LABEL_STATE"
+}
+
+repository_labels_json() {
+    jq -Rn '[inputs | select(length > 0) | {name: .}]' \
+        < "$RELEASE_REPOSITORY_LABELS"
+}
+
+if [[ "$ARGS" == release\ view* ]]; then
+    printf 'release\n' >> "$RELEASE_LABEL_ACTIONS"
+    [[ "$ARGS" == *"$RELEASE_TAG"* ]] || exit 90
+    RELEASE_JSON="$(jq -n \
+        --argjson draft "$RELEASE_LABEL_DRAFT" \
+        --arg target "$RELEASE_LABEL_TARGET" \
+        '{isDraft: $draft, targetCommitish: $target}')"
+    emit_json "$RELEASE_JSON"
+    exit 0
+fi
+
+if [[ "$ARGS" == api*"commits/$COMMIT_SHA/pulls"* ]]; then
+    printf 'candidates\n' >> "$RELEASE_LABEL_ACTIONS"
+    CURRENT_LABELS="$(labels_json | jq '.labels')"
+    CANDIDATES="$(jq --argjson labels "$CURRENT_LABELS" \
+        'map(if .number == 101 then .labels = $labels else . end)' \
+        "$RELEASE_LABEL_CANDIDATES")"
+    emit_json "$CANDIDATES"
+    exit 0
+fi
+
+if [[ ("$ARGS" == *"--method POST"* || "$ARGS" == *"-X POST"*) && \
+      "$ARGS" == *"repos/$GITHUB_REPOSITORY/labels"* && \
+      "$ARGS" != *"/issues/"* ]]; then
+    printf 'create-label\n' >> "$RELEASE_LABEL_ACTIONS"
+    [[ "$ARGS" == *"name=autorelease: published"* ]] || exit 95
+    [[ "$ARGS" == *"color=0e8a16"* ]] || exit 96
+    [[ "$ARGS" == *"description=Release has been published"* ]] || exit 97
+    if [[ "$RELEASE_LABEL_CREATE_RACE" == true ]]; then
+        grep -Fxq 'autorelease: published' "$RELEASE_REPOSITORY_LABELS" || \
+            printf 'autorelease: published\n' >> "$RELEASE_REPOSITORY_LABELS"
+        exit 101
+    fi
+    grep -Fxq 'autorelease: published' "$RELEASE_REPOSITORY_LABELS" || \
+        printf 'autorelease: published\n' >> "$RELEASE_REPOSITORY_LABELS"
+    jq -n '{name: "autorelease: published", color: "0e8a16", description: "Release has been published"}'
+    exit 0
+fi
+
+if [[ "$ARGS" == api*"repos/$GITHUB_REPOSITORY/labels"* && \
+      "$ARGS" != *"/issues/"* ]]; then
+    printf 'repository-label\n' >> "$RELEASE_LABEL_ACTIONS"
+    if [[ "$ARGS" == *"/labels/"*published* ]]; then
+        grep -Fxq 'autorelease: published' "$RELEASE_REPOSITORY_LABELS" || exit 98
+        emit_json '{"name":"autorelease: published","color":"0e8a16","description":"Release has been published"}'
+    else
+        emit_json "$(repository_labels_json)"
+    fi
+    exit 0
+fi
+
+if [[ ("$ARGS" == *"--method DELETE"* || "$ARGS" == *"-X DELETE"* || "$ARGS" == pr\ edit*"--remove-label"*) && "$ARGS" == *pending* ]]; then
+    printf 'delete\n' >> "$RELEASE_LABEL_ACTIONS"
+    [[ "$ARGS" == *"/issues/$RELEASE_LABEL_TARGET_PR/labels"* || "$ARGS" == *"pr edit $RELEASE_LABEL_TARGET_PR"* ]] || exit 91
+    grep -Fxv 'autorelease: pending' "$RELEASE_LABEL_STATE" \
+        > "$RELEASE_LABEL_STATE.next" || true
+    mv "$RELEASE_LABEL_STATE.next" "$RELEASE_LABEL_STATE"
+    exit 0
+fi
+
+if [[ ("$ARGS" == *"--method POST"* || "$ARGS" == *"-X POST"* || "$ARGS" == pr\ edit*"--add-label"*) && "$ARGS" == *"/labels"* ]]; then
+    printf 'add\n' >> "$RELEASE_LABEL_ACTIONS"
+    [[ "$ARGS" == *"/issues/$RELEASE_LABEL_TARGET_PR/labels"* || "$ARGS" == *"pr edit $RELEASE_LABEL_TARGET_PR"* ]] || exit 92
+    [[ "$ARGS" == *"labels[]=autorelease: published"* ]] || exit 99
+    grep -Fxq 'autorelease: published' "$RELEASE_REPOSITORY_LABELS" || exit 100
+    [[ "$RELEASE_LABEL_ADD_FAILURE" != true ]] || exit 93
+    grep -Fxq 'autorelease: published' "$RELEASE_LABEL_STATE" || \
+        printf 'autorelease: published\n' >> "$RELEASE_LABEL_STATE"
+    labels_json
+    exit 0
+fi
+
+if [[ "$ARGS" == api*"/issues/$RELEASE_LABEL_TARGET_PR"* || \
+      "$ARGS" == api*"/pulls/$RELEASE_LABEL_TARGET_PR"* || \
+      "$ARGS" == pr\ view\ "$RELEASE_LABEL_TARGET_PR"* ]]; then
+    printf 'labels\n' >> "$RELEASE_LABEL_ACTIONS"
+    emit_json "$(labels_json)"
+    exit 0
+fi
+
+printf 'unexpected gh call: %s\n' "$ARGS" >&2
+exit 94
+FAKE_GH
+    printf '%s\n' "$fake_gh" > "$RELEASE_LABEL_FAKE_BIN/gh"
+    chmod +x "$RELEASE_LABEL_FAKE_BIN/gh"
+}
+
+run_release_label_script() {
+    : > "$STDOUT_FILE"
+    : > "$STDERR_FILE"
+    env -i \
+        PATH="$RELEASE_LABEL_FAKE_BIN:$PATH" \
+        HOME="${HOME:-/tmp}" \
+        GH_TOKEN=test-token \
+        GITHUB_REPOSITORY=test/repo \
+        RELEASE_TAG=v1.2.3 \
+        COMMIT_SHA="$RELEASE_LABEL_COMMIT_SHA" \
+        RELEASE_LABEL_ACTIONS="$RELEASE_LABEL_ACTIONS" \
+        RELEASE_LABEL_STATE="$RELEASE_LABEL_STATE" \
+        RELEASE_REPOSITORY_LABELS="$RELEASE_REPOSITORY_LABELS" \
+        RELEASE_LABEL_CANDIDATES="$RELEASE_LABEL_CANDIDATES" \
+        RELEASE_LABEL_DRAFT="${RELEASE_LABEL_DRAFT:-false}" \
+        RELEASE_LABEL_TARGET="${RELEASE_LABEL_TARGET:-$RELEASE_LABEL_COMMIT_SHA}" \
+        RELEASE_LABEL_TARGET_PR=101 \
+        RELEASE_LABEL_ADD_FAILURE="${RELEASE_LABEL_ADD_FAILURE:-false}" \
+        RELEASE_LABEL_CREATE_RACE="${RELEASE_LABEL_CREATE_RACE:-false}" \
+        bash "$RELEASE_LABEL_SCRIPT" > "$STDOUT_FILE" 2> "$STDERR_FILE"
+    LAST_STATUS=$?
+}
+
+assert_release_label_queries() {
+    grep -Fxq release "$RELEASE_LABEL_ACTIONS" || \
+        { fail 'release finalization did not verify the published release'; return; }
+    grep -Fxq candidates "$RELEASE_LABEL_ACTIONS" || \
+        { fail 'release finalization did not query PRs for the exact commit'; return; }
+    local candidate_reads
+    candidate_reads="$(grep -Fxc candidates "$RELEASE_LABEL_ACTIONS")"
+    if ! grep -Fxq labels "$RELEASE_LABEL_ACTIONS" && [[ "$candidate_reads" -lt 2 ]]; then
+        fail 'release finalization did not re-fetch final labels'
+    fi
+}
+
+assert_no_label_mutations() {
+    if grep -Eq '^(create-label|add|delete)$' "$RELEASE_LABEL_ACTIONS"; then
+        sed 's/^/    action: /' "$RELEASE_LABEL_ACTIONS" >&2
+        fail 'release finalization mutated labels unexpectedly'
+    fi
+}
+
+assert_label_mutations() {
+    local expected="$1"
+    local actual
+    actual="$(grep -E '^(create-label|add|delete)$' "$RELEASE_LABEL_ACTIONS" || true)"
+    if [[ "$actual" != "$expected" ]]; then
+        sed 's/^/    action: /' "$RELEASE_LABEL_ACTIONS" >&2
+        fail 'release label mutations did not match the required order'
+    fi
+}
+
+assert_repository_labels() {
+    local expected
+    local actual
+    expected="$(printf '%s\n' "$@" | sort)"
+    actual="$(sort "$RELEASE_REPOSITORY_LABELS")"
+    if [[ "$actual" != "$expected" ]]; then
+        sed 's/^/    repository label: /' "$RELEASE_REPOSITORY_LABELS" >&2
+        fail 'repository labels do not match the expected final state'
+    fi
+}
+
+assert_release_labels() {
+    local expected
+    local actual
+    expected="$(printf '%s\n' "$@" | sort)"
+    actual="$(sort "$RELEASE_LABEL_STATE")"
+    if [[ "$actual" != "$expected" ]]; then
+        sed 's/^/    label: /' "$RELEASE_LABEL_STATE" >&2
+        fail 'release PR labels do not match the expected final state'
+    fi
 }
 
 run_source_verification() {
@@ -744,6 +1029,132 @@ test_release_please_calls_release_workflow() {
     fi
 }
 
+test_release_label_job_contract() {
+    local release_please_job
+    local label_job
+    local condition
+    local permissions
+    release_please_job="$(release_please_job_block release-please)"
+    label_job="$(release_please_job_block mark-release-pr-published)"
+    [[ -n "$label_job" ]] || { fail 'missing mark-release-pr-published caller job'; return; }
+
+    grep -Fq 'release_tag: ${{ steps.merged-release.outputs.tag }}' <<< "$release_please_job" || \
+        { fail 'release-please must expose the detected release tag'; return; }
+    grep -Eq '^    needs: \[release-please, release\]$' <<< "$label_job" || \
+        { fail 'label finalization must wait for release-please and release'; return; }
+    condition="$(grep -m1 '^    if:' <<< "$label_job")"
+    grep -Fq "needs.release-please.outputs.release_created == 'true'" <<< "$condition" || \
+        { fail 'label finalization must require a detected release'; return; }
+    grep -Fq "needs.release.result == 'success'" <<< "$condition" || \
+        { fail 'label finalization must require successful publication'; return; }
+    permissions="$(awk '
+        /^    permissions:$/ { active=1 }
+        active && /^    [A-Za-z0-9_-]+:/ && $0 != "    permissions:" { exit }
+        active { print }
+    ' <<< "$label_job")"
+    [[ "$permissions" == $'    permissions:\n      contents: read\n      pull-requests: write' ]] || \
+        { fail 'label finalization permissions must be contents read and pull requests write'; return; }
+    grep -Fq 'RELEASE_TAG: ${{ needs.release-please.outputs.release_tag }}' <<< "$label_job" || \
+        { fail 'label finalization must consume the detected tag'; return; }
+    grep -Fq 'COMMIT_SHA: ${{ github.sha }}' <<< "$label_job" || \
+        { fail 'label finalization must consume the exact release commit'; return; }
+    grep -Fq 'GH_TOKEN: ${{ github.token }}' <<< "$label_job" || \
+        { fail 'label finalization must use the caller job token'; return; }
+    grep -Fq -- '- name: Mark release PR published' <<< "$label_job" || \
+        fail 'label finalization must expose an executable contract step'
+}
+
+test_release_label_happy_path_selects_exact_pr() {
+    extract_release_label_script
+    reset_release_label_fixture one 'autorelease: pending' 'keep-me'
+    run_release_label_script
+    assert_success || return
+    assert_release_label_queries || return
+    assert_label_mutations $'add\ndelete' || return
+    assert_release_labels 'autorelease: published' 'keep-me'
+}
+
+test_release_label_creates_missing_repository_label() {
+    extract_release_label_script
+    reset_release_label_fixture one 'autorelease: pending' 'keep-me'
+    : > "$RELEASE_REPOSITORY_LABELS"
+    run_release_label_script
+    assert_success || return
+    assert_release_label_queries || return
+    assert_label_mutations $'create-label\nadd\ndelete' || return
+    assert_repository_labels 'autorelease: published' || return
+    assert_release_labels 'autorelease: published' 'keep-me'
+}
+
+test_release_label_recovers_from_concurrent_repository_label_create() {
+    extract_release_label_script
+    reset_release_label_fixture one 'autorelease: pending' 'keep-me'
+    : > "$RELEASE_REPOSITORY_LABELS"
+    RELEASE_LABEL_CREATE_RACE=true run_release_label_script
+    assert_success || return
+    assert_release_label_queries || return
+    assert_label_mutations $'create-label\nadd\ndelete' || return
+    assert_repository_labels 'autorelease: published' || return
+    assert_release_labels 'autorelease: published' 'keep-me'
+}
+
+test_release_label_rejects_draft_or_wrong_target() {
+    local scenario
+    extract_release_label_script
+    for scenario in draft wrong-target; do
+        reset_release_label_fixture one 'autorelease: pending' 'keep-me'
+        case "$scenario" in
+            draft) RELEASE_LABEL_DRAFT=true run_release_label_script ;;
+            wrong-target) RELEASE_LABEL_TARGET="$RELEASE_LABEL_OTHER_SHA" run_release_label_script ;;
+        esac
+        assert_failure || return
+        assert_no_label_mutations || return
+        assert_release_labels 'autorelease: pending' 'keep-me' || return
+    done
+}
+
+test_release_label_requires_exactly_one_candidate() {
+    local candidates
+    extract_release_label_script
+    for candidates in zero two; do
+        reset_release_label_fixture "$candidates" 'autorelease: pending' 'keep-me'
+        run_release_label_script
+        assert_failure || return
+        assert_no_label_mutations || return
+        assert_release_labels 'autorelease: pending' 'keep-me' || return
+    done
+}
+
+test_release_label_is_idempotent_when_already_published() {
+    extract_release_label_script
+    reset_release_label_fixture one 'autorelease: published' 'keep-me'
+    run_release_label_script
+    assert_success || return
+    assert_release_label_queries || return
+    assert_no_label_mutations || return
+    assert_release_labels 'autorelease: published' 'keep-me'
+}
+
+test_release_label_removes_only_pending_when_both_exist() {
+    extract_release_label_script
+    reset_release_label_fixture one \
+        'autorelease: pending' 'autorelease: published' 'keep-me'
+    run_release_label_script
+    assert_success || return
+    assert_release_label_queries || return
+    assert_label_mutations delete || return
+    assert_release_labels 'autorelease: published' 'keep-me'
+}
+
+test_release_label_add_failure_preserves_pending() {
+    extract_release_label_script
+    reset_release_label_fixture one 'autorelease: pending' 'keep-me'
+    RELEASE_LABEL_ADD_FAILURE=true run_release_label_script
+    assert_failure || return
+    assert_label_mutations add || return
+    assert_release_labels 'autorelease: pending' 'keep-me'
+}
+
 test_release_reads_trusted_dispatch_context() {
     local source_job
     local contract_step
@@ -1001,6 +1412,15 @@ run_test 'release workflow validates artifacts before publication' test_release_
 run_test 'release is callable only as a reusable workflow' test_release_is_reusable_workflow_only
 run_test 'production releases share one non-canceling concurrency group' test_release_runs_share_one_concurrency_group
 run_test 'Release Please calls the reusable release workflow' test_release_please_calls_release_workflow
+run_test 'release label finalization has restricted caller job wiring' test_release_label_job_contract
+run_test 'release label finalization selects the exact merged PR' test_release_label_happy_path_selects_exact_pr
+run_test 'release label finalization creates a missing published repository label' test_release_label_creates_missing_repository_label
+run_test 'release label finalization recovers from concurrent repository label creation' test_release_label_recovers_from_concurrent_repository_label_create
+run_test 'release label finalization rejects draft or wrong-target releases' test_release_label_rejects_draft_or_wrong_target
+run_test 'release label finalization requires exactly one matching PR' test_release_label_requires_exactly_one_candidate
+run_test 'release label finalization is idempotent once published' test_release_label_is_idempotent_when_already_published
+run_test 'release label finalization removes only a stale pending label' test_release_label_removes_only_pending_when_both_exist
+run_test 'release label finalization preserves pending when publication labeling fails' test_release_label_add_failure_preserves_pending
 run_test 'release reads only trusted dispatch context' test_release_reads_trusted_dispatch_context
 run_test 'destination checks precede upload and publication' test_destination_checks_precede_upload_and_publish
 run_test 'artifact validation precedes both publication phases' test_artifact_validation_precedes_both_publication_steps
