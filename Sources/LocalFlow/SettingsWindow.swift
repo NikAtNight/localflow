@@ -401,6 +401,7 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var paneSwitcher: some View {
+        #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             GlassEffectContainer(spacing: 4) {
                 HStack(spacing: 4) {
@@ -423,21 +424,28 @@ struct SettingsView: View {
                 )
             }
         } else {
-            HStack(spacing: 4) {
-                ForEach(SettingsPane.allCases) { pane in
-                    paneButton(for: pane)
-                        .background(
-                            pane == selectedPane ? Color.accentColor.opacity(0.14) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        )
-                }
-            }
-            .padding(5)
-            .background(
-                .ultraThinMaterial,
-                in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-            )
+            fallbackPaneSwitcher
         }
+        #else
+        fallbackPaneSwitcher
+        #endif
+    }
+
+    private var fallbackPaneSwitcher: some View {
+        HStack(spacing: 4) {
+            ForEach(SettingsPane.allCases) { pane in
+                paneButton(for: pane)
+                    .background(
+                        pane == selectedPane ? Color.accentColor.opacity(0.14) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    )
+            }
+        }
+        .padding(5)
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+        )
     }
 
     private func paneButton(for pane: SettingsPane) -> some View {
