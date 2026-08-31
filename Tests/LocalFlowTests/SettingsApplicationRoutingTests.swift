@@ -51,7 +51,10 @@ final class SettingsApplicationRoutingTests: XCTestCase {
 
         XCTAssertEqual(model.hotkey, .rightCommand)
         XCTAssertEqual(application.values.hotkey, .rightCommand)
-        XCTAssertEqual(system.events, [.hotkey(.rightCommand)])
+        XCTAssertEqual(system.events, [
+            .hotkey(.rightCommand),
+            .commandHotkey(.rightOption),
+        ])
     }
 
     private func makeDefaults() -> UserDefaults {
