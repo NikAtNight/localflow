@@ -287,9 +287,10 @@ Mac. Needs Apple Intelligence enabled, and a different key from dictation.
 ## App-aware style
 
 The cleanup pass adapts to whatever app you're dictating into: full
-sentences and punctuation in Mail, short and casual in Slack or Messages,
-and identifier-safe in editors and terminals (no "correcting" camelCase or
-file paths into prose). Unknown apps get ordinary written punctuation.
+sentences and punctuation in Mail, short and casual in Slack or Messages.
+Code editors and terminals bypass S1-mini because its trained controls cannot
+guarantee preservation of identifiers, symbols, paths, or casing. Unknown apps
+get ordinary written punctuation.
 
 ## Snippets
 

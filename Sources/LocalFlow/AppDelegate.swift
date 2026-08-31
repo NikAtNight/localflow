@@ -641,16 +641,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return
                 }
 
-                // Learned corrections first, then spoken formatting commands
-                // ("bullet point", "thumbs up emoji") become real formatting,
-                // then snippet expansions go in verbatim; cleanup sees the
-                // finished text and is told to preserve it.
-                var text = Snippets.expand(
-                    VoiceFormatter.apply(TranscriptCorrections.apply(raw, corrections: corrections)),
-                    snippets: snippets
-                )
-                if cleanupWanted {
-                    text = await cleanTranscript(text, ollamaModel: ollamaModel, profile: styleProfile)
+                // S1-mini is trained to receive the raw ASR transcript. Run
+                // it before deterministic corrections, voice commands, and
+                // snippets so those exact user-owned replacements cannot be
+                // rewritten by the model. Code destinations bypass S1-mini:
+                // it has no trained control that preserves identifiers and paths.
+                var text = raw
+                if cleanupWanted && S1MiniCleanup.shouldClean(profile: styleProfile) {
+                    text = await cleanTranscript(raw, ollamaModel: ollamaModel, profile: styleProfile)
                     // S1-mini intentionally returns an empty string for
                     // filler-only or noise-only input. That is a successful
                     // normalization, but there is nothing to paste or save.
@@ -662,6 +660,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         return
                     }
                 }
+                text = Snippets.expand(
+                    VoiceFormatter.apply(TranscriptCorrections.apply(text, corrections: corrections)),
+                    snippets: snippets
+                )
 
                 // Keep the transcript reachable even if the paste goes
                 // wrong — "Recent Dictations" in the menu and the settings

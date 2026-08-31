@@ -50,6 +50,12 @@ enum TranscriptCleanup {
 enum S1MiniCleanup {
     static let systemPrompt = "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text."
 
+    /// S1-mini has no trained code context and can damage identifiers, paths,
+    /// symbols, and casing. Keep the raw ASR output for code destinations.
+    static func shouldClean(profile: AppStyleProfile) -> Bool {
+        profile != .code
+    }
+
     static func controlLine(for profile: AppStyleProfile) -> String {
         let styling: String
         let structure: String

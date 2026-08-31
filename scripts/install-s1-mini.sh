@@ -16,10 +16,13 @@ fi
 
 mkdir -p "$MODEL_DIR"
 if [[ ! -f "$GGUF" ]] || ! printf '%s  %s\n' "$MODEL_SHA256" "$GGUF" | shasum -a 256 -c - >/dev/null 2>&1; then
+    DOWNLOAD="$(mktemp "$MODEL_DIR/.s1-mini.XXXXXX")"
+    trap 'rm -f "${DOWNLOAD:-}"' EXIT INT TERM
     printf '%s\n' "Downloading S1-mini by Superwhisper (Q4_K_M, 462 MiB)..."
-    curl --fail --location --progress-bar "$MODEL_URL" --output "$GGUF.tmp"
-    printf '%s  %s\n' "$MODEL_SHA256" "$GGUF.tmp" | shasum -a 256 -c -
-    mv "$GGUF.tmp" "$GGUF"
+    curl --fail --location --proto '=https' --proto-redir '=https' --progress-bar "$MODEL_URL" --output "$DOWNLOAD"
+    printf '%s  %s\n' "$MODEL_SHA256" "$DOWNLOAD" | shasum -a 256 -c -
+    mv "$DOWNLOAD" "$GGUF"
+    trap - EXIT INT TERM
 fi
 
 {

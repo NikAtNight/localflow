@@ -6,6 +6,11 @@ final class S1MiniCleanerTests: XCTestCase {
         XCTAssertEqual(Settings.cleanupModel, "s1-mini")
     }
 
+    func testCodeDestinationsBypassS1Mini() {
+        XCTAssertFalse(S1MiniCleanup.shouldClean(profile: .code))
+        XCTAssertTrue(S1MiniCleanup.shouldClean(profile: .general))
+    }
+
     func testUsesExactRequiredSystemPrompt() {
         XCTAssertEqual(
             S1MiniCleanup.systemPrompt,
@@ -34,14 +39,10 @@ final class S1MiniCleanerTests: XCTestCase {
         )
     }
 
-    func testGeneralAndCodeUseConservativeSemiFormalControls() {
+    func testGeneralUsesSemiFormalListCapableControls() {
         XCTAssertEqual(
             S1MiniCleanup.controlLine(for: .general),
             "[Styling: semi-formal] [Structure: lists] [Context: general]"
-        )
-        XCTAssertEqual(
-            S1MiniCleanup.controlLine(for: .code),
-            "[Styling: semi-formal] [Structure: prose] [Context: general]"
         )
     }
 
