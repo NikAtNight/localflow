@@ -19,7 +19,7 @@ jobs:
       # Keeps an open "chore: release X.Y.Z" PR that accumulates changes on
       # main. This workflow deliberately leaves tagging and publication to the
       # artifact workflow so an incomplete release is never public.
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         id: release
         with:
           config-file: .github/release-please-config.json
