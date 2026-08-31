@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.merged-release.outputs.created }}
+      release_tag: ${{ steps.merged-release.outputs.tag }}
     permissions:
       contents: write # maintain the release PR branch and changelog commit
       pull-requests: write # maintain the release PR
@@ -167,3 +168,112 @@ jobs:
       attestations: write
     uses: ./.github/workflows/release.yml
     secrets: inherit
+
+  mark-release-pr-published:
+    name: Mark release PR published
+    needs: [release-please, release]
+    if: needs.release-please.outputs.release_created == 'true' && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Mark release PR published
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.release_tag }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          PENDING_LABEL='autorelease: pending'
+          PUBLISHED_LABEL='autorelease: published'
+
+          RELEASE="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft,targetCommitish)"
+          if [[ "$(jq -r '.isDraft' <<< "$RELEASE")" != false ]]; then
+            echo "error: release $RELEASE_TAG is not public" >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.targetCommitish' <<< "$RELEASE")" != "$COMMIT_SHA" ]]; then
+            echo "error: release $RELEASE_TAG does not target $COMMIT_SHA" >&2
+            exit 1
+          fi
+
+          PULLS="$(gh \
+            api --paginate \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/commits/$COMMIT_SHA/pulls" \
+            | jq -s 'add // []')"
+          CANDIDATES="$(jq \
+            --arg sha "$COMMIT_SHA" \
+            --arg pending "$PENDING_LABEL" \
+            --arg published "$PUBLISHED_LABEL" \
+            '[.[] | select(
+              .state == "closed" and
+              .merged_at != null and
+              .merge_commit_sha == $sha and
+              .base.ref == "main" and
+              any(.labels[]?; .name == $pending or .name == $published)
+            )]' <<< "$PULLS")"
+          CANDIDATE_COUNT="$(jq 'length' <<< "$CANDIDATES")"
+          if [[ "$CANDIDATE_COUNT" -ne 1 ]]; then
+            echo "error: expected one release PR for $COMMIT_SHA, found $CANDIDATE_COUNT" >&2
+            exit 1
+          fi
+
+          PR_NUMBER="$(jq -er '.[0].number' <<< "$CANDIDATES")"
+          HAS_PENDING="$(jq -r --arg label "$PENDING_LABEL" \
+            'any(.[0].labels[]?; .name == $label)' <<< "$CANDIDATES")"
+          HAS_PUBLISHED="$(jq -r --arg label "$PUBLISHED_LABEL" \
+            'any(.[0].labels[]?; .name == $label)' <<< "$CANDIDATES")"
+
+          if [[ "$HAS_PUBLISHED" != true ]]; then
+            if ! gh \
+              api "repos/$GITHUB_REPOSITORY/labels/autorelease%3A%20published" \
+              >/dev/null 2>&1
+            then
+              if ! gh \
+                api --method POST \
+                "repos/$GITHUB_REPOSITORY/labels" \
+                -f "name=$PUBLISHED_LABEL" \
+                -f 'color=0e8a16' \
+                -f 'description=Release has been published' \
+                >/dev/null 2>&1
+              then
+                echo "Repository label creation failed; checking for a concurrent create." >&2
+              fi
+              if ! gh \
+                api "repos/$GITHUB_REPOSITORY/labels/autorelease%3A%20published" \
+                >/dev/null 2>&1
+              then
+                echo "error: repository label $PUBLISHED_LABEL is unavailable" >&2
+                exit 1
+              fi
+            fi
+            gh \
+              api --method POST \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" \
+              -f "labels[]=$PUBLISHED_LABEL" >/dev/null
+          fi
+          if [[ "$HAS_PENDING" == true ]]; then
+            gh \
+              api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels/autorelease%3A%20pending" \
+              >/dev/null
+          fi
+
+          FINAL_PR="$(gh \
+            api \
+            "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER")"
+          if ! jq -e \
+            --arg pending "$PENDING_LABEL" \
+            --arg published "$PUBLISHED_LABEL" \
+            '([.labels[].name] | index($published)) != null and
+             ([.labels[].name] | index($pending)) == null' \
+            <<< "$FINAL_PR" >/dev/null
+          then
+            echo "error: release PR #$PR_NUMBER labels did not reach published state" >&2
+            exit 1
+          fi
