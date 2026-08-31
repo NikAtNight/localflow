@@ -125,6 +125,65 @@ final class LocalTextModelPolicyFailureAndPrewarmTests: XCTestCase {
         XCTAssertEqual(apple.prewarmCallCount, 2)
         XCTAssertTrue(ollama.prewarmModels.isEmpty)
     }
+
+    func testApplePrewarmUsesOneCooldownForDictationAndCommandModels() async {
+        let clock = PolicyTestClock(now: Date(timeIntervalSinceReferenceDate: 0))
+        let apple = PolicyAppleBackendSpy(isAvailable: true)
+        let ollama = PolicyOllamaBackendSpy()
+        let policy = LocalTextModelPolicy(
+            apple: apple,
+            ollama: ollama,
+            now: { clock.now },
+            prewarmCooldown: 60
+        )
+
+        await policy.prewarm(model: "s1-mini")
+        clock.now = Date(timeIntervalSinceReferenceDate: 1)
+        await policy.prewarm(model: "gemma3:4b")
+
+        XCTAssertEqual(apple.prewarmCallCount, 1)
+        XCTAssertTrue(ollama.prewarmModels.isEmpty)
+    }
+
+    func testOllamaPrewarmIsNotSuppressedByAnEarlierApplePrewarmForTheSameModel() async {
+        let clock = PolicyTestClock(now: Date(timeIntervalSinceReferenceDate: 0))
+        let apple = PolicyAppleBackendSpy(isAvailable: true)
+        let ollama = PolicyOllamaBackendSpy()
+        let policy = LocalTextModelPolicy(
+            apple: apple,
+            ollama: ollama,
+            now: { clock.now },
+            prewarmCooldown: 60
+        )
+
+        await policy.prewarm(model: "s1-mini")
+        apple.isAvailable = false
+        clock.now = Date(timeIntervalSinceReferenceDate: 1)
+        await policy.prewarm(model: "s1-mini")
+
+        XCTAssertEqual(apple.prewarmCallCount, 1)
+        XCTAssertEqual(ollama.prewarmModels, ["s1-mini"])
+    }
+
+    func testApplePrewarmIsNotSuppressedByAnEarlierOllamaPrewarmForTheSameModel() async {
+        let clock = PolicyTestClock(now: Date(timeIntervalSinceReferenceDate: 0))
+        let apple = PolicyAppleBackendSpy(isAvailable: false)
+        let ollama = PolicyOllamaBackendSpy()
+        let policy = LocalTextModelPolicy(
+            apple: apple,
+            ollama: ollama,
+            now: { clock.now },
+            prewarmCooldown: 60
+        )
+
+        await policy.prewarm(model: "s1-mini")
+        apple.isAvailable = true
+        clock.now = Date(timeIntervalSinceReferenceDate: 1)
+        await policy.prewarm(model: "s1-mini")
+
+        XCTAssertEqual(ollama.prewarmModels, ["s1-mini"])
+        XCTAssertEqual(apple.prewarmCallCount, 1)
+    }
 }
 
 @MainActor
