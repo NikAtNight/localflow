@@ -94,3 +94,44 @@ final class VoicedAudioTests: XCTestCase {
         XCTAssertEqual(AudioRecorder.trimmingSilence(speech).count, speech.count)
     }
 }
+
+final class IncrementalCutPointTests: XCTestCase {
+    private let rate = Int(AudioRecorder.sampleRate)
+
+    private func constant(_ amplitude: Float, seconds: Double) -> [Float] {
+        [Float](repeating: amplitude, count: Int(seconds * Double(rate)))
+    }
+
+    func testFindsCutInsideSustainedMiddleSilence() {
+        let speechBefore = constant(0.2, seconds: 3)
+        let silence = constant(0, seconds: 0.75)
+        let speechAfter = constant(0.2, seconds: 3)
+        let samples = speechBefore + silence + speechAfter
+
+        guard let cut = AudioRecorder.incrementalCutPoint(in: samples, after: 0) else {
+            return XCTFail("Expected a cut in the middle silence")
+        }
+
+        XCTAssertGreaterThanOrEqual(cut, speechBefore.count)
+        XCTAssertLessThanOrEqual(cut, speechBefore.count + silence.count)
+        XCTAssertEqual(
+            AudioRecorder.incrementalPauseSeconds(in: samples, around: cut),
+            0.75,
+            accuracy: 0.03
+        )
+    }
+
+    func testContinuousSpeechHasNoSafeCut() {
+        let samples = constant(0.2, seconds: 8)
+
+        XCTAssertNil(AudioRecorder.incrementalCutPoint(in: samples, after: 0))
+    }
+
+    func testSilenceInsideTrailingGuardIsNotUsed() {
+        let samples = constant(0.2, seconds: 3)
+            + constant(0, seconds: 0.75)
+            + constant(0.2, seconds: 0.5)
+
+        XCTAssertNil(AudioRecorder.incrementalCutPoint(in: samples, after: 0))
+    }
+}

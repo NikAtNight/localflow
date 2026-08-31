@@ -5,9 +5,9 @@ import AppKit
 /// Every listening-HUD design the user can pick from the menu bar. Each is a
 /// self-contained Core Graphics renderer driven by the live mic level and a
 /// coarse 12-band spectrum; the overlay panel adapts its size and chrome
-/// (frosted capsule vs. borderless) to the theme.
+/// (system glass, frosted capsule, or borderless) to the theme.
 enum HudTheme: String, CaseIterable {
-    case classic, typeset, aurora, bolide, mercury, ticker
+    case classic, typeset, aurora, bolide, mercury, liquidGlass, ticker
     case constellation, loom, vapor, sonar, shorthand
     case prism, murmuration, filament, bloom, pianola
 
@@ -22,6 +22,7 @@ enum HudTheme: String, CaseIterable {
         case .aurora: return "Aurora — spectrogram"
         case .bolide: return "Bolide — comet"
         case .mercury: return "Mercury — liquid metal"
+        case .liquidGlass: return "Liquid Glass — intelligence wave"
         case .ticker: return "Ticker — chart recorder"
         case .constellation: return "Constellation — star chart"
         case .loom: return "Loom — woven thread"
@@ -43,6 +44,7 @@ enum HudTheme: String, CaseIterable {
         case .aurora: return NSSize(width: 320, height: 64)
         case .bolide: return NSSize(width: 430, height: 88)
         case .mercury: return NSSize(width: 300, height: 62)
+        case .liquidGlass: return NSSize(width: 324, height: 62)
         case .ticker: return NSSize(width: 330, height: 58)
         case .constellation: return NSSize(width: 340, height: 64)
         case .loom: return NSSize(width: 320, height: 60)
@@ -72,6 +74,7 @@ enum HudTheme: String, CaseIterable {
         case .aurora: return AuroraRenderer()
         case .bolide: return BolideRenderer()
         case .mercury: return MercuryRenderer()
+        case .liquidGlass: return LiquidGlassRenderer()
         case .ticker: return TickerRenderer()
         case .constellation: return ConstellationRenderer()
         case .loom: return LoomRenderer()
@@ -712,6 +715,194 @@ final class MercuryRenderer: HudRenderer {
             ctx.strokePath()
         }
         ctx.restoreGState()
+    }
+}
+
+// MARK: - Liquid Glass (Apple Intelligence ribbons held in glass)
+
+final class LiquidGlassRenderer: HudRenderer {
+    private static let layerCount = 3
+    private static let barCount = 56
+    private static let stateCount = layerCount * barCount
+    private static let gradientLocations = (0..<8).map { CGFloat($0) / 7 }
+    // Per-layer variation: relative amplitude, wave speed, and phase offset,
+    // so the three hue lines share one motion language without ever moving
+    // in lockstep.
+    private static let layerScales: [CGFloat] = [1.0, 0.66, 0.42]
+    private static let layerSpeeds: [CGFloat] = [1.0, 1.34, 0.78]
+
+    // Half-heights of the symmetric bars, one spring per bar per layer.
+    private var heights = [CGFloat](repeating: 0, count: stateCount)
+    private var velocities = [CGFloat](repeating: 0, count: stateCount)
+    private var smoothedBands = [CGFloat](repeating: 0, count: 12)
+    private var smoothedLevel: CGFloat = 0
+    private var smoothedCentroid: CGFloat = 0.5
+    private var motionPhase: CGFloat = 0
+    private var gradientPhase: CGFloat = 0
+    private var kick: CGFloat = 0
+    private var voice = VoiceFeatures()
+    private let intelligence = HudRamp([
+        (0.00, "#0A84FF"),
+        (0.25, "#BF5AF2"),
+        (0.50, "#FF375F"),
+        (0.75, "#FF9F0A"),
+        (1.00, "#0A84FF"),
+    ])
+    private let coolTint = HudColor("#4A8FFF")
+    private let warmTint = HudColor("#FF6841")
+
+    func reset() {
+        heights = [CGFloat](repeating: 0, count: Self.stateCount)
+        velocities = [CGFloat](repeating: 0, count: Self.stateCount)
+        smoothedBands = [CGFloat](repeating: 0, count: 12)
+        smoothedLevel = 0
+        smoothedCentroid = 0.5
+        motionPhase = 0
+        gradientPhase = 0
+        kick = 0
+        voice.reset()
+    }
+
+    func render(in ctx: CGContext, bounds: CGRect, t: CGFloat, dt: CGFloat,
+                level: CGFloat, spectrum: [CGFloat]) {
+        voice.update(t: t, dt: dt, level: level, spectrum: spectrum)
+        let frameTime = min(1.0 / 20.0, max(0, dt))
+        // Attack much faster than release: a syllable should hit within a
+        // frame or two, then ebb smoothly.
+        let levelRate: CGFloat = level > smoothedLevel ? 19 : 5.5
+        smoothedLevel += (level - smoothedLevel) * (1 - exp(-levelRate * frameTime))
+        smoothedCentroid += (voice.centroid - smoothedCentroid)
+            * (1 - exp(-3.2 * frameTime))
+        // Fast enough that groups of bars visibly travel and swap heights;
+        // the ribbon version's slow phase read as pulsing glow instead.
+        motionPhase += frameTime * (2.8 + smoothedLevel * 3.4)
+        gradientPhase = (gradientPhase + frameTime * 0.022)
+            .truncatingRemainder(dividingBy: 1)
+
+        // A syllable is a burst of extra travel, not a flash of light.
+        if voice.onset { kick = max(kick, 0.55 + voice.onsetStrength * 0.45) }
+        kick *= pow(0.04, frameTime / 0.25)
+
+        if !spectrum.isEmpty {
+            for band in 0..<min(smoothedBands.count, spectrum.count) {
+                let rate: CGFloat = spectrum[band] > smoothedBands[band] ? 24 : 7
+                smoothedBands[band] += (spectrum[band] - smoothedBands[band])
+                    * (1 - exp(-rate * frameTime))
+            }
+        }
+
+        let height = bounds.height
+        let stub = height * 0.030          // resting dot line, like a tape's silent tail
+        let idleAmp = height * 0.05
+        let voiceAmp = height * 0.40
+        let maxHalf = height * 0.44
+
+        for layer in 0..<Self.layerCount {
+            let layerPhase = CGFloat(layer) * 2.4
+            let speed = Self.layerSpeeds[layer]
+            for bar in 0..<Self.barCount {
+                let u = CGFloat(bar) / CGFloat(Self.barCount - 1)
+                // Voice shape: the 12 bands spread across the strip.
+                let bandPosition = u * CGFloat(smoothedBands.count - 1)
+                let low = Int(bandPosition)
+                let high = min(smoothedBands.count - 1, low + 1)
+                let bandMix = smoothedBands[low]
+                    + (smoothedBands[high] - smoothedBands[low]) * (bandPosition - CGFloat(low))
+                // Two counter-traveling waves: neighbors rise while others
+                // fall, so the strip undulates instead of breathing in unison.
+                let wave = 0.5 + 0.5 * sin(motionPhase * speed + u * 23.0 + layerPhase)
+                let counter = 0.5 + 0.5 * sin(-motionPhase * speed * 0.63 + u * 38.0 + layerPhase * 1.7)
+                let ripple = 0.5 + 0.5 * sin(motionPhase * speed * 1.9 + u * 61.0 - layerPhase)
+                let motion = 0.22 + 0.78 * (wave * 0.48 + counter * 0.32 + ripple * 0.20)
+                let window = pow(sin(.pi * u), 0.55)
+                let idle = idleAmp * (0.55 + 0.45 * sin(motionPhase * 0.5 + u * 6.3 + layerPhase))
+                // Raw `level` rides alongside the smoothed envelope: the
+                // smoothing keeps the strip from strobing, the raw term
+                // makes it jump the instant the voice does.
+                let drive = (smoothedLevel * 1.1 + level * 0.75 + kick * 0.45)
+                    * voiceAmp * (0.35 + 0.65 * bandMix)
+                let target = min(maxHalf,
+                                 stub + Self.layerScales[layer] * window * (idle + drive * motion))
+                let index = layer * Self.barCount + bar
+                velocities[index] += (target - heights[index]) * 150 * frameTime
+                velocities[index] *= exp(-14 * frameTime)
+                heights[index] += velocities[index] * frameTime
+            }
+        }
+
+        let inset = min(bounds.width * 0.08, height * 0.34)
+        let width = bounds.width - inset * 2
+        let barWidth = max(1.2, width / CGFloat(Self.barCount) * 0.42)
+        let pitchBias = smoothedCentroid - 0.5
+
+        // Each layer's gradient starts at a different point in the palette,
+        // so the three lines carry visibly different hues at any x.
+        func gradient(for layer: Int) -> CGGradient? {
+            var colors: [CGColor] = []
+            colors.reserveCapacity(Self.gradientLocations.count)
+            for position in Self.gradientLocations {
+                let palettePosition = (position + gradientPhase + CGFloat(layer) * 0.14)
+                    .truncatingRemainder(dividingBy: 1)
+                var color = intelligence.at(palettePosition)
+                if pitchBias > 0 {
+                    color = HudColor.lerp(color, coolTint, pitchBias * 0.28)
+                } else {
+                    color = HudColor.lerp(color, warmTint, -pitchBias * 0.28)
+                }
+                colors.append(color.cg(1))
+            }
+            return CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                              colors: colors as CFArray,
+                              locations: Self.gradientLocations)
+        }
+
+        func layerPath(_ layer: Int) -> CGPath {
+            let path = CGMutablePath()
+            for bar in 0..<Self.barCount {
+                let u = CGFloat(bar) / CGFloat(Self.barCount - 1)
+                let x = inset + u * width
+                let half = max(stub, heights[layer * Self.barCount + bar])
+                path.move(to: CGPoint(x: x, y: bounds.midY - half))
+                path.addLine(to: CGPoint(x: x, y: bounds.midY + half))
+            }
+            return path
+        }
+
+        func drawPass(_ path: CGPath, gradient: CGGradient?,
+                      width strokeWidth: CGFloat, alpha: CGFloat) {
+            guard alpha > 0.001, let gradient else { return }
+            ctx.saveGState()
+            ctx.setBlendMode(.plusLighter)
+            ctx.setAlpha(alpha)
+            ctx.addPath(path)
+            ctx.setLineWidth(strokeWidth)
+            ctx.setLineCap(.round)
+            ctx.replacePathWithStrokedPath()
+            ctx.clip()
+            ctx.drawLinearGradient(gradient,
+                                   start: CGPoint(x: inset, y: bounds.midY),
+                                   end: CGPoint(x: bounds.maxX - inset, y: bounds.midY),
+                                   options: [.drawsBeforeStartLocation,
+                                             .drawsAfterEndLocation])
+            ctx.restoreGState()
+        }
+
+        let speechPresence = min(1, max(0, (smoothedLevel - 0.025) * 2.8))
+        let thirdPresence = min(1, max(0, (smoothedLevel - 0.10) * 2.6))
+        let presences: [CGFloat] = [1, speechPresence, thirdPresence]
+        for layer in (0..<Self.layerCount).reversed() {
+            let presence = presences[layer]
+            guard presence > 0.001 else { continue }
+            let path = layerPath(layer)
+            let layerGradient = gradient(for: layer)
+            // Soft halo pass, then the bright bar core.
+            drawPass(path, gradient: layerGradient,
+                     width: barWidth * 2.8,
+                     alpha: (0.05 + smoothedLevel * 0.05 + kick * 0.03) * presence)
+            drawPass(path, gradient: layerGradient,
+                     width: barWidth,
+                     alpha: (0.30 + smoothedLevel * 0.26 + kick * 0.10) * presence)
+        }
     }
 }
 

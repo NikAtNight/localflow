@@ -1,5 +1,20 @@
 import Foundation
 
+/// Reasoning effort for command mode's Ollama fallback. Encoded onto the
+/// request's `think` field by OllamaCleaner.
+enum ReasoningLevel: String, CaseIterable {
+    case off, low, medium, high
+
+    var label: String {
+        switch self {
+        case .off: return "Off (fastest)"
+        case .low: return "Low"
+        case .medium: return "Medium"
+        case .high: return "High (slowest)"
+        }
+    }
+}
+
 /// UserDefaults-backed app settings.
 enum Settings {
     // A computed accessor avoids storing Foundation's non-Sendable singleton
@@ -11,6 +26,8 @@ enum Settings {
         static let whisperModel = "whisperModel"
         static let cleanupEnabled = "cleanupEnabled"
         static let ollamaModel = "ollamaModel"
+        static let ollamaCommandModel = "ollamaCommandModel"
+        static let commandReasoning = "commandReasoning"
         static let soundCues = "soundCues"
         static let keepMicWarm = "keepMicWarm"
         static let inputDeviceUID = "inputDeviceUID"
@@ -90,9 +107,30 @@ enum Settings {
         set { defaults.set(newValue, forKey: Key.cleanupEnabled) }
     }
 
+    /// Superwhisper's transcript normalizer, registered by
+    /// scripts/setup-s1-mini.sh. Any other name is treated as a general
+    /// instruct model (e.g. "gemma3:4b").
     static var ollamaModel: String {
-        get { defaults.string(forKey: Key.ollamaModel) ?? "gemma3:4b" }
+        get { defaults.string(forKey: Key.ollamaModel) ?? "s1-mini" }
         set { defaults.set(newValue, forKey: Key.ollamaModel) }
+    }
+
+    /// Command mode needs instruction following, which s1-mini can't do, so
+    /// it has its own model when it falls back to Ollama.
+    static var ollamaCommandModel: String {
+        get { defaults.string(forKey: Key.ollamaCommandModel) ?? "gemma3:4b" }
+        set { defaults.set(newValue, forKey: Key.ollamaCommandModel) }
+    }
+
+    /// How hard the command-mode model thinks before answering. Only
+    /// meaningful for models with a thinking mode (qwen3 toggles it, gpt-oss
+    /// takes a level); models without one (gemma3) ignore it. Cleanup is
+    /// unaffected either way: s1-mini requires thinking off.
+    static var commandReasoning: ReasoningLevel {
+        get {
+            ReasoningLevel(rawValue: defaults.string(forKey: Key.commandReasoning) ?? "") ?? .off
+        }
+        set { defaults.set(newValue.rawValue, forKey: Key.commandReasoning) }
     }
 
     /// Hold-to-edit key for command mode. Must differ from `hotkey`;
@@ -114,7 +152,9 @@ enum Settings {
     }
 
     /// Command mode only runs when it's enabled, its key doesn't collide
-    /// with the dictation key, and the on-device model can actually serve it.
+    /// with the dictation key, and a backend (Apple Intelligence or a
+    /// reachable Ollama server) can actually serve it.
+    @MainActor
     static var commandModeActive: Bool {
         commandModeEnabled && commandHotkey != hotkey && CommandMode.isAvailable
     }

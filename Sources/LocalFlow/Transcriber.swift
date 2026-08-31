@@ -155,9 +155,7 @@ actor Transcriber {
 
     private func currentDecodingOptions() -> DecodingOptions {
         var options = Self.decodingOptions
-        if let vocabularyTokens {
-            options.promptTokens = vocabularyTokens
-        }
+        options.promptTokens = vocabularyTokens
         return options
     }
 
@@ -200,7 +198,10 @@ actor Transcriber {
     /// invents filler for such clips, so canonical hallucination phrases are
     /// treated as an empty transcript. Never applied to normal-energy audio —
     /// people legitimately dictate "thank you".
-    func transcribe(samples: [Float], lowEnergy: Bool = false) async throws -> String {
+    func transcribe(
+        samples: [Float],
+        lowEnergy: Bool = false
+    ) async throws -> String {
         guard whisperKit != nil else { throw TranscriberError.notLoaded }
         await transcriptionGate.acquire()
         // Snapshot pipeline + options together AFTER the gate: a model
@@ -329,6 +330,19 @@ actor Transcriber {
             previousEnd = segment.end
         }
         return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func joinTranscriptParts(
+        _ first: String,
+        _ second: String,
+        pauseSeconds: Double = 0
+    ) -> String {
+        if first.isEmpty { return second }
+        if second.isEmpty { return first }
+        let separator = pauseSeconds >= Double(paragraphPauseSeconds) && endsSentence(first)
+            ? "\n\n"
+            : " "
+        return first + separator + second
     }
 
     private static func endsSentence(_ text: String) -> Bool {

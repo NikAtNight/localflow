@@ -7,8 +7,10 @@ import FoundationModels
 /// selected text is rewritten in place. With nothing selected, the spoken
 /// request is answered inline at the cursor.
 ///
-/// Runs on the same on-device model as transcript cleanup, so the text
-/// being edited never leaves the machine.
+/// Prefers the same on-device model as transcript cleanup, falling back to
+/// a local Ollama instruct model (not s1-mini, which only normalizes), so
+/// the text being edited never leaves the machine either way.
+@MainActor
 enum CommandMode {
     enum CommandError: Error, LocalizedError {
         case unavailable
@@ -16,12 +18,14 @@ enum CommandMode {
         var errorDescription: String? {
             switch self {
             case .unavailable:
-                return "Command mode needs Apple Intelligence. Enable it in System Settings."
+                return "Command mode needs Apple Intelligence or a running Ollama server."
             }
         }
     }
 
-    static var isAvailable: Bool { AppleIntelligenceCleaner.isAvailable }
+    static var isAvailable: Bool {
+        AppleIntelligenceCleaner.isAvailable || OllamaCleaner.lastKnownReachable
+    }
 
     private static let editInstructions = """
     You edit text on command. You are given a piece of text and an instruction \
@@ -67,7 +71,7 @@ enum CommandMode {
         fallback: String
     ) async throws -> String {
         #if canImport(FoundationModels)
-        if #available(macOS 26.0, *) {
+        if #available(macOS 26.0, *), AppleIntelligenceCleaner.isAvailable {
             let session = LanguageModelSession(instructions: instructions)
             let response = try await session.respond(
                 to: prompt,
@@ -78,6 +82,12 @@ enum CommandMode {
             return text.isEmpty ? fallback : text
         }
         #endif
-        throw CommandError.unavailable
+        let text = try await OllamaCleaner.respond(
+            system: instructions,
+            prompt: prompt,
+            model: Settings.ollamaCommandModel,
+            reasoning: Settings.commandReasoning
+        )
+        return text.isEmpty ? fallback : text
     }
 }

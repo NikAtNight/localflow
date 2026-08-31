@@ -2,6 +2,47 @@ import AppKit
 import AVFoundation
 import ServiceManagement
 
+struct UserFacingIssue: Equatable {
+    static let menuCharacterLimit = 48
+
+    let summary: String
+    let details: String
+    let at: Date
+
+    init(summary: String, details: String, at: Date = Date()) {
+        self.summary = summary
+        self.details = details
+        self.at = at
+    }
+
+    var menuSummary: String {
+        let normalized = summary.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        let text = normalized.isEmpty ? "Something went wrong" : normalized
+        guard text.count > Self.menuCharacterLimit else { return text }
+        let prefix = text.prefix(Self.menuCharacterLimit - 1)
+        return prefix.trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+}
+
+enum IncrementalCleanupPlan {
+    static func shouldCleanTailOnly(
+        incrementalTranscriptionSucceeded: Bool,
+        chunkCleanupActive: Bool,
+        allCommittedChunksCleaned: Bool,
+        tailCleanupSucceeded: Bool,
+        capturedProfile: AppStyleProfile,
+        releaseProfile: AppStyleProfile,
+        cleanupEnabledAtRelease: Bool
+    ) -> Bool {
+        incrementalTranscriptionSucceeded
+            && chunkCleanupActive
+            && allCommittedChunksCleaned
+            && tailCleanupSucceeded
+            && capturedProfile == releaseProfile
+            && cleanupEnabledAtRelease
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum State {
@@ -9,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case idle
         case recording
         case processing
-        case failed(String)
+        case failed(UserFacingIssue)
     }
 
     private var statusItem: NSStatusItem!
@@ -63,15 +104,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let transcriber = Transcriber()
     private let overlay = WaveformOverlay()
 
+    private struct DictationContext {
+        let styleProfile: AppStyleProfile
+        let cleanupEnabled: Bool
+        let ollamaModel: String
+        let corrections: [(wrong: String, right: String)]
+        let snippets: [(trigger: String, expansion: String)]
+
+        @MainActor
+        static func capture() -> DictationContext {
+            DictationContext(
+                styleProfile: AppStyleProfile.current(),
+                cleanupEnabled: Settings.cleanupEnabled,
+                ollamaModel: Settings.ollamaModel,
+                corrections: Settings.corrections,
+                snippets: Settings.snippets
+            )
+        }
+    }
+
+    private final class IncrementalRecording {
+        let generation: Int
+        let context: DictationContext
+        var committedEnd = 0
+        var committedText = ""
+        var cleanedCommittedText = ""
+        var chunkCount = 0
+        var cleanedChunkCount = 0
+        var nextPauseSeconds = 0.0
+        var failed = false
+        var chunkCleanupFailed = false
+        var pass: Task<Void, Never>?
+        var cleanupTask: Task<Void, Never>?
+        var cleanupTasks: [Task<Void, Never>] = []
+        var timer: DispatchWorkItem?
+
+        init(generation: Int, context: DictationContext) {
+            self.generation = generation
+            self.context = context
+        }
+    }
+
+    private struct IncrementalStats {
+        let chunkCount: Int
+        let committedSeconds: Double
+        let tailSeconds: Double
+    }
+
+    private enum IncrementalError: Error {
+        case emptyVoicedTail
+    }
+
+    private var incrementalRecording: IncrementalRecording?
+
     private var state: State = .loadingModel {
         didSet {
             // Failure banners self-clear after 3s; keep the last one
             // reachable in the menu until a dictation succeeds again.
-            if case .failed(let message) = state { lastError = (message, Date()) }
+            if case .failed(let issue) = state { lastError = issue }
             refreshStatusUI()
         }
     }
-    private var lastError: (message: String, at: Date)?
+    private var lastError: UserFacingIssue? {
+        didSet { settingsModel?.lastIssue = lastError }
+    }
     private var lastErrorMenuItem: NSMenuItem!
 
     /// What to show when nothing is recording and no failure banner is up.
@@ -110,8 +206,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         requestPermissions()
         startHotkey()
         loadModel()
-        if Settings.cleanupEnabled {
+        // Command mode's hotkey gate needs Ollama reachability even when
+        // cleanup is off, so the probe runs for either feature.
+        if Settings.cleanupEnabled || Settings.commandModeEnabled {
             probeOllama()
+        }
+        if Settings.cleanupEnabled {
             // Load the on-device model's weights now, not on the first
             // dictation's cleanup call.
             AppleIntelligenceCleaner.prewarm()
@@ -131,9 +231,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self, self.isRecording else { return }
                 self.isRecording = false
                 self.recordingGeneration += 1
+                self.discardIncrementalRecording()
                 self.overlay.hide()
                 self.playCue("Basso")
-                self.state = .failed("Mic error: \(error.localizedDescription)")
+                self.state = .failed(UserFacingIssue(
+                    summary: "Microphone stopped",
+                    details: error.localizedDescription
+                ))
                 self.scheduleFailureRecovery()
             }
         }
@@ -187,7 +291,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsModel.onVocabularyChange = { _ in refreshVocabulary() }
         settingsModel.onCorrectionsChange = { refreshVocabulary() }
-        settingsModel.onCommandModeChange = { [weak self] in self?.startCommandHotkey() }
+        settingsModel.onCommandModeChange = { [weak self] in
+            // Enabling may hinge on Ollama; the probe re-runs the hotkey
+            // start once reachability is known.
+            if Settings.commandModeEnabled { self?.probeOllama() }
+            self?.startCommandHotkey()
+        }
         settingsModel.onAutomaticUpdatesChange = { [weak self] in self?.updates.applyAutomaticPreference() }
         settingsModel.onThemeChange = { [weak self] in
             guard let self else { return }
@@ -224,6 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DiagLog.log("%@ while recording — discarding the recording", reason)
             isRecording = false
             recordingGeneration += 1
+            discardIncrementalRecording()
             overlay.hide()
             recorder.stop { _ in }
             state = restingState
@@ -283,7 +393,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Command mode runs a second, independent tap so its key is watched
     /// exactly like the dictation key. Silently absent when command mode is
-    /// off, the keys collide, or the on-device model isn't available.
+    /// off, the keys collide, or no backend (Apple Intelligence or a
+    /// reachable Ollama server) can serve it.
     private func startCommandHotkey() {
         guard Settings.commandModeActive else {
             if commandHotkeyActive {
@@ -330,7 +441,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.recomputeReadyState()
             } else {
                 self.hotkeyActive = false
-                self.state = .failed("Hotkey blocked: remove + re-add LocalFlow in Accessibility settings (menu below) — retrying…")
+                self.state = .failed(UserFacingIssue(
+                    summary: "Dictation shortcut unavailable",
+                    details: "Remove and re-add LocalFlow in Accessibility settings. LocalFlow will keep retrying."
+                ))
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     self.attemptHotkeyStart()
                 }
@@ -368,9 +482,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // No recomputeReadyState() here — it would flip straight
                     // back to .idle and the banner would never appear.
                     modelLoaded = true
-                    state = .failed("Couldn't load \(model) — still on previous model, retrying…")
+                    state = .failed(UserFacingIssue(
+                        summary: "Couldn't switch Whisper model",
+                        details: "Couldn't load \(model): \(error.localizedDescription) "
+                            + "The previous model is still active, and LocalFlow will retry."
+                    ))
                 } else {
-                    state = .failed("Model load failed: \(error.localizedDescription) — retrying…")
+                    state = .failed(UserFacingIssue(
+                        summary: "Couldn't load Whisper model",
+                        details: "\(error.localizedDescription) LocalFlow will retry."
+                    ))
                 }
                 scheduleModelRetry(generation: generation)
             }
@@ -407,10 +528,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func probeOllama() {
         // Ollama is only the fallback backend, so no point probing (or
-        // warning about) it when the on-device model handles cleanup.
+        // warning about) it when the on-device model handles everything.
         guard !AppleIntelligenceCleaner.isAvailable else { return }
         Task {
             settingsModel?.ollamaReachable = await OllamaCleaner.isAvailable()
+            // Reachability feeds Settings.commandModeActive, and the command
+            // tap may have been skipped (or left running) on stale state.
+            await MainActor.run { self.startCommandHotkey() }
         }
     }
 
@@ -429,6 +553,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        if Settings.cleanupEnabled && !AppleIntelligenceCleaner.isAvailable {
+            Task { await OllamaCleaner.prewarm(model: Settings.ollamaModel) }
+        }
         // A denied mic yields an engine that happily records silence —
         // every dictation would "succeed" with nothing to show. Fail loudly.
         let micAuth = AVCaptureDevice.authorizationStatus(for: .audio)
@@ -437,13 +564,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // "did nothing" with no trace. Never again.
             DiagLog.log("hotkey press refused: microphone authorization is %d", micAuth.rawValue)
             playCue("Basso")
-            state = .failed("Microphone access denied — enable it in System Settings → Privacy & Security → Microphone")
+            state = .failed(UserFacingIssue(
+                summary: "Microphone access needed",
+                details: "Enable LocalFlow in System Settings > Privacy & Security > Microphone."
+            ))
             scheduleFailureRecovery()
             return
         }
         isRecording = true
         recordingGeneration += 1
         let generation = recordingGeneration
+        if recordingIsCommand {
+            discardIncrementalRecording()
+        } else {
+            beginIncrementalRecording(generation: generation)
+        }
         // Enqueue hardware startup before doing menu/HUD work on the main
         // thread. A warm microphone can now begin delivering immediately
         // while the visual state is updated in parallel. The "speak now"
@@ -466,6 +601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 if self.isRecording {
                     self.isRecording = false
+                    self.discardIncrementalRecording()
                     // Release may never call stop now that the active flag is
                     // clear, so finish recorder-side cleanup here.
                     self.recorder.stop { _ in }
@@ -476,7 +612,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.overlay.hide()
                 self.playCue("Basso")
-                self.state = .failed("Mic error: \(error.localizedDescription)")
+                self.state = .failed(UserFacingIssue(
+                    summary: "Couldn't start the microphone",
+                    details: error.localizedDescription
+                ))
                 self.scheduleFailureRecovery()
                 return
             }
@@ -497,11 +636,188 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static let maxRecordingSeconds: TimeInterval = 300
+    private static let incrementalStartSeconds: TimeInterval = 8
+    private static let incrementalTickSeconds: TimeInterval = 4
+
+    private func beginIncrementalRecording(generation: Int) {
+        discardIncrementalRecording()
+        let incremental = IncrementalRecording(
+            generation: generation,
+            context: DictationContext.capture()
+        )
+        incrementalRecording = incremental
+        scheduleIncrementalTick(incremental, after: Self.incrementalStartSeconds)
+    }
+
+    private func scheduleIncrementalTick(
+        _ incremental: IncrementalRecording,
+        after delay: TimeInterval
+    ) {
+        let work = DispatchWorkItem { [weak self, weak incremental] in
+            guard let self, let incremental else { return }
+            self.runIncrementalTick(incremental)
+        }
+        incremental.timer = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func runIncrementalTick(_ incremental: IncrementalRecording) {
+        guard incrementalRecording === incremental,
+              isRecording,
+              recordingGeneration == incremental.generation else { return }
+        scheduleIncrementalTick(incremental, after: Self.incrementalTickSeconds)
+        guard incremental.pass == nil, !incremental.failed else { return }
+
+        recorder.snapshot { [weak self, weak incremental] samples in
+            guard let self, let incremental,
+                  self.incrementalRecording === incremental,
+                  self.isRecording,
+                  samples.count >= Int(Self.incrementalStartSeconds * AudioRecorder.sampleRate),
+                  incremental.pass == nil,
+                  !incremental.failed else { return }
+            self.startIncrementalPass(incremental, samples: samples)
+        }
+    }
+
+    private func startIncrementalPass(
+        _ incremental: IncrementalRecording,
+        samples: [Float]
+    ) {
+        guard let cut = AudioRecorder.incrementalCutPoint(
+            in: samples,
+            after: incremental.committedEnd
+        ) else { return }
+
+        let chunk = AudioRecorder.trimmingSilence(
+            Array(samples[incremental.committedEnd..<cut])
+        )
+        let voice = AudioRecorder.voicedMetrics(of: chunk)
+        guard voice.voicedSeconds >= Self.minVoicedSeconds else { return }
+
+        let pauseBeforeChunk = incremental.nextPauseSeconds
+        let pauseAfterChunk = AudioRecorder.incrementalPauseSeconds(in: samples, around: cut)
+        let chunkSeconds = Double(chunk.count) / AudioRecorder.sampleRate
+        incremental.pass = Task { [weak self, weak incremental] in
+            guard let self, let incremental else { return }
+            let startedAt = Date()
+            do {
+                let text = try await self.transcriber.transcribe(
+                    samples: chunk,
+                    lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS
+                )
+                guard !Task.isCancelled else {
+                    incremental.pass = nil
+                    return
+                }
+                let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+                DiagLog.log("[diag] incremental chunk: audio=%.1fs decode=%dms outputBytes=%d",
+                      chunkSeconds, elapsedMs, text.utf8.count)
+                guard !text.isEmpty else {
+                    incremental.failed = true
+                    incremental.committedEnd = 0
+                    incremental.committedText = ""
+                    incremental.chunkCount = 0
+                    self.cancelIncrementalCleanup(incremental)
+                    incremental.cleanedCommittedText = ""
+                    incremental.cleanedChunkCount = 0
+                    incremental.chunkCleanupFailed = true
+                    incremental.pass = nil
+                    DiagLog.log("[diag] incremental chunk returned empty; full-pass fallback armed")
+                    return
+                }
+                incremental.committedText = Transcriber.joinTranscriptParts(
+                    incremental.committedText,
+                    text,
+                    pauseSeconds: incremental.nextPauseSeconds
+                )
+                incremental.committedEnd = cut
+                incremental.chunkCount += 1
+                incremental.nextPauseSeconds = pauseAfterChunk
+                self.startIncrementalCleanup(
+                    incremental,
+                    chunkText: text,
+                    pauseBeforeChunk: pauseBeforeChunk
+                )
+            } catch {
+                guard !Task.isCancelled else {
+                    incremental.pass = nil
+                    return
+                }
+                let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
+                incremental.failed = true
+                incremental.committedEnd = 0
+                incremental.committedText = ""
+                incremental.chunkCount = 0
+                self.cancelIncrementalCleanup(incremental)
+                incremental.cleanedCommittedText = ""
+                incremental.cleanedChunkCount = 0
+                incremental.chunkCleanupFailed = true
+                DiagLog.log("[diag] incremental chunk failed after %dms (%@); full-pass fallback armed",
+                      elapsedMs, error.localizedDescription)
+            }
+            incremental.pass = nil
+        }
+    }
+
+    private func startIncrementalCleanup(
+        _ incremental: IncrementalRecording,
+        chunkText: String,
+        pauseBeforeChunk: Double
+    ) {
+        guard incremental.context.cleanupEnabled else { return }
+        let previousCleanup = incremental.cleanupTask
+        let cleanupTask = Task { [weak self, weak incremental] in
+            if let previousCleanup { await previousCleanup.value }
+            guard let self, let incremental,
+                  !Task.isCancelled,
+                  !incremental.chunkCleanupFailed else { return }
+
+            let context = incremental.context
+            let composed = Self.composeTranscript(chunkText, context: context)
+            let result = await self.cleanTranscriptResult(
+                composed,
+                ollamaModel: context.ollamaModel,
+                profile: context.styleProfile
+            )
+            guard result.succeeded else {
+                incremental.chunkCleanupFailed = true
+                DiagLog.log("[diag] incremental cleanup returned input; full cleanup fallback armed")
+                return
+            }
+            incremental.cleanedCommittedText = Transcriber.joinTranscriptParts(
+                incremental.cleanedCommittedText,
+                result.text,
+                pauseSeconds: pauseBeforeChunk
+            )
+            incremental.cleanedChunkCount += 1
+        }
+        incremental.cleanupTask = cleanupTask
+        incremental.cleanupTasks.append(cleanupTask)
+    }
+
+    private func cancelIncrementalCleanup(_ incremental: IncrementalRecording) {
+        incremental.cleanupTasks.forEach { $0.cancel() }
+        incremental.cleanupTasks.removeAll()
+        incremental.cleanupTask = nil
+    }
+
+    private func discardIncrementalRecording() {
+        if let incremental = incrementalRecording {
+            incremental.timer?.cancel()
+            incremental.pass?.cancel()
+            cancelIncrementalCleanup(incremental)
+            incremental.timer = nil
+        }
+        incrementalRecording = nil
+    }
 
     // MARK: - Command mode (hold, speak an instruction, edit in place)
 
     private func commandKeyPressed() {
         guard modelLoaded, !isRecording else { return }
+        if !AppleIntelligenceCleaner.isAvailable {
+            Task { await OllamaCleaner.prewarm(model: Settings.ollamaCommandModel) }
+        }
         recordingIsCommand = true
         hotkeyPressed()
     }
@@ -539,7 +855,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.finishDictation(seq, with: .skip)
                     self.dismissHud(hudGeneration)
                     self.playCue("Basso")
-                    self.state = .failed("Command failed: \(error.localizedDescription)")
+                    self.state = .failed(UserFacingIssue(
+                        summary: "Couldn't apply the voice edit",
+                        details: error.localizedDescription
+                    ))
                     self.scheduleFailureRecovery()
                     self.finishProcessing()
                 }
@@ -562,6 +881,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the next press can flip the flag before the stop completion runs.
         let asCommand = recordingIsCommand
         recordingIsCommand = false
+        let releaseContext = asCommand ? nil : DictationContext.capture()
+        let incremental = asCommand ? nil : incrementalRecording
+        incremental?.timer?.cancel()
+        incremental?.timer = nil
+        incrementalRecording = nil
         recorder.stop { [weak self] samples in
             guard let self else { return }
             if self.failedCaptureStarts.remove(generation) != nil {
@@ -569,7 +893,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             self.process(samples: samples, releasedAt: releasedAt,
-                         hudGeneration: generation, asCommand: asCommand)
+                         hudGeneration: generation, asCommand: asCommand,
+                         incremental: incremental, releaseContext: releaseContext)
         }
         overlay.beginProcessing()
     }
@@ -596,7 +921,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         samples rawSamples: [Float],
         releasedAt: Date,
         hudGeneration: Int? = nil,
-        asCommand: Bool = false
+        asCommand: Bool = false,
+        incremental: IncrementalRecording? = nil,
+        releaseContext: DictationContext? = nil
     ) {
         let seq = injectionSeqCounter
         injectionSeqCounter += 1
@@ -617,17 +944,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         processingCount += 1
         if !isRecording { state = .processing }
-        let cleanupWanted = Settings.cleanupEnabled
-        let ollamaModel = Settings.ollamaModel
-        let corrections = Settings.corrections
-        let snippets = Settings.snippets
-        // Read while the target app is still frontmost.
-        let styleProfile = AppStyleProfile.current()
+        let context = releaseContext ?? DictationContext.capture()
 
         Task {
             do {
-                let raw = try await transcriber.transcribe(samples: samples,
-                                                           lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS)
+                let transcription = try await transcribeReleasedAudio(
+                    rawSamples: rawSamples,
+                    trimmedSamples: samples,
+                    voice: voice,
+                    incremental: asCommand ? nil : incremental
+                )
+                let raw = transcription.text
                 guard !raw.isEmpty else {
                     // Muted mic, wrong input, silence: without a cue the
                     // user only finds out nothing was pasted much later.
@@ -643,33 +970,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // paste: corrections still apply (names get misheard the
                 // same way), but no formatting, snippets, or cleanup.
                 if asCommand {
-                    let instruction = TranscriptCorrections.apply(raw, corrections: corrections)
+                    let instruction = TranscriptCorrections.apply(
+                        raw,
+                        corrections: context.corrections
+                    )
                     runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration)
                     return
                 }
 
-                // Learned corrections first, then spoken formatting commands
-                // ("bullet point", "thumbs up emoji") become real formatting,
-                // then snippet expansions go in verbatim; cleanup sees the
-                // finished text and is told to preserve it.
-                var text = Snippets.expand(
-                    VoiceFormatter.apply(TranscriptCorrections.apply(raw, corrections: corrections)),
-                    snippets: snippets
-                )
-                if cleanupWanted {
-                    text = await cleanTranscript(text, ollamaModel: ollamaModel, profile: styleProfile)
+                var usedTailOnlyCleanup = false
+                var text: String?
+                if let incremental,
+                   let stats = transcription.incrementalStats {
+                    let canAttemptTailOnly = IncrementalCleanupPlan.shouldCleanTailOnly(
+                        incrementalTranscriptionSucceeded: true,
+                        chunkCleanupActive: incremental.context.cleanupEnabled,
+                        allCommittedChunksCleaned: true,
+                        tailCleanupSucceeded: true,
+                        capturedProfile: incremental.context.styleProfile,
+                        releaseProfile: context.styleProfile,
+                        cleanupEnabledAtRelease: context.cleanupEnabled
+                    )
+                    if canAttemptTailOnly {
+                        if let cleanupTask = incremental.cleanupTask { await cleanupTask.value }
+                        let allCommittedChunksCleaned = !incremental.chunkCleanupFailed
+                            && incremental.cleanedChunkCount == stats.chunkCount
+                        if allCommittedChunksCleaned,
+                           let tailText = transcription.incrementalTailText {
+                            let tail = Self.composeTranscript(tailText, context: incremental.context)
+                            let cleanedTail: TranscriptCleanupResult
+                            if tail.isEmpty {
+                                cleanedTail = TranscriptCleanupResult(text: "", succeeded: true)
+                            } else {
+                                cleanedTail = await cleanTranscriptResult(
+                                    tail,
+                                    ollamaModel: incremental.context.ollamaModel,
+                                    profile: incremental.context.styleProfile
+                                )
+                            }
+                            if IncrementalCleanupPlan.shouldCleanTailOnly(
+                                incrementalTranscriptionSucceeded: true,
+                                chunkCleanupActive: incremental.context.cleanupEnabled,
+                                allCommittedChunksCleaned: allCommittedChunksCleaned,
+                                tailCleanupSucceeded: cleanedTail.succeeded,
+                                capturedProfile: incremental.context.styleProfile,
+                                releaseProfile: context.styleProfile,
+                                cleanupEnabledAtRelease: context.cleanupEnabled
+                            ) {
+                                text = Transcriber.joinTranscriptParts(
+                                    incremental.cleanedCommittedText,
+                                    cleanedTail.text,
+                                    pauseSeconds: incremental.nextPauseSeconds
+                                )
+                                usedTailOnlyCleanup = true
+                            } else {
+                                DiagLog.log("[diag] incremental tail cleanup returned input; full cleanup fallback armed")
+                            }
+                        }
+                    } else {
+                        cancelIncrementalCleanup(incremental)
+                    }
+                } else {
+                    if let incremental { cancelIncrementalCleanup(incremental) }
+                }
+
+                let finalText: String
+                if let text {
+                    finalText = text
+                } else {
+                    // The release snapshot preserves the old all-at-once path
+                    // whenever incremental cleanup cannot prove consistency.
+                    let composed = Self.composeTranscript(raw, context: context)
+                    if context.cleanupEnabled {
+                        finalText = await cleanTranscript(
+                            composed,
+                            ollamaModel: context.ollamaModel,
+                            profile: context.styleProfile
+                        )
+                    } else {
+                        finalText = composed
+                    }
                 }
 
                 // Keep the transcript reachable even if the paste goes
                 // wrong — "Recent Dictations" in the menu and the settings
                 // window can re-copy it. The daily history file keeps it
                 // past this session.
-                recentTranscripts.insert(RecentDictation(text: text), at: 0)
+                recentTranscripts.insert(RecentDictation(text: finalText), at: 0)
                 if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
                 settingsModel?.recentDictations = recentTranscripts
-                DictationHistory.record(text)
+                DictationHistory.record(finalText)
 
-                finishDictation(seq, with: .inject(text))
+                finishDictation(seq, with: .inject(finalText))
                 // The Cmd-V is posted synchronously inside inject (once the
                 // queue reaches this dictation); the HUD's job ends here;
                 // the paste-confirmation window runs on cues/banners alone.
@@ -679,7 +1071,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let ms = Int(Date().timeIntervalSince(releasedAt) * 1000)
                 lastLatencyMs = ms
                 DiagLog.log("end-to-end %dms (%.1fs audio, cleanup=%@, outputBytes=%d)",
-                      ms, duration, cleanupWanted ? "on" : "off", text.utf8.count)
+                      ms, duration, context.cleanupEnabled ? "on" : "off", finalText.utf8.count)
+                if let stats = transcription.incrementalStats {
+                    DiagLog.log("[diag] incremental transcription: chunks=%d committed=%.1fs tail=%.1fs",
+                          stats.chunkCount, stats.committedSeconds, stats.tailSeconds)
+                    DiagLog.log("[diag] incremental cleanup: chunks=%d tailOnly=%d",
+                          stats.chunkCount, usedTailOnlyCleanup ? 1 : 0)
+                }
                 finishProcessing()
             } catch {
                 processingCount -= 1
@@ -690,10 +1088,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 retrySamples.append(samples)
                 if retrySamples.count > 3 { retrySamples.removeFirst() }
                 playCue("Basso")
-                state = .failed("Transcription failed: \(error.localizedDescription) — audio kept (see Retry in menu)")
+                state = .failed(UserFacingIssue(
+                    summary: "Couldn't transcribe the recording",
+                    details: "\(error.localizedDescription) The audio was kept. Use Retry Failed Dictation in the menu."
+                ))
                 scheduleFailureRecovery()
             }
         }
+    }
+
+    private func transcribeReleasedAudio(
+        rawSamples: [Float],
+        trimmedSamples: [Float],
+        voice: (voicedSeconds: Double, voicedDBFS: Float),
+        incremental: IncrementalRecording?
+    ) async throws -> (
+        text: String,
+        incrementalStats: IncrementalStats?,
+        incrementalTailText: String?
+    ) {
+        guard let incremental else {
+            let text = try await transcriber.transcribe(
+                samples: trimmedSamples,
+                lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS
+            )
+            return (text, nil, nil)
+        }
+
+        if let pass = incremental.pass {
+            let waitStartedAt = Date()
+            await pass.value
+            let waitMs = Int(Date().timeIntervalSince(waitStartedAt) * 1000)
+            DiagLog.log("[diag] release waited %dms for active incremental pass", waitMs)
+        }
+        guard !incremental.failed,
+              incremental.chunkCount > 0,
+              incremental.committedEnd <= rawSamples.count else {
+            let text = try await transcriber.transcribe(
+                samples: trimmedSamples,
+                lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS
+            )
+            return (text, nil, nil)
+        }
+
+        let tailRange = incremental.committedEnd..<rawSamples.count
+        let tail = AudioRecorder.trimmingSilence(Array(rawSamples[tailRange]))
+        let tailVoice = AudioRecorder.voicedMetrics(of: tail)
+        do {
+            let tailStartedAt = Date()
+            let tailText: String
+            if tail.isEmpty || tailVoice.voicedSeconds == 0 {
+                tailText = ""
+            } else {
+                tailText = try await transcriber.transcribe(
+                    samples: tail,
+                    lowEnergy: tailVoice.voicedDBFS < Self.quietVoicedDBFS
+                )
+            }
+            let tailMs = Int(Date().timeIntervalSince(tailStartedAt) * 1000)
+            DiagLog.log("[diag] incremental tail: audio=%.1fs decode=%dms outputBytes=%d",
+                  Double(tail.count) / AudioRecorder.sampleRate, tailMs, tailText.utf8.count)
+            if tailText.isEmpty, tailVoice.voicedSeconds > 0 {
+                throw IncrementalError.emptyVoicedTail
+            }
+            let text = Transcriber.joinTranscriptParts(
+                incremental.committedText,
+                tailText,
+                pauseSeconds: incremental.nextPauseSeconds
+            )
+            let rate = AudioRecorder.sampleRate
+            return (
+                text,
+                IncrementalStats(
+                    chunkCount: incremental.chunkCount,
+                    committedSeconds: Double(incremental.committedEnd) / rate,
+                    tailSeconds: Double(rawSamples.count - incremental.committedEnd) / rate
+                ),
+                tailText
+            )
+        } catch {
+            DiagLog.log("[diag] incremental tail failed (%@); retrying full utterance",
+                  error.localizedDescription)
+            let retryStartedAt = Date()
+            let text = try await transcriber.transcribe(
+                samples: trimmedSamples,
+                lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS
+            )
+            let retryMs = Int(Date().timeIntervalSince(retryStartedAt) * 1000)
+            DiagLog.log("[diag] full-utterance retry: audio=%.1fs decode=%dms outputBytes=%d",
+                  Double(trimmedSamples.count) / AudioRecorder.sampleRate,
+                  retryMs,
+                  text.utf8.count)
+            return (text, nil, nil)
+        }
+    }
+
+    private static func composeTranscript(
+        _ text: String,
+        context: DictationContext
+    ) -> String {
+        Snippets.expand(
+            VoiceFormatter.apply(
+                TranscriptCorrections.apply(text, corrections: context.corrections)
+            ),
+            snippets: context.snippets
+        )
     }
 
     /// Runs the enabled cleanup backend; any failure returns the input so a
@@ -704,25 +1203,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ollamaModel: String,
         profile: AppStyleProfile
     ) async -> String {
+        (await cleanTranscriptResult(
+            text,
+            ollamaModel: ollamaModel,
+            profile: profile
+        )).text
+    }
+
+    /// Chunk cleanup needs the same soft-failure behavior as the release
+    /// path, plus a signal that it is safe to combine independently cleaned
+    /// parts. Validation distinguishes a legitimate no-op from a rejected
+    /// response so clean chunks do not force a full cleanup retry at release.
+    private func cleanTranscriptResult(
+        _ text: String,
+        ollamaModel: String,
+        profile: AppStyleProfile
+    ) async -> TranscriptCleanupResult {
         if AppleIntelligenceCleaner.isAvailable {
             do {
-                return try await AppleIntelligenceCleaner.clean(text, profile: profile)
+                return try await AppleIntelligenceCleaner.cleanResult(text, profile: profile)
             } catch {
                 DiagLog.log("Apple Intelligence cleanup failed (%@), pasting uncleaned text",
                       error.localizedDescription)
-                return text
+                return TranscriptCleanupResult(text: text, succeeded: false)
             }
         }
         do {
-            let cleaned = try await OllamaCleaner.clean(text, model: ollamaModel, profile: profile)
+            let result = try await OllamaCleaner.cleanResult(
+                text,
+                model: ollamaModel,
+                profile: profile
+            )
             settingsModel?.ollamaReachable = true
-            return cleaned
+            return result
         } catch {
             // A transport error means the server is unavailable;
             // HTTP/decoding failures still prove it was reached.
-            settingsModel?.ollamaReachable = !(error is URLError)
+            if let urlError = error as? URLError {
+                if urlError.code != .cancelled {
+                    settingsModel?.ollamaReachable = false
+                }
+            } else if !(error is CancellationError) {
+                settingsModel?.ollamaReachable = true
+            }
             DiagLog.log("Ollama cleanup failed (%@) — pasting raw transcript", error.localizedDescription)
-            return text
+            return TranscriptCleanupResult(text: text, succeeded: false)
         }
     }
 
@@ -765,7 +1290,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
                     self.playCue("Basso")
-                    self.state = .failed("Paste may not have landed — see Recent Dictations")
+                    self.state = .failed(UserFacingIssue(
+                        summary: "Paste may not have landed",
+                        details: "The transcript is available under Recent Dictations in the menu."
+                    ))
                     self.scheduleFailureRecovery()
                 }
             }
@@ -803,7 +1331,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// transcript) — one cue/banner path for all of them.
     private func reportHeardNothing() {
         playCue("Basso")
-        state = .failed("Heard nothing — is the right microphone selected?")
+        state = .failed(UserFacingIssue(
+            summary: "Didn't hear any speech",
+            details: "Check the selected microphone in Settings > Dictation."
+        ))
         scheduleFailureRecovery()
     }
 
@@ -832,8 +1363,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
 
-        lastErrorMenuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        lastErrorMenuItem.isEnabled = false
+        lastErrorMenuItem = NSMenuItem(
+            title: "View Last Error…",
+            action: #selector(openSettings),
+            keyEquivalent: ""
+        )
+        lastErrorMenuItem.target = self
         lastErrorMenuItem.isHidden = true
         menu.addItem(lastErrorMenuItem)
         menu.addItem(.separator())
@@ -937,24 +1472,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshStatusUI() {
         let symbol: String
         let statusText: String
+        statusMenuItem?.toolTip = nil
         switch state {
         case .loadingModel:
             symbol = "arrow.down.circle"
             statusText = "Loading \(Settings.whisperModel)…"
         case .idle:
             symbol = "waveform"
-            var text = "Ready — hold \(hotkey.key.label) to dictate"
-            if let ms = lastLatencyMs { text += "  (last: \(ms)ms)" }
+            var text = "Ready"
+            if let ms = lastLatencyMs { text += " · \(ms)ms" }
             statusText = text
+            statusMenuItem?.toolTip = "Hold \(hotkey.key.label) to dictate"
         case .recording:
             symbol = "record.circle.fill"
             statusText = "Recording… release to transcribe"
         case .processing:
             symbol = "hourglass"
             statusText = "Transcribing…"
-        case .failed(let message):
+        case .failed(let issue):
             symbol = "exclamationmark.triangle"
-            statusText = message
+            statusText = issue.menuSummary
+            statusMenuItem?.toolTip = issue.details
         }
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "LocalFlow")
         statusMenuItem?.title = statusText
@@ -1091,7 +1629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
-        if Settings.cleanupEnabled { probeOllama() }
+        if Settings.cleanupEnabled || Settings.commandModeEnabled { probeOllama() }
         rebuildRecentDictationsMenu()
         rebuildMicrophoneMenu()
         refreshQuickActionChecks()
@@ -1100,10 +1638,11 @@ extension AppDelegate: NSMenuDelegate {
             ? "Retry \(retrySamples.count) Failed Dictations"
             : "Retry Failed Dictation"
         if let lastError {
-            let ago = RelativeDateTimeFormatter().localizedString(for: lastError.at, relativeTo: Date())
-            lastErrorMenuItem.title = "Last error (\(ago)): \(lastError.message)"
+            lastErrorMenuItem.title = "View Last Error…"
+            lastErrorMenuItem.toolTip = lastError.details
             lastErrorMenuItem.isHidden = false
         } else {
+            lastErrorMenuItem.toolTip = nil
             lastErrorMenuItem.isHidden = true
         }
     }

@@ -3,6 +3,11 @@ import Foundation
 import FoundationModels
 #endif
 
+struct TranscriptCleanupResult {
+    let text: String
+    let succeeded: Bool
+}
+
 /// Cleanup contract shared by both backends: Apple's on-device foundation
 /// model (macOS 26+ with Apple Intelligence) and a local Ollama server.
 enum TranscriptCleanup {
@@ -36,11 +41,66 @@ enum TranscriptCleanup {
     }
 
     /// Sanity-checks a cleaner's output; a misfired cleaner (empty answer,
-    /// ballooned text) yields the raw transcript instead.
-    static func validated(_ cleaned: String, raw: String) -> String {
+    /// ballooned text, a leaked reasoning tag) yields the raw transcript
+    /// instead. The "<think>" check is from a real failure: a thinking-mode
+    /// mixup once pasted the literal tag as the entire dictation.
+    static func validationResult(_ cleaned: String, raw: String) -> TranscriptCleanupResult {
         let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count < raw.count * 3 + 64 else { return raw }
-        return trimmed
+        guard !trimmed.isEmpty, trimmed.count < raw.count * 3 + 64 else {
+            return TranscriptCleanupResult(text: raw, succeeded: false)
+        }
+        guard !trimmed.hasPrefix("<think>") else {
+            return TranscriptCleanupResult(text: raw, succeeded: false)
+        }
+        // A cleaner can legitimately decide that an already-clean chunk needs
+        // no edits. Completion is not the same thing as changing the text.
+        return TranscriptCleanupResult(text: trimmed, succeeded: true)
+    }
+
+    static func validated(_ cleaned: String, raw: String) -> String {
+        validationResult(cleaned, raw: raw).text
+    }
+}
+
+/// Superwhisper's s1-mini is a fine-tuned transcript normalizer, not an
+/// instruct model: it ignores free-form instructions like `systemPrompt`
+/// above and is steered entirely by its fixed system prompt plus a control
+/// line prepended to the transcript. Sending it the instruct-style request
+/// yields garbage, so the Ollama cleaner switches shape on the model name.
+enum S1MiniCleanup {
+    static func matches(model: String) -> Bool {
+        model.lowercased().contains("s1-mini")
+    }
+
+    /// Verbatim from the model card; the model was trained against exactly
+    /// this wording.
+    static let systemPrompt = """
+    You are a text normalizer for speech-to-text transcripts. The input begins with a \
+    control line specifying the styling, structure, and context settings; clean the \
+    transcript to match those settings and output only the cleaned text.
+    """
+
+    /// The model's three control axes (its only steering), mapped from the
+    /// app's style profiles. Styling is always semi-formal: measured against
+    /// the Q4_K_M build, the casual stylings keep verbal tics ("um, so I was
+    /// thinking...") and strip capitalization, which breaks cleanup's core
+    /// promise for every profile. "lists" permits bullets where the instruct
+    /// backends are told to allow them (and protects list markers the
+    /// deterministic formatter already produced); chats and code stay prose.
+    static func controlLine(for profile: AppStyleProfile) -> String {
+        let structure: String, context: String
+        switch profile {
+        case .email:        (structure, context) = ("lists", "email")
+        case .workChat:     (structure, context) = ("prose", "general")
+        case .personalChat: (structure, context) = ("prose", "general")
+        case .code:         (structure, context) = ("prose", "general")
+        case .general:      (structure, context) = ("lists", "general")
+        }
+        return "[Styling: semi-formal] [Structure: \(structure)] [Context: \(context)]"
+    }
+
+    static func prompt(for rawText: String, profile: AppStyleProfile) -> String {
+        controlLine(for: profile) + "\n" + rawText
     }
 }
 
@@ -67,9 +127,14 @@ enum AppleIntelligenceCleaner {
         #endif
     }
 
-    static func clean(_ rawText: String, profile: AppStyleProfile = .general) async throws -> String {
+    static func cleanResult(
+        _ rawText: String,
+        profile: AppStyleProfile = .general
+    ) async throws -> TranscriptCleanupResult {
         #if canImport(FoundationModels)
-        guard #available(macOS 26.0, *) else { return rawText }
+        guard #available(macOS 26.0, *) else {
+            return TranscriptCleanupResult(text: rawText, succeeded: false)
+        }
         // A fresh session per dictation: a reused one accumulates every
         // previous transcript as context and eventually overflows it.
         let session = LanguageModelSession(instructions: TranscriptCleanup.instructions(for: profile))
@@ -77,9 +142,13 @@ enum AppleIntelligenceCleaner {
             to: rawText,
             options: GenerationOptions(temperature: 0.1)
         )
-        return TranscriptCleanup.validated(response.content, raw: rawText)
+        return TranscriptCleanup.validationResult(response.content, raw: rawText)
         #else
-        return rawText
+        return TranscriptCleanupResult(text: rawText, succeeded: false)
         #endif
+    }
+
+    static func clean(_ rawText: String, profile: AppStyleProfile = .general) async throws -> String {
+        try await cleanResult(rawText, profile: profile).text
     }
 }

@@ -15,7 +15,7 @@ No audio ever leaves your machine.
 │  Mic    │─────PCM─────▶│ WhisperKit│───────────▶│  Ollama   │───────────▶│  Text    │
 │ capture │              │   (STT)   │            │  cleanup  │ (optional) │ injector │
 └─────────┘              └───────────┘            └───────────┘            └──────────┘
- AVAudioEngine            CoreML / ANE             gemma3:4b               clipboard + ⌘V
+ AVAudioEngine            CoreML / ANE             s1-mini                 clipboard + ⌘V
 ```
 
 ## Requirements
@@ -156,10 +156,11 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   still transcribing.
 - Menu options:
   - **Hold to Talk** — switch the hotkey (Right Option / Right Command / Fn).
-  - **Whisper Model** — Small English (default) is the latency/accuracy balance.
-    Large v3 626 MB prioritizes compact accuracy, while Large v3 Turbo is the
-    best speed/accuracy option on a well-provisioned Mac; switching downloads
-    and specializes the selected model before Ready.
+  - **Whisper Model** — Large v3 Turbo is the default and the best
+    speed/accuracy option on a well-provisioned Mac. Small English is faster
+    with lower accuracy, while Large v3 626 MB trades speed for a smaller
+    model download. Switching downloads and specializes the selected model
+    before Ready.
   - **Recent Dictations** — the last 5 transcripts; click one to copy it back
     to the clipboard (the safety net if a paste ever goes astray).
   - **Open Dictation History** — today's log in Finder (see below).
@@ -178,7 +179,8 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   the recording (rather than pasting it somewhere surprising at wake).
 - Start at Login uses a LaunchAgent that relaunches LocalFlow if it ever
   crashes; quitting from the menu stays quit.
-- If something misfires, the menu keeps a "Last error" line until the next
+- If something misfires, the menu shows a short summary and keeps a
+  "View Last Error…" link to the full details in Settings until the next
   successful dictation.
 - **Initial startup or a model switch can take minutes**: LocalFlow downloads,
   loads, and CoreML-specializes the model before the menubar reports Ready.
@@ -254,17 +256,32 @@ Two backends, picked automatically:
    model. Nothing to install, no server, fully local, typically well under a
    second.
 2. **Ollama (fallback)**: used only when the on-device model isn't available.
+   The default model is [Superwhisper's s1-mini](https://huggingface.co/superwhisper/s1-mini),
+   a 0.6B transcript normalizer trained specifically for this job (~460 MB,
+   GPU-accelerated by Ollama on Apple Silicon). It needs a custom Modelfile
+   (thinking off, greedy decoding),
+   so use the setup script rather than a plain `ollama pull`:
 
 ```bash
 brew install ollama
 ollama serve                # or: brew services start ollama
-ollama pull gemma3:4b
+./scripts/setup-s1-mini.sh
+```
+
+The setup script is also attached to each GitHub release for people who did
+not clone the source:
+
+```bash
+curl -fLO https://github.com/NikAtNight/localflow/releases/latest/download/setup-s1-mini.sh
+chmod +x setup-s1-mini.sh
+./setup-s1-mini.sh
 ```
 
 Enable the cleanup toggle in Settings (its label shows which backend is
 active). If the backend is down or errors, LocalFlow pastes the raw
-transcript instead — dictation never blocks on the LLM. Different Ollama
-model: `defaults write app.talix.localflow ollamaModel "qwen2.5:3b"`.
+transcript instead — dictation never blocks on the LLM. The model is
+configurable in Settings → Cleanup; s1-mini gets its trained prompt protocol,
+any other name is treated as a general instruct model.
 
 ## Command mode (voice editing)
 
@@ -275,8 +292,12 @@ say what you want done:
   "turn this into bullet points", "make it friendlier", "translate to Spanish".
 - **With nothing selected** what you ask for is written at the cursor.
 
-Runs on Apple's on-device model, so the text being edited never leaves the
-Mac. Needs Apple Intelligence enabled, and a different key from dictation.
+Runs on Apple's on-device model when Apple Intelligence is enabled, else on
+a local Ollama instruct model (`gemma3:4b` by default; model and reasoning
+effort are configurable in Settings → Command mode). Either way the text
+being edited never leaves the Mac. Note this is a different model than
+cleanup's s1-mini, which can't follow instructions. Needs a different key
+from dictation.
 
 ## App-aware style
 
@@ -340,7 +361,8 @@ a folder shortcut, and **Delete All History**.
 - English-only decoding by default (the `.en` Whisper models).
 - In Secure Input fields (password boxes), LocalFlow avoids the clipboard and
   falls back to synthesized keystrokes, which some apps ignore.
-- No streaming/partial transcription — audio is transcribed on hotkey release.
+- No live partial text. Long recordings are transcribed in chunks while the
+  key is held, but text is pasted only after release.
 - No cursor-context awareness yet (see plan roadmap).
 
 ## Layout
@@ -364,10 +386,12 @@ a folder shortcut, and **Delete All History**.
 
 ## Cutting a release
 
-Releases are built by `.github/workflows/release.yml` on a macOS runner:
-tests, signed build, notarization, DMG, then the DMG is attached to the
-GitHub Release. Publish a release tagged `v1.2.3` and the workflow does the
-rest; `workflow_dispatch` produces the same artifact without publishing.
+Release Please maintains the version PR. Merging it creates the tag and
+GitHub Release, then dispatches `.github/workflows/release.yml` with that tag.
+The macOS runner tests, signs, notarizes, and packages the app, then attaches
+the DMG, Sparkle ZIP and appcast, checksums, and provenance to the release.
+A manual workflow dispatch with a tag rebuilds an existing release; leaving
+the tag blank produces an unpublished development artifact.
 
 Signing and notarization need these repository secrets. Without them the
 workflow still builds and attaches a DMG, but it is ad-hoc signed and
@@ -380,6 +404,7 @@ Gatekeeper makes users right-click → Open:
 | `APPLE_ID` | Apple ID for notarization |
 | `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password for that Apple ID |
 | `APPLE_TEAM_ID` | Developer team ID |
+| `SPARKLE_PRIVATE_KEY` | EdDSA private key matching the public key in `Info.plist` |
 
 The workflow fails the build if `FoundationModels` did not link, since an
 older SDK would silently ship a build with no command mode and no on-device
