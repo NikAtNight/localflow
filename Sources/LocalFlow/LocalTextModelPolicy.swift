@@ -168,9 +168,10 @@ final class LocalTextModelPolicy {
         model: String,
         profile: AppStyleProfile
     ) async throws -> TranscriptCleanupResult {
+        let resolvedModel = await resolvedOllamaModel(model)
         let generation: TextModelGeneration
         do {
-            generation = try await ollama.cleanup(rawText, model: model, profile: profile)
+            generation = try await ollama.cleanup(rawText, model: resolvedModel, profile: profile)
             try Task.checkCancellation()
             ollamaReachability = .reachable
         } catch {
@@ -185,12 +186,13 @@ final class LocalTextModelPolicy {
         model: String,
         reasoning: ReasoningLevel
     ) async throws -> String? {
+        let resolvedModel = await resolvedOllamaModel(model)
         let generation: TextModelGeneration
         do {
             generation = try await ollama.command(
                 system: system,
                 prompt: prompt,
-                model: model,
+                model: resolvedModel,
                 reasoning: reasoning
             )
             try Task.checkCancellation()
@@ -199,6 +201,21 @@ final class LocalTextModelPolicy {
             try handleOllamaFailure(error)
         }
         return validatedCommand(generation)
+    }
+
+    private func resolvedOllamaModel(_ configuredModel: String) async -> String {
+        let models = await installedOllamaModels()
+        guard !models.isEmpty, !models.contains(configuredModel) else {
+            return configuredModel
+        }
+
+        let resolvedModel = models.contains("gemma3:4b") ? "gemma3:4b" : models[0]
+        DiagLog.log(
+            "configured Ollama model %@ is not installed; using %@",
+            configuredModel,
+            resolvedModel
+        )
+        return resolvedModel
     }
 
     func prewarm(model: String) async {

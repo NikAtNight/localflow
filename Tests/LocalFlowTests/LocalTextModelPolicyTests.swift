@@ -44,6 +44,70 @@ final class LocalTextModelPolicyTests: XCTestCase {
         XCTAssertEqual(policy.ollamaReachability, .reachable)
     }
 
+    func testCleanupUsesInstalledGemmaWhenConfiguredModelIsMissing() async throws {
+        let apple = AppleBackendSpy(isAvailable: false)
+        let ollama = OllamaBackendSpy()
+        ollama.installedModelsResults = [.success(["gemma3:4b"])]
+        ollama.cleanupResults = [.success(.init(text: "Cleaned by Ollama.", finishReason: .complete))]
+        let policy = LocalTextModelPolicy(apple: apple, ollama: ollama)
+
+        _ = try await policy.cleanup("cleaned by ollama", model: "s1-mini", profile: .general)
+
+        XCTAssertEqual(ollama.cleanupRequests.first?.model, "gemma3:4b")
+    }
+
+    func testCleanupUsesConfiguredModelWhenItIsInstalled() async throws {
+        let apple = AppleBackendSpy(isAvailable: false)
+        let ollama = OllamaBackendSpy()
+        ollama.installedModelsResults = [.success(["s1-mini", "gemma3:4b"])]
+        ollama.cleanupResults = [.success(.init(text: "Cleaned by Ollama.", finishReason: .complete))]
+        let policy = LocalTextModelPolicy(apple: apple, ollama: ollama)
+
+        _ = try await policy.cleanup("cleaned by ollama", model: "s1-mini", profile: .general)
+
+        XCTAssertEqual(ollama.cleanupRequests.first?.model, "s1-mini")
+    }
+
+    func testCleanupUsesAnotherInstalledModelWhenGemmaIsMissing() async throws {
+        let apple = AppleBackendSpy(isAvailable: false)
+        let ollama = OllamaBackendSpy()
+        ollama.installedModelsResults = [.success(["qwen3:4b"])]
+        ollama.cleanupResults = [.success(.init(text: "Cleaned by Ollama.", finishReason: .complete))]
+        let policy = LocalTextModelPolicy(apple: apple, ollama: ollama)
+
+        _ = try await policy.cleanup("cleaned by ollama", model: "s1-mini", profile: .general)
+
+        XCTAssertEqual(ollama.cleanupRequests.first?.model, "qwen3:4b")
+    }
+
+    func testCleanupUsesConfiguredModelWhenNoOllamaModelsAreInstalled() async throws {
+        let apple = AppleBackendSpy(isAvailable: false)
+        let ollama = OllamaBackendSpy()
+        ollama.installedModelsResults = [.success([])]
+        ollama.cleanupResults = [.failure(OllamaClientError.httpStatus(404))]
+        let policy = LocalTextModelPolicy(apple: apple, ollama: ollama)
+
+        let result = try await policy.cleanup("raw text", model: "s1-mini", profile: .general)
+
+        XCTAssertEqual(ollama.cleanupRequests.first?.model, "s1-mini")
+        XCTAssertEqual(result.text, "raw text")
+        XCTAssertFalse(result.succeeded)
+    }
+
+    func testCleanupUsesConfiguredModelWhenListingOllamaModelsFails() async throws {
+        let apple = AppleBackendSpy(isAvailable: false)
+        let ollama = OllamaBackendSpy()
+        ollama.installedModelsResults = [.failure(URLError(.cannotConnectToHost))]
+        ollama.cleanupResults = [.failure(URLError(.cannotConnectToHost))]
+        let policy = LocalTextModelPolicy(apple: apple, ollama: ollama)
+
+        let result = try await policy.cleanup("raw text", model: "s1-mini", profile: .general)
+
+        XCTAssertEqual(ollama.cleanupRequests.first?.model, "s1-mini")
+        XCTAssertEqual(result.text, "raw text")
+        XCTAssertFalse(result.succeeded)
+    }
+
     func testCleanupFallsBackToOllamaWhenAppleFailsAtRuntime() async throws {
         let apple = AppleBackendSpy(isAvailable: true)
         apple.cleanupResults = [.failure(TestError.appleFailed)]
@@ -117,6 +181,24 @@ final class LocalTextModelPolicyTests: XCTestCase {
         XCTAssertEqual(ollama.commandRequests.first?.model, "gemma3:4b")
         XCTAssertEqual(ollama.commandRequests.first?.reasoning, .off)
         XCTAssertEqual(policy.ollamaReachability, .reachable)
+    }
+
+    func testCommandUsesInstalledGemmaWhenConfiguredModelIsMissing() async throws {
+        let apple = AppleBackendSpy(isAvailable: false)
+        let ollama = OllamaBackendSpy()
+        ollama.installedModelsResults = [.success(["gemma3:4b"])]
+        ollama.commandResults = [.success(.init(text: "Shortened text.", finishReason: .complete))]
+        let policy = LocalTextModelPolicy(apple: apple, ollama: ollama)
+
+        _ = try await policy.command(
+            system: "Shorten the text.",
+            prompt: "A long passage",
+            model: "s1-mini",
+            reasoning: .off,
+            fallback: "A long passage"
+        )
+
+        XCTAssertEqual(ollama.commandRequests.first?.model, "gemma3:4b")
     }
 
     func testEmptyOrLengthLimitedCommandKeepsTheFallbackText() async throws {
@@ -308,10 +390,19 @@ final class OllamaClientTests: XCTestCase {
             return Self.response(for: request, status: 200, json: #"{"version":"0.11.0"}"#)
         }
 
-        let unavailable = await client.isAvailable()
-        let recovered = await client.isAvailable()
-        XCTAssertFalse(unavailable)
-        XCTAssertTrue(recovered)
+        do {
+            try await client.probe()
+            XCTFail("Expected the first probe to fail")
+        } catch let error as URLError {
+            XCTAssertEqual(error.code, .cannotConnectToHost)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        do {
+            try await client.probe()
+        } catch {
+            XCTFail("Expected the second probe to succeed, got: \(error)")
+        }
         XCTAssertEqual(URLProtocolStub.recordedRequests.map(\.url?.path), ["/api/version", "/api/version"])
         XCTAssertEqual(URLProtocolStub.recordedRequests.map(\.timeoutInterval), [2, 2])
     }
@@ -429,6 +520,7 @@ private final class OllamaBackendSpy: OllamaTextModelBackend {
 
     var cleanupResults: [Result<TextModelGeneration, Error>] = []
     var commandResults: [Result<TextModelGeneration, Error>] = []
+    var installedModelsResults: [Result<[String], Error>] = [.success([])]
     var cleanupHandler: ((CleanupRequest) async throws -> TextModelGeneration)?
     var prewarmHandler: ((String) async -> Void)?
     private(set) var cleanupRequests: [CleanupRequest] = []
@@ -465,6 +557,11 @@ private final class OllamaBackendSpy: OllamaTextModelBackend {
     func prewarm(model: String) async {
         prewarmModels.append(model)
         await prewarmHandler?(model)
+    }
+
+    func installedModels() async throws -> [String] {
+        guard !installedModelsResults.isEmpty else { return [] }
+        return try installedModelsResults.removeFirst().get()
     }
 }
 
