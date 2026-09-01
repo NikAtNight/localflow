@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.3](https://github.com/NikAtNight/localflow/compare/v1.1.2...v1.1.3) (2026-09-01)
+
+
+### Fixes
+
+* fall back to an installed cleanup model ([46ba035](https://github.com/NikAtNight/localflow/commit/46ba0353f15655673764800ae7e2d94e36da0a0c))
+* keep menu error summaries compact ([4417b35](https://github.com/NikAtNight/localflow/commit/4417b35081a8fdc6c0538e3923b574ce31e0b693))
+* share release gate logic across workflows ([518899b](https://github.com/NikAtNight/localflow/commit/518899b86f12a384b89375208f6b215c8ce1e99b))
+
 ## [1.1.2](https://github.com/NikAtNight/localflow/compare/v1.1.1...v1.1.2) (2026-09-01)
 
 
