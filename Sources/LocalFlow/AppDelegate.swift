@@ -20,7 +20,9 @@ struct UserFacingIssue: Equatable {
         let text = normalized.isEmpty ? "Something went wrong" : normalized
         guard text.count > Self.menuCharacterLimit else { return text }
         let prefix = text.prefix(Self.menuCharacterLimit - 1)
-        return prefix.trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+        let wordBoundary = prefix.lastIndex(of: " ")
+        let truncated = wordBoundary.map { prefix[..<$0] } ?? prefix
+        return String(truncated) + "…"
     }
 }
 
@@ -252,39 +254,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// changes there reach the live hotkey tap, recorder, and transcriber.
     private func buildSettings() {
         settingsModel = SettingsModel()
-        settingsModel.onHotkeyChange = { [weak self] key in
+        settingsModel?.onHotkeyChange = { [weak self] key in
             self?.hotkey.key = key
             self?.refreshStatusUI()
         }
-        settingsModel.onModelChange = { [weak self] in self?.loadModel() }
-        settingsModel.onMicChange = { [weak self] uid in
+        settingsModel?.onModelChange = { [weak self] in self?.loadModel() }
+        settingsModel?.onMicChange = { [weak self] uid in
             // Release the old warm route and pre-open the new one so its
             // Bluetooth hands-free transition is paid at selection time,
             // rather than during the first dictation.
             self?.recorder.selectDevice(uid)
         }
-        settingsModel.onKeepWarmChange = { [weak self] in
+        settingsModel?.onKeepWarmChange = { [weak self] in
             self?.recorder.keepWarm = Settings.keepMicWarm
             if !Settings.keepMicWarm { self?.recorder.releaseWarmSession() }
         }
-        settingsModel.onCleanupToggle = { [weak self] in
+        settingsModel?.onCleanupToggle = { [weak self] in
             guard let self, Settings.cleanupEnabled else { return }
             self.probeOllama()
             let model = Settings.ollamaModel
             Task { await self.textModelPolicy.prewarm(model: model) }
         }
-        settingsModel.onVocabularyChange = { [weak self] terms in
+        settingsModel?.onVocabularyChange = { [weak self] terms in
             guard let transcriber = self?.transcriber else { return }
             Task { await transcriber.setVocabulary(terms) }
         }
-        settingsModel.onCommandModeChange = { [weak self] in
+        settingsModel?.onCommandModeChange = { [weak self] in
             // Enabling may hinge on Ollama; the probe re-runs the hotkey
             // start once reachability is known.
             if Settings.commandModeEnabled { self?.probeOllama() }
             self?.startCommandHotkey()
         }
-        settingsModel.onAutomaticUpdatesChange = { [weak self] in self?.updates.applyAutomaticPreference() }
-        settingsModel.onThemeChange = { [weak self] in
+        settingsModel?.onAutomaticUpdatesChange = { [weak self] in self?.updates.applyAutomaticPreference() }
+        settingsModel?.onThemeChange = { [weak self] in
             guard let self else { return }
             if !self.isRecording { self.overlay.preview() }
             ThemeIcon.apply(HudTheme.current)
@@ -549,8 +551,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             reachable = false
         }
 
-        guard settingsModel.ollamaReachable != reachable else { return }
-        settingsModel.ollamaReachable = reachable
+        guard settingsModel?.ollamaReachable != reachable else { return }
+        settingsModel?.ollamaReachable = reachable
         if !textModelPolicy.isAppleAvailable {
             startCommandHotkey()
         }
@@ -957,8 +959,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if retrySamples.count > 3 { retrySamples.removeFirst() }
             playCue("Basso")
             state = .failed(UserFacingIssue(
-                summary: "Couldn't transcribe the recording",
-                details: "\(message) The audio was kept. Use Retry Failed Dictation in the menu."
+                summary: "Couldn't transcribe audio",
+                details: "\(message) The audio was kept. Use Retry Dictation in the menu."
             ))
             scheduleFailureRecovery()
         }
@@ -1083,12 +1085,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
 
-        statusMenuItem = NSMenuItem(title: "Loading model…", action: nil, keyEquivalent: "")
+        statusMenuItem = NSMenuItem(
+            title: "Loading model…",
+            action: #selector(openSettings),
+            keyEquivalent: ""
+        )
+        statusMenuItem.target = self
         statusMenuItem.isEnabled = false
         menu.addItem(statusMenuItem)
 
         lastErrorMenuItem = NSMenuItem(
-            title: "View Last Error…",
+            title: "Last Error…",
             action: #selector(openSettings),
             keyEquivalent: ""
         )
@@ -1103,7 +1110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(recentMenuItem)
 
         retryMenuItem = NSMenuItem(
-            title: "Retry Failed Dictation",
+            title: "Retry Dictation",
             action: #selector(retryFailedDictation),
             keyEquivalent: ""
         )
@@ -1121,7 +1128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(fixItem)
 
         let historyItem = NSMenuItem(
-            title: "Open Dictation History",
+            title: "Dictation History",
             action: #selector(openDictationHistory),
             keyEquivalent: ""
         )
@@ -1133,7 +1140,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Quick actions: the settings people flip most often, applied through
         // the same SettingsModel entry point as the settings window. Checkmarks
         // and the mic list are refreshed in menuWillOpen.
-        hotkeyMenuItem = NSMenuItem(title: "Hold to Talk", action: nil, keyEquivalent: "")
+        hotkeyMenuItem = NSMenuItem(title: "Shortcut", action: nil, keyEquivalent: "")
         let hotkeyMenu = NSMenu()
         for key in HotkeyManager.Key.allCases {
             let item = NSMenuItem(title: key.label, action: #selector(selectHotkey(_:)), keyEquivalent: "")
@@ -1144,7 +1151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkeyMenuItem.submenu = hotkeyMenu
         menu.addItem(hotkeyMenuItem)
 
-        modelMenuItem = NSMenuItem(title: "Whisper Model", action: nil, keyEquivalent: "")
+        modelMenuItem = NSMenuItem(title: "Model", action: nil, keyEquivalent: "")
         let modelMenu = NSMenu()
         for entry in Settings.whisperModels {
             let item = NSMenuItem(title: entry.label, action: #selector(selectWhisperModel(_:)), keyEquivalent: "")
@@ -1169,7 +1176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Kept in the menu (not just Settings): it's the recovery path the
         // hotkey-failure banner points at.
         let permissionsItem = NSMenuItem(
-            title: "Open Accessibility Settings…",
+            title: "Accessibility…",
             action: #selector(openAccessibilitySettings),
             keyEquivalent: ""
         )
@@ -1196,6 +1203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let symbol: String
         let statusText: String
         statusMenuItem?.toolTip = nil
+        statusMenuItem?.isEnabled = false
         switch state {
         case .loadingModel:
             symbol = "arrow.down.circle"
@@ -1210,7 +1218,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusMenuItem?.toolTip = "Hold \(hotkey.key.label) to dictate"
         case .recording:
             symbol = "record.circle.fill"
-            statusText = "Recording… release to transcribe"
+            statusText = "Recording…"
+            statusMenuItem?.toolTip = "Release \(hotkey.key.label) to transcribe"
         case .processing:
             symbol = "hourglass"
             statusText = "Transcribing…"
@@ -1218,9 +1227,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             symbol = "exclamationmark.triangle"
             statusText = issue.menuSummary
             statusMenuItem?.toolTip = issue.details
+            statusMenuItem?.isEnabled = true
         }
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "LocalFlow")
         statusMenuItem?.title = statusText
+        if let lastError {
+            lastErrorMenuItem?.title = "Last Error…"
+            lastErrorMenuItem?.toolTip = lastError.details
+            if case .failed = state {
+                lastErrorMenuItem?.isHidden = true
+            } else {
+                lastErrorMenuItem?.isHidden = false
+            }
+        } else {
+            lastErrorMenuItem?.toolTip = nil
+            lastErrorMenuItem?.isHidden = true
+        }
     }
 
     // MARK: - Menu actions
@@ -1294,7 +1316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             stored.removeAll { $0.wrong.caseInsensitiveCompare(proposal.wrong) == .orderedSame }
             stored.append(proposal)
         }
-        settingsModel.corrections = stored.map { CorrectionPair(wrong: $0.wrong, right: $0.right) }
+        settingsModel?.corrections = stored.map { CorrectionPair(wrong: $0.wrong, right: $0.right) }
         DiagLog.log("learned %d correction(s) from an edited dictation", proposals.count)
     }
 
@@ -1334,17 +1356,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func selectHotkey(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? HotkeyManager.Key else { return }
-        settingsModel.apply(.hotkey(key), from: .menu)
+        settingsModel.apply(.hotkey(key))
     }
 
     @objc private func selectWhisperModel(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String else { return }
-        settingsModel.apply(.whisperModel(name), from: .menu)
+        settingsModel.apply(.whisperModel(name))
     }
 
     @objc private func selectMicrophone(_ sender: NSMenuItem) {
         // A nil representedObject is the "System Default" row.
-        settingsModel.apply(.microphone(sender.representedObject as? String), from: .menu)
+        settingsModel.apply(.microphone(sender.representedObject as? String))
     }
 }
 
@@ -1358,16 +1380,9 @@ extension AppDelegate: NSMenuDelegate {
         refreshQuickActionChecks()
         retryMenuItem.isHidden = retrySamples.isEmpty
         retryMenuItem.title = retrySamples.count > 1
-            ? "Retry \(retrySamples.count) Failed Dictations"
-            : "Retry Failed Dictation"
-        if let lastError {
-            lastErrorMenuItem.title = "View Last Error…"
-            lastErrorMenuItem.toolTip = lastError.details
-            lastErrorMenuItem.isHidden = false
-        } else {
-            lastErrorMenuItem.toolTip = nil
-            lastErrorMenuItem.isHidden = true
-        }
+            ? "Retry \(retrySamples.count) Dictations"
+            : "Retry Dictation"
+        refreshStatusUI()
     }
 
     private func rebuildRecentDictationsMenu() {
@@ -1389,10 +1404,10 @@ extension AppDelegate: NSMenuDelegate {
     /// static, so only the `state` needs refreshing when the menu opens.
     private func refreshQuickActionChecks() {
         for item in hotkeyMenuItem.submenu?.items ?? [] {
-            item.state = (item.representedObject as? HotkeyManager.Key) == settingsModel.hotkey ? .on : .off
+            item.state = (item.representedObject as? HotkeyManager.Key) == settingsModel?.hotkey ? .on : .off
         }
         for item in modelMenuItem.submenu?.items ?? [] {
-            item.state = (item.representedObject as? String) == settingsModel.whisperModel ? .on : .off
+            item.state = (item.representedObject as? String) == settingsModel?.whisperModel ? .on : .off
         }
     }
 
@@ -1404,7 +1419,7 @@ extension AppDelegate: NSMenuDelegate {
         guard let submenu = micMenuItem.submenu else { return }
         submenu.removeAllItems()
         let devices = AudioDevices.inputDevices()
-        let currentUID = settingsModel.micUID
+        let currentUID = settingsModel?.micUID
 
         let defaultName = AudioDevices.defaultInputDeviceID().flatMap { id in
             devices.first(where: { $0.id == id })?.name

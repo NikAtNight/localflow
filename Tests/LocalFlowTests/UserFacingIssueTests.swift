@@ -22,6 +22,39 @@ final class UserFacingIssueTests: XCTestCase {
         XCTAssertTrue(issue.menuSummary.hasSuffix("…"))
     }
 
+    func testBuiltInMenuSummariesFitTheCharacterLimit() {
+        let summaries = [
+            "Microphone stopped",
+            "Dictation shortcut unavailable",
+            "Couldn't switch Whisper model",
+            "Couldn't load Whisper model",
+            "Microphone access needed",
+            "Couldn't start the microphone",
+            "Couldn't apply the voice edit",
+            "Couldn't transcribe the command",
+            "Couldn't transcribe audio",
+            "Paste may not have landed",
+            "Didn't hear any speech",
+        ]
+
+        for summary in summaries {
+            XCTAssertLessThanOrEqual(
+                summary.count,
+                UserFacingIssue.menuCharacterLimit,
+                "Built-in menu summary is too long: \(summary)"
+            )
+        }
+    }
+
+    func testMenuSummaryTruncatesAtAWordBoundary() {
+        let issue = UserFacingIssue(
+            summary: "Unexpected transcription service failure message",
+            details: "Full system error"
+        )
+
+        XCTAssertEqual(issue.menuSummary, "Unexpected transcription…")
+    }
+
     func testLoadingStatusDoesNotExposeTheRegistryModelIdentifier() {
         let status = MenuStatusText.loadingModel(
             identifier: "openai_whisper-large-v3-v20240930_turbo"
