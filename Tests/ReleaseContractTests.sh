@@ -3,6 +3,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VALIDATOR="$REPO_ROOT/scripts/validate-release.sh"
+RELEASE_LIB="$REPO_ROOT/scripts/release-lib.sh"
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
 RELEASE_PLEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release-please.yml"
 README="$REPO_ROOT/README.md"
@@ -195,7 +196,8 @@ reset_detection_fixture() {
     local before_version="${1:-1.0.0}"
     local release_version="${2:-1.1.0}"
     rm -rf "$DETECTION_REPO"
-    mkdir -p "$DETECTION_REPO/.github"
+    mkdir -p "$DETECTION_REPO/.github" "$DETECTION_REPO/scripts"
+    cp "$RELEASE_LIB" "$DETECTION_REPO/scripts/release-lib.sh"
     git -C "$DETECTION_REPO" init -q -b main
 
     printf '{".":"%s"}\n' "$before_version" \
@@ -638,6 +640,8 @@ reset_publication_fixture() {
     git -C "$DETECTION_REPO" remote add origin "$PUBLICATION_ORIGIN"
     git -C "$DETECTION_REPO" push -q -u origin main
     git clone -q "$PUBLICATION_ORIGIN" "$PUBLICATION_REPO"
+    mkdir -p "$PUBLICATION_REPO/scripts"
+    cp "$RELEASE_LIB" "$PUBLICATION_REPO/scripts/release-lib.sh"
 
     printf 'main advanced while an older release was building\n' >> "$DETECTION_REPO/notes.txt"
     git -C "$DETECTION_REPO" add notes.txt
@@ -737,15 +741,12 @@ test_tagged_preflight() {
     reset_tool_fixture
     run_preflight
     assert_success || return
-    assert_output 'is_release=true' || return
-    assert_output 'sign=true' || return
-    assert_output 'updater=true' || return
     assert_output 'version=1.2.3' || return
     assert_output 'short_version=1.2.3' || return
     assert_output 'bundle_version=1.2.3'
 }
 
-test_development_preflight() {
+test_preflight_requires_release_tag() {
     RELEASE_TAG='' \
     MAC_CERT_P12_BASE64='' \
     MAC_CERT_PASSWORD='' \
@@ -756,10 +757,17 @@ test_development_preflight() {
     SPARKLE_FRAMEWORK_PATH="$TEST_ROOT/missing-framework" \
     SPARKLE_APPCAST_TOOL="$TEST_ROOT/missing-generate-appcast" \
         run_preflight
-    assert_success || return
-    assert_output 'is_release=false' || return
-    assert_output 'sign=false' || return
-    assert_output 'updater=false'
+    assert_failure_containing 'RELEASE_TAG is required'
+}
+
+test_release_uses_one_signed_updatable_artifact_set() {
+    if rg -q 'write_output (is_release|sign|updater)|outputs\.(is_release|sign|updater)' \
+        "$VALIDATOR" "$RELEASE_WORKFLOW"; then
+        fail 'the verified release path must not expose diverging release-state flags'
+        return
+    fi
+    assert_file_contains "$RELEASE_WORKFLOW" '"LocalFlow-${APP_VERSION}.zip"' || return
+    assert_file_contains "$RELEASE_WORKFLOW" '"dist/appcast.xml"'
 }
 
 test_missing_release_input() {
@@ -938,13 +946,6 @@ test_dmg_is_signed_after_packaging_before_notarization() {
 }
 
 test_signed_dmg_passes_codesign_gatekeeper_and_stapler_checks() {
-    local verify_step
-    verify_step="$(release_step_block 'Verify signed artifacts')"
-    if ! grep -Fq 'SIGNED: ${{ steps.contract.outputs.sign }}' <<< "$verify_step"; then
-        fail 'signed artifact verification must use the validated signing decision'
-        return
-    fi
-
     extract_release_step_script 'Verify signed artifacts'
     reset_release_tool_fixture
     run_release_script "$RELEASE_STEP_SCRIPT"
@@ -972,9 +973,9 @@ test_existing_draft_targets_requested_commit() {
 }
 
 test_existing_tag_targets_requested_commit() {
-    assert_file_contains "$RELEASE_WORKFLOW" \
-        'TAG_TARGET="$(git rev-parse "$RELEASE_TAG^{commit}")"' || return
-    assert_file_contains "$RELEASE_WORKFLOW" '[[ "$TAG_TARGET" == "$COMMIT_SHA" ]]'
+    assert_file_contains "$RELEASE_LIB" \
+        'tag_target="$(git rev-parse "$RELEASE_TAG^{commit}")"' || return
+    assert_file_contains "$RELEASE_LIB" '[[ "$tag_target" != "$COMMIT_SHA" ]]'
 }
 
 test_release_workflow_validates_before_publication() {
@@ -1194,11 +1195,11 @@ test_destination_checks_precede_upload_and_publish() {
         active { print }
     ' "$RELEASE_WORKFLOW")"
     case "$draft_step" in
-        *'EXISTING_TARGET'*'TAG_TARGET'*'gh release upload'*) ;;
+        *'EXISTING_TARGET'*'verify_release_tag_target'*'gh release upload'*) ;;
         *) fail 'draft target and tag checks must run before upload'; return ;;
     esac
     case "$publish_step" in
-        *'EXISTING_TARGET'*'TAG_TARGET'*'gh release edit'*) ;;
+        *'EXISTING_TARGET'*'verify_release_tag_target'*'gh release edit'*) ;;
         *) fail 'draft target and tag checks must run before publication' ;;
     esac
 }
@@ -1226,10 +1227,11 @@ test_release_please_is_push_main_only() {
 test_release_state_comes_from_verified_manifest_transition() {
     assert_file_contains "$RELEASE_WORKFLOW" \
         '.github/.release-please-manifest.json' || return
-    assert_file_contains "$RELEASE_WORKFLOW" \
-        'git diff --quiet "$BEFORE_SHA" "$COMMIT_SHA" -- "$MANIFEST"' || return
-    assert_file_contains "$RELEASE_WORKFLOW" \
+    assert_file_contains "$RELEASE_LIB" \
+        'git diff --quiet "$before_sha" "$commit_sha" -- "$manifest"' || return
+    assert_file_contains "$RELEASE_LIB" \
         "jq -er '.[\".\"]'" || return
+    assert_file_contains "$RELEASE_WORKFLOW" 'source scripts/release-lib.sh' || return
     assert_file_contains "$RELEASE_WORKFLOW" \
         'release_tag: ${{ steps.source.outputs.tag }}' || return
     assert_file_contains "$RELEASE_WORKFLOW" \
@@ -1289,6 +1291,13 @@ test_numeric_semver_increase_is_detected() {
     assert_success || return
     assert_output 'created=true' || return
     assert_output 'tag=v1.10.0'
+}
+
+test_unsafe_semver_component_is_rejected() {
+    extract_detection_script
+    reset_detection_fixture '1.99.0' '1.100.0'
+    run_release_detection "$DETECTION_BEFORE_SHA" "$DETECTION_COMMIT_SHA"
+    assert_failure_containing 'CFBundleVersion'
 }
 
 test_release_detection_rejects_version_rollback() {
@@ -1364,15 +1373,16 @@ test_publication_rechecks_fresh_main_tip() {
     fi
 }
 
-if [[ ! -x "$VALIDATOR" ]]; then
+if [[ ! -x "$VALIDATOR" || ! -r "$RELEASE_LIB" ]]; then
     printf 'not ok 1 - release validator exists\n' >&2
     printf '    expected executable: %s\n' "$VALIDATOR" >&2
     printf '    The release contract tests were added before its implementation.\n' >&2
     exit 1
 fi
 
-run_test 'tagged preflight enables signing and updates' test_tagged_preflight
-run_test 'development preflight permits unsigned builds without updates' test_development_preflight
+run_test 'tagged preflight emits verified release metadata' test_tagged_preflight
+run_test 'preflight requires a verified release tag' test_preflight_requires_release_tag
+run_test 'verified releases use one signed updatable artifact set' test_release_uses_one_signed_updatable_artifact_set
 
 for input in \
     MAC_CERT_P12_BASE64 \
@@ -1432,6 +1442,7 @@ run_test 'an unavailable before revision fails closed without dispatch' test_mis
 run_test 'release source must equal the current origin/main tip' test_release_source_requires_current_main_tip
 run_test 'release source rejects a reverted origin/main tip' test_release_source_rejects_reverted_main_tip
 run_test 'numeric semantic-version increases are accepted' test_numeric_semver_increase_is_detected
+run_test 'CFBundleVersion-unsafe semantic versions fail closed' test_unsafe_semver_component_is_rejected
 run_test 'release detection rejects a version rollback' test_release_detection_rejects_version_rollback
 run_test 'release detection rejects a stable-to-prerelease rollback' test_release_detection_rejects_prerelease_rollback
 run_test 'release source verification rejects a version rollback' test_release_source_rejects_version_rollback

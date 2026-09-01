@@ -187,18 +187,7 @@ preflight() {
     local framework="${SPARKLE_FRAMEWORK_PATH:-}"
     local appcast_tool="${SPARKLE_APPCAST_TOOL:-}"
 
-    if [[ -z "$tag" ]]; then
-        local short_sha="${COMMIT_SHA:-dev}"
-        short_sha="${short_sha:0:7}"
-        write_output is_release false
-        write_output sign false
-        write_output updater false
-        write_output tag ""
-        write_output version "0.0.0-dev.$short_sha"
-        write_output short_version "0.0.0"
-        write_output bundle_version "0.0.0"
-        return
-    fi
+    [[ -n "$tag" ]] || fail "RELEASE_TAG is required"
 
     parse_release_tag "$tag"
     for input in \
@@ -221,9 +210,6 @@ preflight() {
     validate_source_plist
     validate_sparkle_signing_key
 
-    write_output is_release true
-    write_output sign true
-    write_output updater true
     write_output tag "$tag"
     write_output version "$RELEASE_VERSION"
     write_output short_version "$RELEASE_SHORT_VERSION"

@@ -34,69 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           MANIFEST=.github/.release-please-manifest.json
-          semver_is_greater() {
-            local before="$1"
-            local after="$2"
-            local pattern='^([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|beta|rc)\.([0-9]+))?$'
-            local before_major before_minor before_patch before_stage before_number
-            local after_major after_minor after_patch after_stage after_number
-            local component before_rank after_rank
-
-            [[ "$before" =~ $pattern ]] || return 2
-            before_major="${BASH_REMATCH[1]}"
-            before_minor="${BASH_REMATCH[2]}"
-            before_patch="${BASH_REMATCH[3]}"
-            before_stage="${BASH_REMATCH[5]:-}"
-            before_number="${BASH_REMATCH[6]:-0}"
-            [[ "$after" =~ $pattern ]] || return 2
-            after_major="${BASH_REMATCH[1]}"
-            after_minor="${BASH_REMATCH[2]}"
-            after_patch="${BASH_REMATCH[3]}"
-            after_stage="${BASH_REMATCH[5]:-}"
-            after_number="${BASH_REMATCH[6]:-0}"
-
-            for component in \
-              "$before_major" "$before_minor" "$before_patch" "$before_number" \
-              "$after_major" "$after_minor" "$after_patch" "$after_number"
-            do
-              if [[ ${#component} -gt 1 && "$component" == 0* ]]; then
-                return 2
-              fi
-            done
-            if [[ -n "$before_stage" && "$before_number" == 0 ]] || \
-               [[ -n "$after_stage" && "$after_number" == 0 ]]; then
-              return 2
-            fi
-            if [[ ${#before_major} -gt 4 || ${#after_major} -gt 4 || \
-                  ${#before_minor} -gt 2 || ${#after_minor} -gt 2 || \
-                  ${#before_patch} -gt 2 || ${#after_patch} -gt 2 || \
-                  ${#before_number} -gt 3 || ${#after_number} -gt 3 ]]; then
-              return 2
-            fi
-
-            if (( 10#$after_major > 10#$before_major )); then return 0; fi
-            if (( 10#$after_major < 10#$before_major )); then return 1; fi
-            if (( 10#$after_minor > 10#$before_minor )); then return 0; fi
-            if (( 10#$after_minor < 10#$before_minor )); then return 1; fi
-            if (( 10#$after_patch > 10#$before_patch )); then return 0; fi
-            if (( 10#$after_patch < 10#$before_patch )); then return 1; fi
-
-            if [[ -z "$before_stage" ]]; then
-              [[ -n "$after_stage" ]] && return 1
-              return 1
-            fi
-            [[ -z "$after_stage" ]] && return 0
-            case "$before_stage" in alpha) before_rank=1 ;; beta) before_rank=2 ;; rc) before_rank=3 ;; esac
-            case "$after_stage" in alpha) after_rank=1 ;; beta) after_rank=2 ;; rc) after_rank=3 ;; esac
-            if (( after_rank > before_rank )); then return 0; fi
-            if (( after_rank < before_rank )); then return 1; fi
-            (( 10#$after_number > 10#$before_number ))
-          }
-
-          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "error: before_sha must be a full lowercase Git commit SHA" >&2
-            exit 1
-          fi
+          source scripts/release-lib.sh
           if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "error: release SHA must be a full lowercase Git commit SHA" >&2
             exit 1
@@ -112,54 +50,14 @@ jobs:
           fi
           ORIGIN_MAIN_SHA="$(git rev-parse origin/main)"
           if [[ "$ORIGIN_MAIN_SHA" != "$COMMIT_SHA" ]]; then
+            # Push another manifest bump to release the new main tip.
             echo "error: origin/main tip no longer equals the release source" >&2
             exit 1
           fi
-          if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
-            echo "error: before_sha does not identify an available commit" >&2
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$BEFORE_SHA" "$COMMIT_SHA"; then
-            echo "error: before_sha is not an ancestor of the release SHA" >&2
-            exit 1
-          fi
-          if ! git cat-file -e "$BEFORE_SHA:$MANIFEST" 2>/dev/null || \
-             ! git cat-file -e "$COMMIT_SHA:$MANIFEST" 2>/dev/null; then
-            echo "error: release manifest is unavailable across the claimed transition" >&2
-            exit 1
-          fi
-          if git diff --quiet "$BEFORE_SHA" "$COMMIT_SHA" -- "$MANIFEST"; then
-            echo "error: release manifest did not change across the claimed transition" >&2
-            exit 1
-          else
-            DIFF_STATUS=$?
-            if [[ "$DIFF_STATUS" -ne 1 ]]; then
-              echo "error: could not verify the release manifest transition" >&2
-              exit 1
-            fi
-          fi
-
-          BEFORE_VERSION="$(git show "$BEFORE_SHA:$MANIFEST" | jq -er '.["."]')"
-          VERSION="$(git show "$COMMIT_SHA:$MANIFEST" | jq -er '.["."]')"
-          if semver_is_greater "$BEFORE_VERSION" "$VERSION"; then
-            :
-          else
-            VERSION_STATUS=$?
-            if [[ "$VERSION_STATUS" -eq 2 ]]; then
-              echo "error: release manifest contains an unsupported semantic version" >&2
-            else
-              echo "error: release version $VERSION must be greater than $BEFORE_VERSION" >&2
-            fi
-            exit 1
-          fi
-          RELEASE_TAG="v$VERSION"
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
-            echo "error: release manifest contains an unsupported version: $VERSION" >&2
-            exit 1
-          fi
+          verify_release_manifest_transition "$BEFORE_SHA" "$COMMIT_SHA" "$MANIFEST"
 
           echo "ref=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_MANIFEST_TAG" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build, sign, notarize, publish
@@ -206,7 +104,6 @@ jobs:
 
       - name: Import signing certificate
         id: signing
-        if: steps.contract.outputs.sign == 'true'
         env:
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
@@ -239,7 +136,6 @@ jobs:
           APP_VERSION: ${{ steps.contract.outputs.version }}
           APP_SHORT_VERSION: ${{ steps.contract.outputs.short_version }}
           APP_BUNDLE_VERSION: ${{ steps.contract.outputs.bundle_version }}
-          UPDATER_ENABLED: ${{ steps.contract.outputs.updater }}
           SKIP_PREWARM: "1"
           SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
         run: ./scripts/make-app.sh
@@ -253,7 +149,6 @@ jobs:
           fi
 
       - name: Notarize app
-        if: steps.contract.outputs.sign == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -275,7 +170,6 @@ jobs:
         run: ./scripts/make-dmg.sh
 
       - name: Sign DMG
-        if: steps.contract.outputs.sign == 'true'
         env:
           APP_VERSION: ${{ steps.contract.outputs.version }}
           SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
@@ -286,7 +180,6 @@ jobs:
             --identifier app.talix.localflow.dmg "$DMG"
 
       - name: Notarize DMG
-        if: steps.contract.outputs.sign == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -305,22 +198,18 @@ jobs:
       - name: Verify signed artifacts
         env:
           APP_VERSION: ${{ steps.contract.outputs.version }}
-          SIGNED: ${{ steps.contract.outputs.sign }}
         run: |
           set -euo pipefail
           DMG="dist/LocalFlow-${APP_VERSION}.dmg"
           codesign --verify --deep --strict --verbose=2 build/LocalFlow.app
-          if [[ "$SIGNED" == "true" ]]; then
-            codesign --verify --strict --verbose=2 "$DMG"
-            spctl --assess --type execute --verbose=4 build/LocalFlow.app
-            spctl --assess --type open --context context:primary-signature \
-              --verbose=4 "$DMG"
-            xcrun stapler validate build/LocalFlow.app
-            xcrun stapler validate "$DMG"
-          fi
+          codesign --verify --strict --verbose=2 "$DMG"
+          spctl --assess --type execute --verbose=4 build/LocalFlow.app
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=4 "$DMG"
+          xcrun stapler validate build/LocalFlow.app
+          xcrun stapler validate "$DMG"
 
       - name: Build Sparkle appcast
-        if: steps.contract.outputs.updater == 'true'
         env:
           APP_VERSION: ${{ steps.contract.outputs.version }}
           RELEASE_TAG: ${{ steps.contract.outputs.tag }}
@@ -352,16 +241,12 @@ jobs:
       - name: Build checksums
         env:
           APP_VERSION: ${{ steps.contract.outputs.version }}
-          UPDATER_ENABLED: ${{ steps.contract.outputs.updater }}
         run: |
           set -euo pipefail
           cp scripts/setup-s1-mini.sh dist/setup-s1-mini.sh
           chmod 755 dist/setup-s1-mini.sh
           cd dist
-          FILES=("LocalFlow-${APP_VERSION}.dmg" setup-s1-mini.sh)
-          if [[ "$UPDATER_ENABLED" == "true" ]]; then
-            FILES+=("LocalFlow-${APP_VERSION}.zip")
-          fi
+          FILES=("LocalFlow-${APP_VERSION}.dmg" "LocalFlow-${APP_VERSION}.zip" setup-s1-mini.sh)
           shasum -a 256 "${FILES[@]}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
@@ -392,7 +277,6 @@ jobs:
           retention-days: 14
 
       - name: Create verified draft release
-        if: steps.contract.outputs.is_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           APP_VERSION: ${{ steps.contract.outputs.version }}
@@ -400,24 +284,7 @@ jobs:
           COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
         run: |
           set -euo pipefail
-          verify_current_main_tip() {
-            local auth_header
-            local origin_main_sha
-            auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
-            if ! GIT_CONFIG_COUNT=1 \
-                 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
-                 GIT_CONFIG_VALUE_0="$auth_header" \
-                 git fetch --no-tags origin \
-                   "+refs/heads/main:refs/remotes/origin/main"; then
-              echo "error: could not refresh the origin/main tip before release mutation" >&2
-              return 1
-            fi
-            origin_main_sha="$(git rev-parse origin/main)"
-            if [[ "$origin_main_sha" != "$COMMIT_SHA" ]]; then
-              echo "error: origin/main tip no longer equals the release source" >&2
-              return 1
-            fi
-          }
+          source scripts/release-lib.sh
 
           NOTES_FILE="$RUNNER_TEMP/release-notes.md"
           if [[ -f CHANGELOG.md ]]; then
@@ -445,21 +312,7 @@ jobs:
             fi
           fi
 
-          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
-          export GIT_CONFIG_VALUE_0="$AUTH_HEADER"
-          REMOTE_TAG="$(git ls-remote --tags --refs origin "refs/tags/$RELEASE_TAG")"
-          if [[ -n "$REMOTE_TAG" ]]; then
-            git fetch --no-tags origin \
-              "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-            TAG_TARGET="$(git rev-parse "$RELEASE_TAG^{commit}")"
-            if ! [[ "$TAG_TARGET" == "$COMMIT_SHA" ]]; then
-              echo "error: tag $RELEASE_TAG targets $TAG_TARGET, not $COMMIT_SHA" >&2
-              exit 1
-            fi
-          fi
-          unset AUTH_HEADER GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          verify_release_tag_target
 
           if [[ -z "$EXISTING" ]]; then
             verify_current_main_tip
@@ -481,31 +334,13 @@ jobs:
           gh release upload "$RELEASE_TAG" "${ASSETS[@]}" --clobber
 
       - name: Publish complete release
-        if: steps.contract.outputs.is_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.contract.outputs.tag }}
           COMMIT_SHA: ${{ needs.source.outputs.commit_sha }}
         run: |
           set -euo pipefail
-          verify_current_main_tip() {
-            local auth_header
-            local origin_main_sha
-            auth_header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
-            if ! GIT_CONFIG_COUNT=1 \
-                 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
-                 GIT_CONFIG_VALUE_0="$auth_header" \
-                 git fetch --no-tags origin \
-                   "+refs/heads/main:refs/remotes/origin/main"; then
-              echo "error: could not refresh the origin/main tip before release mutation" >&2
-              return 1
-            fi
-            origin_main_sha="$(git rev-parse origin/main)"
-            if [[ "$origin_main_sha" != "$COMMIT_SHA" ]]; then
-              echo "error: origin/main tip no longer equals the release source" >&2
-              return 1
-            fi
-          }
+          source scripts/release-lib.sh
 
           IS_DRAFT="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)"
           if [[ "$IS_DRAFT" != "true" ]]; then
@@ -518,21 +353,7 @@ jobs:
             exit 1
           fi
 
-          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
-          export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
-          export GIT_CONFIG_VALUE_0="$AUTH_HEADER"
-          REMOTE_TAG="$(git ls-remote --tags --refs origin "refs/tags/$RELEASE_TAG")"
-          if [[ -n "$REMOTE_TAG" ]]; then
-            git fetch --no-tags origin \
-              "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-            TAG_TARGET="$(git rev-parse "$RELEASE_TAG^{commit}")"
-            if ! [[ "$TAG_TARGET" == "$COMMIT_SHA" ]]; then
-              echo "error: tag $RELEASE_TAG targets $TAG_TARGET, not $COMMIT_SHA" >&2
-              exit 1
-            fi
-          fi
-          unset AUTH_HEADER GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
+          verify_release_tag_target
 
           EXPECTED=$'LocalFlow-${{ steps.contract.outputs.version }}.dmg\nLocalFlow-${{ steps.contract.outputs.version }}.zip\nSHA256SUMS.txt\nappcast.xml\nsetup-s1-mini.sh'
           EXPECTED="$(printf '%s\n' "$EXPECTED" | LC_ALL=C sort)"

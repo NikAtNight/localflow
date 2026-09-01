@@ -42,121 +42,25 @@ jobs:
         run: |
           set -euo pipefail
           MANIFEST=.github/.release-please-manifest.json
-          semver_is_greater() {
-            local before="$1"
-            local after="$2"
-            local pattern='^([0-9]+)\.([0-9]+)\.([0-9]+)(-(alpha|beta|rc)\.([0-9]+))?$'
-            local before_major before_minor before_patch before_stage before_number
-            local after_major after_minor after_patch after_stage after_number
-            local component before_rank after_rank
-
-            [[ "$before" =~ $pattern ]] || return 2
-            before_major="${BASH_REMATCH[1]}"
-            before_minor="${BASH_REMATCH[2]}"
-            before_patch="${BASH_REMATCH[3]}"
-            before_stage="${BASH_REMATCH[5]:-}"
-            before_number="${BASH_REMATCH[6]:-0}"
-            [[ "$after" =~ $pattern ]] || return 2
-            after_major="${BASH_REMATCH[1]}"
-            after_minor="${BASH_REMATCH[2]}"
-            after_patch="${BASH_REMATCH[3]}"
-            after_stage="${BASH_REMATCH[5]:-}"
-            after_number="${BASH_REMATCH[6]:-0}"
-
-            for component in \
-              "$before_major" "$before_minor" "$before_patch" "$before_number" \
-              "$after_major" "$after_minor" "$after_patch" "$after_number"
-            do
-              if [[ ${#component} -gt 1 && "$component" == 0* ]]; then
-                return 2
-              fi
-            done
-            if [[ -n "$before_stage" && "$before_number" == 0 ]] || \
-               [[ -n "$after_stage" && "$after_number" == 0 ]]; then
-              return 2
-            fi
-            if [[ ${#before_major} -gt 4 || ${#after_major} -gt 4 || \
-                  ${#before_minor} -gt 2 || ${#after_minor} -gt 2 || \
-                  ${#before_patch} -gt 2 || ${#after_patch} -gt 2 || \
-                  ${#before_number} -gt 3 || ${#after_number} -gt 3 ]]; then
-              return 2
-            fi
-
-            if (( 10#$after_major > 10#$before_major )); then return 0; fi
-            if (( 10#$after_major < 10#$before_major )); then return 1; fi
-            if (( 10#$after_minor > 10#$before_minor )); then return 0; fi
-            if (( 10#$after_minor < 10#$before_minor )); then return 1; fi
-            if (( 10#$after_patch > 10#$before_patch )); then return 0; fi
-            if (( 10#$after_patch < 10#$before_patch )); then return 1; fi
-
-            if [[ -z "$before_stage" ]]; then
-              [[ -n "$after_stage" ]] && return 1
-              return 1
-            fi
-            [[ -z "$after_stage" ]] && return 0
-            case "$before_stage" in alpha) before_rank=1 ;; beta) before_rank=2 ;; rc) before_rank=3 ;; esac
-            case "$after_stage" in alpha) after_rank=1 ;; beta) after_rank=2 ;; rc) after_rank=3 ;; esac
-            if (( after_rank > before_rank )); then return 0; fi
-            if (( after_rank < before_rank )); then return 1; fi
-            (( 10#$after_number > 10#$before_number ))
-          }
-
-          if [[ ! "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]] || \
-             ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
-            echo "error: BEFORE_SHA does not identify an available commit" >&2
-            exit 1
-          fi
-          if [[ ! "$COMMIT_SHA" =~ ^[0-9a-f]{40}$ ]] || \
-             ! git cat-file -e "$COMMIT_SHA^{commit}" 2>/dev/null; then
-            echo "error: COMMIT_SHA does not identify an available commit" >&2
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$BEFORE_SHA" "$COMMIT_SHA"; then
-            echo "error: BEFORE_SHA is not an ancestor of COMMIT_SHA" >&2
-            exit 1
-          fi
+          source scripts/release-lib.sh
           if [[ "$(git rev-parse HEAD)" != "$COMMIT_SHA" ]]; then
             echo "error: the checkout does not match COMMIT_SHA" >&2
             exit 1
           fi
-          if ! git cat-file -e "$BEFORE_SHA:$MANIFEST" 2>/dev/null || \
-             ! git cat-file -e "$COMMIT_SHA:$MANIFEST" 2>/dev/null; then
-            echo "error: release manifest is unavailable across the pushed revision range" >&2
-            exit 1
-          fi
-
-          if git diff --quiet "$BEFORE_SHA" "$COMMIT_SHA" -- "$MANIFEST"; then
-            echo "A normal main-branch push; no release build to dispatch."
-            echo "created=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          else
-            DIFF_STATUS=$?
-            if [[ "$DIFF_STATUS" -ne 1 ]]; then
-              echo "error: could not verify the release manifest transition" >&2
-              exit 1
-            fi
-          fi
-
-          BEFORE_VERSION="$(git show "$BEFORE_SHA:$MANIFEST" | jq -er '.["."]')"
-          VERSION="$(git show "$COMMIT_SHA:$MANIFEST" | jq -er '.["."]')"
-          if semver_is_greater "$BEFORE_VERSION" "$VERSION"; then
+          if verify_release_manifest_transition \
+              "$BEFORE_SHA" "$COMMIT_SHA" "$MANIFEST" true; then
             :
           else
-            VERSION_STATUS=$?
-            if [[ "$VERSION_STATUS" -eq 2 ]]; then
-              echo "error: release manifest contains an unsupported semantic version" >&2
-            else
-              echo "error: release version $VERSION must be greater than $BEFORE_VERSION" >&2
+            TRANSITION_STATUS=$?
+            if [[ "$TRANSITION_STATUS" -eq 3 ]]; then
+              echo "A normal main-branch push; no release build to dispatch."
+              echo "created=false" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
-            exit 1
-          fi
-          TAG="v$VERSION"
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z]+\.[0-9]+)?$ ]]; then
-            echo "error: release manifest contains an unsupported version: $VERSION" >&2
-            exit 1
+            exit "$TRANSITION_STATUS"
           fi
           echo "created=true" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_MANIFEST_TAG" >> "$GITHUB_OUTPUT"
 
   release:
     name: Build release before publication
