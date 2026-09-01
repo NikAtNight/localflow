@@ -29,10 +29,10 @@ final class SettingsApplicationRoutingTests: XCTestCase {
         let system = FakeLiveSystem()
         let application = makeApplication(defaults: makeDefaults(), system: system)
 
-        XCTAssertSuccess(application.apply(.commandHotkey(.rightCommand), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.commandHotkey(.rightCommand)))
         system.events.removeAll()
 
-        XCTAssertSuccess(application.apply(.hotkey(.rightCommand), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.hotkey(.rightCommand)))
 
         XCTAssertEqual(system.events, [
             .hotkey(.rightCommand),
@@ -47,7 +47,7 @@ final class SettingsApplicationRoutingTests: XCTestCase {
         let application = makeApplication(defaults: makeDefaults(), system: system)
         let model = SettingsModel(settingsApplication: application)
 
-        XCTAssertSuccess(model.apply(.hotkey(.rightCommand), from: .menu))
+        XCTAssertSuccess(model.apply(.hotkey(.rightCommand)))
 
         XCTAssertEqual(model.hotkey, .rightCommand)
         XCTAssertEqual(application.values.hotkey, .rightCommand)

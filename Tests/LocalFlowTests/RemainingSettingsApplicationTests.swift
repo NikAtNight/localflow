@@ -53,12 +53,20 @@ final class RemainingSettingsApplicationTests: XCTestCase {
         XCTAssertFalse(application.values.commandModeEnabled)
         XCTAssertEqual(application.values.theme, .aurora)
         XCTAssertFalse(application.values.soundCues)
+        XCTAssertEqual(application.values.ollamaModel, "cleanup-model")
+        XCTAssertEqual(application.values.ollamaCommandModel, "command-model")
+        XCTAssertEqual(application.values.commandReasoning, .high)
+        XCTAssertFalse(application.values.saveHistory)
         XCTAssertEqual(defaults.string(forKey: "commandHotkey"), HotkeyManager.Key.rightCommand.rawValue)
         XCTAssertEqual(defaults.object(forKey: "keepMicWarm") as? Bool, false)
         XCTAssertEqual(defaults.object(forKey: "cleanupEnabled") as? Bool, true)
         XCTAssertEqual(defaults.object(forKey: "commandModeEnabled") as? Bool, false)
         XCTAssertEqual(defaults.string(forKey: "hudTheme"), HudTheme.aurora.rawValue)
         XCTAssertEqual(defaults.object(forKey: "soundCues") as? Bool, false)
+        XCTAssertEqual(defaults.string(forKey: "ollamaModel"), "cleanup-model")
+        XCTAssertEqual(defaults.string(forKey: "ollamaCommandModel"), "command-model")
+        XCTAssertEqual(defaults.string(forKey: "commandReasoning"), ReasoningLevel.high.rawValue)
+        XCTAssertEqual(defaults.object(forKey: "saveHistory") as? Bool, false)
     }
 
     func testApplicationDoesNotApplyEffectsForInitialValues() {
@@ -66,12 +74,16 @@ final class RemainingSettingsApplicationTests: XCTestCase {
         let system = FakeLiveSystem()
         let application = makeApplication(defaults: defaults, system: system)
 
-        XCTAssertSuccess(application.apply(.commandHotkey(.rightOption), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.keepMicWarm(true), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.cleanupEnabled(false), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.commandModeEnabled(true), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.theme(.classic), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.soundCues(true), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.commandHotkey(.rightOption)))
+        XCTAssertSuccess(application.apply(.keepMicWarm(true)))
+        XCTAssertSuccess(application.apply(.cleanupEnabled(false)))
+        XCTAssertSuccess(application.apply(.commandModeEnabled(true)))
+        XCTAssertSuccess(application.apply(.theme(.classic)))
+        XCTAssertSuccess(application.apply(.soundCues(true)))
+        XCTAssertSuccess(application.apply(.ollamaModel("s1-mini")))
+        XCTAssertSuccess(application.apply(.ollamaCommandModel("gemma3:4b")))
+        XCTAssertSuccess(application.apply(.commandReasoning(.off)))
+        XCTAssertSuccess(application.apply(.saveHistory(true)))
 
         XCTAssertTrue(system.events.isEmpty)
     }
@@ -88,6 +100,10 @@ final class RemainingSettingsApplicationTests: XCTestCase {
         model.commandModeEnabled = false
         model.theme = .aurora
         model.soundCues = false
+        model.ollamaModel = "cleanup-model"
+        model.ollamaCommandModel = "command-model"
+        model.commandReasoning = .high
+        model.saveHistory = false
 
         XCTAssertEqual(system.events, [
             .commandHotkey(.rightCommand),
@@ -103,15 +119,23 @@ final class RemainingSettingsApplicationTests: XCTestCase {
         XCTAssertEqual(application.values.commandModeEnabled, model.commandModeEnabled)
         XCTAssertEqual(application.values.theme, model.theme)
         XCTAssertEqual(application.values.soundCues, model.soundCues)
+        XCTAssertEqual(application.values.ollamaModel, model.ollamaModel)
+        XCTAssertEqual(application.values.ollamaCommandModel, model.ollamaCommandModel)
+        XCTAssertEqual(application.values.commandReasoning, model.commandReasoning)
+        XCTAssertEqual(application.values.saveHistory, model.saveHistory)
     }
 
     private func applyChangedValues(to application: SettingsApplication) {
-        XCTAssertSuccess(application.apply(.commandHotkey(.rightCommand), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.keepMicWarm(false), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.cleanupEnabled(true), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.commandModeEnabled(false), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.theme(.aurora), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.soundCues(false), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.commandHotkey(.rightCommand)))
+        XCTAssertSuccess(application.apply(.keepMicWarm(false)))
+        XCTAssertSuccess(application.apply(.cleanupEnabled(true)))
+        XCTAssertSuccess(application.apply(.commandModeEnabled(false)))
+        XCTAssertSuccess(application.apply(.theme(.aurora)))
+        XCTAssertSuccess(application.apply(.soundCues(false)))
+        XCTAssertSuccess(application.apply(.ollamaModel("cleanup-model")))
+        XCTAssertSuccess(application.apply(.ollamaCommandModel("command-model")))
+        XCTAssertSuccess(application.apply(.commandReasoning(.high)))
+        XCTAssertSuccess(application.apply(.saveHistory(false)))
     }
 
     private func makeDefaults() -> UserDefaults {

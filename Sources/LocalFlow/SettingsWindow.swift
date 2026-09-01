@@ -47,88 +47,91 @@ final class SettingsModel: ObservableObject {
     @Published var theme: HudTheme = HudTheme.current {
         didSet {
             guard oldValue != theme, !isSynchronizingApplicationValues else { return }
-            apply(.theme(theme), from: .settingsWindow)
+            apply(.theme(theme))
         }
     }
 
     @Published var hotkey: HotkeyManager.Key = Settings.hotkey {
         didSet {
             guard oldValue != hotkey, !isSynchronizingApplicationValues else { return }
-            apply(.hotkey(hotkey), from: .settingsWindow)
+            apply(.hotkey(hotkey))
         }
     }
 
     @Published var whisperModel: String = Settings.whisperModel {
         didSet {
             guard oldValue != whisperModel, !isSynchronizingApplicationValues else { return }
-            apply(.whisperModel(whisperModel), from: .settingsWindow)
+            apply(.whisperModel(whisperModel))
         }
     }
 
     @Published var micUID: String? = Settings.inputDeviceUID {
         didSet {
             guard oldValue != micUID, !isSynchronizingApplicationValues else { return }
-            apply(.microphone(micUID), from: .settingsWindow)
+            apply(.microphone(micUID))
         }
     }
 
     @Published var cleanupEnabled: Bool = Settings.cleanupEnabled {
         didSet {
             guard oldValue != cleanupEnabled, !isSynchronizingApplicationValues else { return }
-            apply(.cleanupEnabled(cleanupEnabled), from: .settingsWindow)
+            apply(.cleanupEnabled(cleanupEnabled))
         }
     }
 
     @Published var ollamaModel: String = Settings.ollamaModel {
         didSet {
-            guard oldValue != ollamaModel else { return }
-            Settings.ollamaModel = ollamaModel
+            guard oldValue != ollamaModel, !isSynchronizingApplicationValues else { return }
+            apply(.ollamaModel(ollamaModel))
         }
     }
 
     @Published var soundCues: Bool = Settings.soundCues {
         didSet {
             guard oldValue != soundCues, !isSynchronizingApplicationValues else { return }
-            apply(.soundCues(soundCues), from: .settingsWindow)
+            apply(.soundCues(soundCues))
         }
     }
 
     @Published var saveHistory: Bool = Settings.saveHistory {
-        didSet { Settings.saveHistory = saveHistory }
+        didSet {
+            guard oldValue != saveHistory, !isSynchronizingApplicationValues else { return }
+            apply(.saveHistory(saveHistory))
+        }
     }
 
     @Published var automaticUpdates: Bool = Settings.automaticUpdates {
         didSet {
             guard oldValue != automaticUpdates, !isSynchronizingApplicationValues else { return }
-            apply(.automaticUpdates(automaticUpdates), from: .settingsWindow)
+            apply(.automaticUpdates(automaticUpdates))
         }
     }
 
     @Published var commandModeEnabled: Bool = Settings.commandModeEnabled {
         didSet {
             guard oldValue != commandModeEnabled, !isSynchronizingApplicationValues else { return }
-            apply(.commandModeEnabled(commandModeEnabled), from: .settingsWindow)
+            apply(.commandModeEnabled(commandModeEnabled))
         }
     }
 
     @Published var commandHotkey: HotkeyManager.Key = Settings.commandHotkey {
         didSet {
             guard oldValue != commandHotkey, !isSynchronizingApplicationValues else { return }
-            apply(.commandHotkey(commandHotkey), from: .settingsWindow)
+            apply(.commandHotkey(commandHotkey))
         }
     }
 
     @Published var ollamaCommandModel: String = Settings.ollamaCommandModel {
         didSet {
-            guard oldValue != ollamaCommandModel else { return }
-            Settings.ollamaCommandModel = ollamaCommandModel
+            guard oldValue != ollamaCommandModel, !isSynchronizingApplicationValues else { return }
+            apply(.ollamaCommandModel(ollamaCommandModel))
         }
     }
 
     @Published var commandReasoning: ReasoningLevel = Settings.commandReasoning {
         didSet {
-            guard oldValue != commandReasoning else { return }
-            Settings.commandReasoning = commandReasoning
+            guard oldValue != commandReasoning, !isSynchronizingApplicationValues else { return }
+            apply(.commandReasoning(commandReasoning))
         }
     }
 
@@ -156,7 +159,7 @@ final class SettingsModel: ObservableObject {
     @Published var customVocabulary: String = Settings.customVocabulary {
         didSet {
             guard oldValue != customVocabulary, !isSynchronizingApplicationValues else { return }
-            apply(.customVocabulary(customVocabulary), from: .settingsWindow)
+            apply(.customVocabulary(customVocabulary))
         }
     }
 
@@ -168,8 +171,7 @@ final class SettingsModel: ObservableObject {
             apply(
                 .corrections(corrections.map {
                     SettingsApplication.Correction(wrong: $0.wrong, right: $0.right)
-                }),
-                from: .settingsWindow
+                })
             )
         }
     }
@@ -194,14 +196,14 @@ final class SettingsModel: ObservableObject {
     @Published var keepMicWarm: Bool = Settings.keepMicWarm {
         didSet {
             guard oldValue != keepMicWarm, !isSynchronizingApplicationValues else { return }
-            apply(.keepMicWarm(keepMicWarm), from: .settingsWindow)
+            apply(.keepMicWarm(keepMicWarm))
         }
     }
 
     @Published var startAtLogin: Bool = false {
         didSet {
             guard oldValue != startAtLogin, !isSynchronizingApplicationValues else { return }
-            apply(.startAtLogin(startAtLogin), from: .settingsWindow)
+            apply(.startAtLogin(startAtLogin))
         }
     }
 
@@ -253,10 +255,9 @@ final class SettingsModel: ObservableObject {
     /// and live effects with the settings window.
     @discardableResult
     func apply(
-        _ change: SettingsApplication.Change,
-        from source: SettingsApplication.Source
+        _ change: SettingsApplication.Change
     ) -> Result<Void, SettingsApplication.Failure> {
-        let result = settingsApplication.apply(change, from: source)
+        let result = settingsApplication.apply(change)
         if case .failure(.loginItemChangeFailed) = result {
             DiagLog.log("login item toggle failed")
         }
@@ -278,6 +279,10 @@ final class SettingsModel: ObservableObject {
         theme = settingsApplication.values.theme
         soundCues = settingsApplication.values.soundCues
         customVocabulary = settingsApplication.values.customVocabulary
+        ollamaModel = settingsApplication.values.ollamaModel
+        ollamaCommandModel = settingsApplication.values.ollamaCommandModel
+        commandReasoning = settingsApplication.values.commandReasoning
+        saveHistory = settingsApplication.values.saveHistory
         let applicationCorrections = settingsApplication.values.corrections
         if corrections.map({ SettingsApplication.Correction(wrong: $0.wrong, right: $0.right) })
             != applicationCorrections {
@@ -301,7 +306,7 @@ final class SettingsModel: ObservableObject {
         // Feed the model pickers whatever is installed right now; models
         // pulled while the window was closed appear on the next open.
         Task { [weak self] in
-            let models = await OllamaCleaner.installedModels()
+            let models = await LocalTextModelPolicy.shared.installedOllamaModels()
             self?.availableOllamaModels = models
         }
     }

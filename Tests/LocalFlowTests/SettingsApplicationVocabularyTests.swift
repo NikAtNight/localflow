@@ -27,10 +27,10 @@ final class SettingsApplicationVocabularyTests: XCTestCase {
         let application = makeApplication(defaults: firstDefaults, system: system)
         let corrections = [SettingsApplication.Correction(wrong: "talex", right: "Talix")]
 
-        XCTAssertSuccess(application.apply(.customVocabulary("LocalFlow"), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.corrections(corrections), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.customVocabulary("LocalFlow"), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.corrections(corrections), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.customVocabulary("LocalFlow")))
+        XCTAssertSuccess(application.apply(.corrections(corrections)))
+        XCTAssertSuccess(application.apply(.customVocabulary("LocalFlow")))
+        XCTAssertSuccess(application.apply(.corrections(corrections)))
 
         XCTAssertEqual(system.decoderVocabulary, ["LocalFlow", "LocalFlow, Talix"])
         XCTAssertEqual(firstDefaults.string(forKey: Settings.Key.customVocabulary), "LocalFlow")

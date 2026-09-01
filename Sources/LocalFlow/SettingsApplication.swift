@@ -23,6 +23,10 @@ final class SettingsApplication {
         var soundCues: Bool
         var customVocabulary: String
         var corrections: [Correction]
+        var ollamaModel: String
+        var ollamaCommandModel: String
+        var commandReasoning: ReasoningLevel
+        var saveHistory: Bool
     }
 
     enum Change: Equatable {
@@ -39,11 +43,10 @@ final class SettingsApplication {
         case soundCues(Bool)
         case customVocabulary(String)
         case corrections([Correction])
-    }
-
-    enum Source {
-        case settingsWindow
-        case menu
+        case ollamaModel(String)
+        case ollamaCommandModel(String)
+        case commandReasoning(ReasoningLevel)
+        case saveHistory(Bool)
     }
 
     enum Failure: Error, Equatable {
@@ -137,6 +140,12 @@ final class SettingsApplication {
         let soundCues = Self.loadBool(from: defaults, key: Settings.Key.soundCues, default: true)
         let customVocabulary = defaults.string(forKey: Settings.Key.customVocabulary) ?? ""
         let corrections = Self.loadCorrections(from: defaults)
+        let ollamaModel = defaults.string(forKey: Settings.Key.ollamaModel) ?? "s1-mini"
+        let ollamaCommandModel = defaults.string(forKey: Settings.Key.ollamaCommandModel) ?? "gemma3:4b"
+        let commandReasoning = ReasoningLevel(
+            rawValue: defaults.string(forKey: Settings.Key.commandReasoning) ?? ""
+        ) ?? .off
+        let saveHistory = Self.loadBool(from: defaults, key: Settings.Key.saveHistory, default: true)
 
         values = Values(
             hotkey: hotkey,
@@ -151,7 +160,11 @@ final class SettingsApplication {
             theme: theme,
             soundCues: soundCues,
             customVocabulary: customVocabulary,
-            corrections: corrections
+            corrections: corrections,
+            ollamaModel: ollamaModel,
+            ollamaCommandModel: ollamaCommandModel,
+            commandReasoning: commandReasoning,
+            saveHistory: saveHistory
         )
 
         // Repair missing or malformed values without treating startup as a
@@ -172,10 +185,14 @@ final class SettingsApplication {
         defaults.set(soundCues, forKey: Settings.Key.soundCues)
         defaults.set(customVocabulary, forKey: Settings.Key.customVocabulary)
         defaults.set(Self.encodedCorrections(corrections), forKey: Settings.Key.corrections)
+        defaults.set(ollamaModel, forKey: Settings.Key.ollamaModel)
+        defaults.set(ollamaCommandModel, forKey: Settings.Key.ollamaCommandModel)
+        defaults.set(commandReasoning.rawValue, forKey: Settings.Key.commandReasoning)
+        defaults.set(saveHistory, forKey: Settings.Key.saveHistory)
     }
 
     @discardableResult
-    func apply(_ change: Change, from _: Source) -> Result<Void, Failure> {
+    func apply(_ change: Change) -> Result<Void, Failure> {
         switch change {
         case .hotkey(let hotkey):
             guard hotkey != values.hotkey else { return .success(()) }
@@ -269,6 +286,26 @@ final class SettingsApplication {
             defaults.set(Self.encodedCorrections(corrections), forKey: Settings.Key.corrections)
             values.corrections = corrections
             effects.refreshDecoderVocabulary(Self.effectiveVocabulary(from: values))
+
+        case .ollamaModel(let model):
+            guard model != values.ollamaModel else { return .success(()) }
+            defaults.set(model, forKey: Settings.Key.ollamaModel)
+            values.ollamaModel = model
+
+        case .ollamaCommandModel(let model):
+            guard model != values.ollamaCommandModel else { return .success(()) }
+            defaults.set(model, forKey: Settings.Key.ollamaCommandModel)
+            values.ollamaCommandModel = model
+
+        case .commandReasoning(let reasoning):
+            guard reasoning != values.commandReasoning else { return .success(()) }
+            defaults.set(reasoning.rawValue, forKey: Settings.Key.commandReasoning)
+            values.commandReasoning = reasoning
+
+        case .saveHistory(let saveHistory):
+            guard saveHistory != values.saveHistory else { return .success(()) }
+            defaults.set(saveHistory, forKey: Settings.Key.saveHistory)
+            values.saveHistory = saveHistory
         }
 
         return .success(())

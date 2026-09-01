@@ -49,10 +49,10 @@ final class SettingsApplicationTests: XCTestCase {
         let first = makeApplication(defaults: firstDefaults, system: firstSystem)
         let second = makeApplication(defaults: secondDefaults, system: secondSystem)
 
-        XCTAssertSuccess(first.apply(.hotkey(.rightCommand), from: .settingsWindow))
-        XCTAssertSuccess(first.apply(.whisperModel(Self.smallModel), from: .settingsWindow))
-        XCTAssertSuccess(first.apply(.microphone("studio-mic"), from: .settingsWindow))
-        XCTAssertSuccess(first.apply(.automaticUpdates(false), from: .settingsWindow))
+        XCTAssertSuccess(first.apply(.hotkey(.rightCommand)))
+        XCTAssertSuccess(first.apply(.whisperModel(Self.smallModel)))
+        XCTAssertSuccess(first.apply(.microphone("studio-mic")))
+        XCTAssertSuccess(first.apply(.automaticUpdates(false)))
 
         let restored = makeApplication(defaults: firstDefaults, system: FakeLiveSystem())
         XCTAssertEqual(restored.values.hotkey, .rightCommand)
@@ -93,10 +93,10 @@ final class SettingsApplicationTests: XCTestCase {
         let system = FakeLiveSystem()
         let application = makeApplication(defaults: defaults, system: system)
 
-        XCTAssertSuccess(application.apply(.hotkey(.rightCommand), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.whisperModel(Self.smallModel), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.microphone("usb-mic"), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.automaticUpdates(false), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.hotkey(.rightCommand)))
+        XCTAssertSuccess(application.apply(.whisperModel(Self.smallModel)))
+        XCTAssertSuccess(application.apply(.microphone("usb-mic")))
+        XCTAssertSuccess(application.apply(.automaticUpdates(false)))
 
         XCTAssertEqual(system.events, [
             .hotkey(.rightCommand),
@@ -115,16 +115,16 @@ final class SettingsApplicationTests: XCTestCase {
         let system = FakeLiveSystem()
         let application = makeApplication(defaults: defaults, system: system)
 
-        XCTAssertSuccess(application.apply(.hotkey(.rightCommand), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.whisperModel(Self.smallModel), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.microphone("usb-mic"), from: .settingsWindow))
-        XCTAssertSuccess(application.apply(.automaticUpdates(false), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.hotkey(.rightCommand)))
+        XCTAssertSuccess(application.apply(.whisperModel(Self.smallModel)))
+        XCTAssertSuccess(application.apply(.microphone("usb-mic")))
+        XCTAssertSuccess(application.apply(.automaticUpdates(false)))
         system.events.removeAll()
 
-        XCTAssertSuccess(application.apply(.hotkey(.rightCommand), from: .menu))
-        XCTAssertSuccess(application.apply(.whisperModel(Self.smallModel), from: .menu))
-        XCTAssertSuccess(application.apply(.microphone("usb-mic"), from: .menu))
-        XCTAssertSuccess(application.apply(.automaticUpdates(false), from: .menu))
+        XCTAssertSuccess(application.apply(.hotkey(.rightCommand)))
+        XCTAssertSuccess(application.apply(.whisperModel(Self.smallModel)))
+        XCTAssertSuccess(application.apply(.microphone("usb-mic")))
+        XCTAssertSuccess(application.apply(.automaticUpdates(false)))
 
         XCTAssertTrue(system.events.isEmpty)
     }
@@ -143,8 +143,8 @@ final class SettingsApplicationTests: XCTestCase {
             let windowApplication = makeApplication(defaults: makeDefaults(), system: windowSystem)
             let menuApplication = makeApplication(defaults: makeDefaults(), system: menuSystem)
 
-            XCTAssertSuccess(windowApplication.apply(change, from: .settingsWindow))
-            XCTAssertSuccess(menuApplication.apply(change, from: .menu))
+            XCTAssertSuccess(windowApplication.apply(change))
+            XCTAssertSuccess(menuApplication.apply(change))
 
             XCTAssertEqual(windowApplication.values, menuApplication.values)
             XCTAssertEqual(windowSystem.events, menuSystem.events)
@@ -156,7 +156,7 @@ final class SettingsApplicationTests: XCTestCase {
         let system = FakeLiveSystem()
         let application = makeApplication(defaults: defaults, system: system)
 
-        let result = application.apply(.whisperModel("unknown-model"), from: .settingsWindow)
+        let result = application.apply(.whisperModel("unknown-model"))
 
         XCTAssertFailure(result, equals: .unsupportedWhisperModel)
         XCTAssertEqual(application.values.whisperModel, Self.turboModel)
@@ -169,7 +169,7 @@ final class SettingsApplicationTests: XCTestCase {
         let system = FakeLiveSystem()
         let application = makeApplication(defaults: defaults, system: system)
 
-        XCTAssertSuccess(application.apply(.startAtLogin(true), from: .settingsWindow))
+        XCTAssertSuccess(application.apply(.startAtLogin(true)))
 
         XCTAssertEqual(system.loginItemChanges, [true])
         XCTAssertTrue(application.values.startAtLogin)
@@ -182,7 +182,7 @@ final class SettingsApplicationTests: XCTestCase {
         system.loginItemError = TestError()
         let application = makeApplication(defaults: defaults, system: system)
 
-        let result = application.apply(.startAtLogin(true), from: .settingsWindow)
+        let result = application.apply(.startAtLogin(true))
 
         XCTAssertFailure(result, equals: .loginItemChangeFailed)
         XCTAssertEqual(system.loginItemChanges, [true])
