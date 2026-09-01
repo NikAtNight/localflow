@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.4](https://github.com/NikAtNight/localflow/compare/v1.1.3...v1.1.4) (2026-09-01)
+
+
+### Fixes
+
+* keep launch updater sessions from wedging ([4ecf7f5](https://github.com/NikAtNight/localflow/commit/4ecf7f5721980dddf6031bc3e27a8e91c245c5ec))
+* run the app from a synchronous main entry ([d4eec7b](https://github.com/NikAtNight/localflow/commit/d4eec7b904a3d9cbffeacdd608c3382413003d4a))
+
 ## [1.1.3](https://github.com/NikAtNight/localflow/compare/v1.1.2...v1.1.3) (2026-09-01)
 
 
