@@ -56,10 +56,6 @@ enum TranscriptCleanup {
         // no edits. Completion is not the same thing as changing the text.
         return TranscriptCleanupResult(text: trimmed, succeeded: true)
     }
-
-    static func validated(_ cleaned: String, raw: String) -> String {
-        validationResult(cleaned, raw: raw).text
-    }
 }
 
 /// Superwhisper's s1-mini is a fine-tuned transcript normalizer, not an
@@ -91,9 +87,8 @@ enum S1MiniCleanup {
         let structure: String, context: String
         switch profile {
         case .email:        (structure, context) = ("lists", "email")
-        case .workChat:     (structure, context) = ("prose", "general")
-        case .personalChat: (structure, context) = ("prose", "general")
-        case .code:         (structure, context) = ("prose", "general")
+        case .workChat, .personalChat, .code:
+            (structure, context) = ("prose", "general")
         case .general:      (structure, context) = ("lists", "general")
         }
         return "[Styling: semi-formal] [Structure: \(structure)] [Context: \(context)]"

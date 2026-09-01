@@ -208,9 +208,9 @@ final class S1MiniCleanupTests: XCTestCase {
     }
 
     func testLeakedThinkTagIsNeverPasted() {
-        XCTAssertEqual(TranscriptCleanup.validated("<think>", raw: "raw words"), "raw words")
-        XCTAssertEqual(TranscriptCleanup.validated("<think>\nstuff", raw: "raw words"), "raw words")
-        XCTAssertEqual(TranscriptCleanup.validated("clean words", raw: "raw words"), "clean words")
+        XCTAssertEqual(TranscriptCleanup.validationResult("<think>", raw: "raw words").text, "raw words")
+        XCTAssertEqual(TranscriptCleanup.validationResult("<think>\nstuff", raw: "raw words").text, "raw words")
+        XCTAssertEqual(TranscriptCleanup.validationResult("clean words", raw: "raw words").text, "clean words")
     }
 
     func testUnchangedCleanupOutputIsAValidCompletion() {

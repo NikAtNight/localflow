@@ -44,8 +44,6 @@ final class InjectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(cancelled.first?.kind, .command)
         XCTAssertNil(retainedSamples)
         XCTAssertEqual(coordinator.pendingCount, 0)
-        XCTAssertEqual(coordinator.processingCount, 0)
-        XCTAssertFalse(coordinator.isProcessing)
         XCTAssertEqual(processingCounts, [1, 2, 1, 0])
         XCTAssertEqual(pasted, ["later dictation"])
 
@@ -56,7 +54,7 @@ final class InjectionCoordinatorTests: XCTestCase {
         await settleAsyncWork()
 
         XCTAssertEqual(pasted, ["later dictation"])
-        XCTAssertEqual(coordinator.processingCount, 0)
+        XCTAssertEqual(coordinator.pendingCount, 0)
     }
 
     func testLaterCompletionDoesNotRestartArmedHeadStallDeadline() async {
@@ -102,8 +100,6 @@ final class InjectionCoordinatorTests: XCTestCase {
         ])
         XCTAssertFalse(coordinator.isPending(stalledCommand))
         XCTAssertEqual(coordinator.pendingCount, 0)
-        XCTAssertEqual(coordinator.processingCount, 0)
-        XCTAssertFalse(coordinator.isProcessing)
         XCTAssertEqual(processingCounts, [1, 2, 3, 2, 1, 0])
 
         coordinator.complete(stalledCommand, with: .inject("late command"))
@@ -114,7 +110,7 @@ final class InjectionCoordinatorTests: XCTestCase {
             "paste:first",
             "paste:second"
         ])
-        XCTAssertEqual(coordinator.processingCount, 0)
+        XCTAssertEqual(coordinator.pendingCount, 0)
     }
 
     private func settleAsyncWork() async {

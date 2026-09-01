@@ -82,15 +82,6 @@ final class OllamaClient: @unchecked Sendable {
         try requireSuccess(response)
     }
 
-    func isAvailable() async -> Bool {
-        do {
-            try await probe()
-            return true
-        } catch {
-            return false
-        }
-    }
-
     func installedModels() async throws -> [String] {
         var request = URLRequest(url: baseURL.appendingPathComponent("api/tags"))
         request.timeoutInterval = 3
@@ -172,10 +163,6 @@ final class OllamaLocalTextModelBackend: OllamaTextModelBackend {
 struct OllamaCleaner {
     nonisolated static let baseURL = URL(string: "http://localhost:11434")!
     nonisolated static let keepAlive = "30m"
-
-    static func installedModels() async -> [String] {
-        await LocalTextModelPolicy.shared.installedOllamaModels()
-    }
 
     /// Ollama's `think` takes a bool for toggle-based models or a level string
     /// for models such as gpt-oss.

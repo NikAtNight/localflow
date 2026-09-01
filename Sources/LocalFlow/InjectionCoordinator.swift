@@ -27,8 +27,8 @@ final class InjectionCoordinator {
     private let onProcessingCountChange: (Int) -> Void
 
     private var operations: [Int: Operation] = [:]
-    private var nextSequence = 0
-    private var sequenceCounter = 0
+    private var nextSequenceToDrain = 0
+    private var sequenceNumberCounter = 0
     private var drainPending = false
     private var headStallTimeout: DispatchWorkItem?
     private var stalledHeadSequence: Int?
@@ -48,12 +48,10 @@ final class InjectionCoordinator {
     }
 
     var pendingCount: Int { operations.count }
-    var processingCount: Int { operations.count }
-    var isProcessing: Bool { !operations.isEmpty }
 
     func begin(kind: OperationKind) -> Int {
-        let sequence = sequenceCounter
-        sequenceCounter += 1
+        let sequence = sequenceNumberCounter
+        sequenceNumberCounter += 1
         operations[sequence] = Operation(kind: kind, outcome: nil)
         onProcessingCountChange(operations.count)
         return sequence
@@ -75,12 +73,12 @@ final class InjectionCoordinator {
     private func drain() {
         guard !drainPending else { return }
 
-        while let operation = operations[nextSequence], let outcome = operation.outcome {
-            if stalledHeadSequence == nextSequence {
+        while let operation = operations[nextSequenceToDrain], let outcome = operation.outcome {
+            if stalledHeadSequence == nextSequenceToDrain {
                 cancelHeadTimeout()
             }
-            operations.removeValue(forKey: nextSequence)
-            nextSequence += 1
+            operations.removeValue(forKey: nextSequenceToDrain)
+            nextSequenceToDrain += 1
 
             switch outcome {
             case .inject(let text):
@@ -98,13 +96,13 @@ final class InjectionCoordinator {
             }
         }
 
-        guard let head = operations[nextSequence], head.outcome == nil else { return }
+        guard let head = operations[nextSequenceToDrain], head.outcome == nil else { return }
         let hasResolvedFollower = operations.contains { sequence, operation in
-            sequence > nextSequence && operation.outcome != nil
+            sequence > nextSequenceToDrain && operation.outcome != nil
         }
         guard hasResolvedFollower else { return }
 
-        let stalledSequence = nextSequence
+        let stalledSequence = nextSequenceToDrain
         if stalledHeadSequence == stalledSequence, headStallTimeout != nil {
             return
         }
@@ -116,10 +114,10 @@ final class InjectionCoordinator {
             guard
                   let stalled = self.operations[stalledSequence],
                   stalled.outcome == nil,
-                  self.nextSequence == stalledSequence else { return }
+                  self.nextSequenceToDrain == stalledSequence else { return }
 
             self.operations.removeValue(forKey: stalledSequence)
-            self.nextSequence += 1
+            self.nextSequenceToDrain += 1
             self.onCancel(stalledSequence, stalled.kind)
             self.onProcessingCountChange(self.operations.count)
             self.drain()
