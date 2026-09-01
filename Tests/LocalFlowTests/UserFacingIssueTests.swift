@@ -17,8 +17,21 @@ final class UserFacingIssueTests: XCTestCase {
             details: "Full system error"
         )
 
+        XCTAssertEqual(UserFacingIssue.menuCharacterLimit, 32)
         XCTAssertEqual(issue.menuSummary.count, UserFacingIssue.menuCharacterLimit)
         XCTAssertTrue(issue.menuSummary.hasSuffix("…"))
+    }
+
+    func testLoadingStatusDoesNotExposeTheRegistryModelIdentifier() {
+        let status = MenuStatusText.loadingModel(
+            identifier: "openai_whisper-large-v3-v20240930_turbo"
+        )
+
+        XCTAssertEqual(status.title, "Loading Whisper model…")
+        XCTAssertEqual(
+            status.details,
+            "Loading openai_whisper-large-v3-v20240930_turbo"
+        )
     }
 
     func testEmptySummaryGetsAReadableFallback() {
