@@ -3,7 +3,7 @@ import AVFoundation
 import ServiceManagement
 
 struct UserFacingIssue: Equatable {
-    static let menuCharacterLimit = 48
+    static let menuCharacterLimit = 32
 
     let summary: String
     let details: String
@@ -21,6 +21,27 @@ struct UserFacingIssue: Equatable {
         guard text.count > Self.menuCharacterLimit else { return text }
         let prefix = text.prefix(Self.menuCharacterLimit - 1)
         return prefix.trimmingCharacters(in: .whitespacesAndNewlines) + "…"
+    }
+}
+
+struct MenuStatusText: Equatable {
+    let title: String
+    let details: String?
+
+    static func loadingModel(identifier: String) -> Self {
+        Self(title: "Loading Whisper model…", details: "Loading \(identifier)")
+    }
+}
+
+enum StartupModelSequence {
+    static func run(
+        loadWhisper: () async throws -> Void,
+        onWhisperLoaded: () async -> Void = {},
+        prewarmCleanup: () async -> Void
+    ) async throws {
+        try await loadWhisper()
+        await onWhisperLoaded()
+        await prewarmCleanup()
     }
 }
 
@@ -185,10 +206,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // cleanup is off, so the probe runs for either feature.
         if Settings.cleanupEnabled || Settings.commandModeEnabled {
             probeOllama()
-        }
-        if Settings.cleanupEnabled {
-            let model = Settings.ollamaModel
-            Task { await textModelPolicy.prewarm(model: model) }
         }
         Task { await transcriber.setVocabulary(Settings.effectiveVocabulary) }
         // Called on the audio thread; overlay.push hops to main internally.
@@ -427,6 +444,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A model switch mid-recording must not repaint the recording UI.
         if !isRecording { state = .loadingModel }
         let model = Settings.whisperModel
+        let cleanupModel = Settings.ollamaModel
+        let shouldPrewarmCleanup = Settings.cleanupEnabled
         Task {
             // Only gate the hotkey when nothing can transcribe: during a
             // switch or retry the previous model keeps serving, and clearing
@@ -436,12 +455,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 modelLoaded = false
             }
             do {
-                try await transcriber.load(model: model)
+                let startedAt = Date()
+                DiagLog.log("model %@ load started", model)
+                try await StartupModelSequence.run(
+                    loadWhisper: { try await self.transcriber.load(model: model) },
+                    onWhisperLoaded: {
+                        guard generation == self.modelLoadGeneration else { return }
+                        DiagLog.log(
+                            "model %@ loaded — ready (%.0fms)",
+                            model,
+                            Date().timeIntervalSince(startedAt) * 1_000
+                        )
+                        self.modelRetryDelay = 5
+                        self.modelLoaded = true
+                        self.recomputeReadyState()
+                    },
+                    prewarmCleanup: {
+                        guard shouldPrewarmCleanup else { return }
+                        await self.textModelPolicy.prewarm(model: cleanupModel)
+                    }
+                )
                 guard generation == modelLoadGeneration else { return } // superseded
-                DiagLog.log("model %@ loaded — ready", model)
-                modelRetryDelay = 5
-                modelLoaded = true
-                recomputeReadyState()
             } catch {
                 guard generation == modelLoadGeneration else { return }
                 DiagLog.log("model load failed: %@", error.localizedDescription)
@@ -1165,7 +1199,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch state {
         case .loadingModel:
             symbol = "arrow.down.circle"
-            statusText = "Loading \(Settings.whisperModel)…"
+            let status = MenuStatusText.loadingModel(identifier: Settings.whisperModel)
+            statusText = status.title
+            statusMenuItem?.toolTip = status.details
         case .idle:
             symbol = "waveform"
             var text = "Ready"
