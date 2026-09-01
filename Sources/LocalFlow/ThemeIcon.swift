@@ -374,7 +374,7 @@ enum ThemeIcon {
         case .aurora: auroraGlyph(ctx, S)
         case .bolide: bolideGlyph(ctx, S)
         case .mercury: mercuryGlyph(ctx, S)
-        case .liquidGlass: prismGlyph(ctx, S)
+        case .liquidGlass: liquidGlassGlyph(ctx, S)
         case .ticker: tickerGlyph(ctx, S)
         case .constellation: constellationGlyph(ctx, S)
         case .loom: loomGlyph(ctx, S)
@@ -543,6 +543,40 @@ enum ThemeIcon {
         ctx.setLineWidth(S * 0.018)
         ctx.setLineCap(.round)
         ctx.strokePath()
+    }
+
+    /// The Apple Intelligence bar wave — the marketing site's hero waveform,
+    /// frozen mid-phrase: symmetric rounded bars through the four-hue
+    /// gradient, each with the renderer's soft halo behind a bright core.
+    private static func liquidGlassGlyph(_ ctx: CGContext, _ S: CGFloat) {
+        let heights: [CGFloat] = [14, 26, 40, 58, 44, 70, 52, 82, 60, 88, 66,
+                                  90, 58, 76, 46, 64, 38, 52, 28, 40, 18, 30, 12]
+        let intelligence = HudRamp([
+            (0.00, "#0A84FF"), (0.25, "#BF5AF2"), (0.50, "#FF375F"),
+            (0.75, "#FF9F0A"), (1.00, "#0A84FF"),
+        ])
+        let left = S * 0.175
+        let pitch = S * 0.65 / CGFloat(heights.count)
+        let core = pitch * 0.40
+        let midY = S * 0.5
+        let maxHalf = S * 0.21
+        ctx.saveGState()
+        ctx.setBlendMode(.plusLighter)
+        for (i, h) in heights.enumerated() {
+            let u = (CGFloat(i) + 0.5) / CGFloat(heights.count)
+            let color = intelligence.at(u)
+            let half = max(S * 0.010, maxHalf * h / 100)
+            let x = left + (CGFloat(i) + 0.5) * pitch
+            func bar(_ w: CGFloat, _ alpha: CGFloat) {
+                ctx.setFillColor(color.cg(alpha))
+                ctx.addPath(roundedRect(x - w / 2, midY - half, w, half * 2, w / 2))
+                ctx.fillPath()
+            }
+            bar(core * 2.8, 0.10)
+            bar(core * 1.7, 0.22)
+            bar(core, 0.95)
+        }
+        ctx.restoreGState()
     }
 
     /// Paper tape with a graphite trace and red peak stamps.
