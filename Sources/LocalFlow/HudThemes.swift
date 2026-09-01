@@ -818,8 +818,10 @@ final class LiquidGlassRenderer: HudRenderer {
                 let idle = idleAmp * (0.55 + 0.45 * sin(motionPhase * 0.5 + u * 6.3 + layerPhase))
                 // Raw `level` rides alongside the smoothed envelope: the
                 // smoothing keeps the strip from strobing, the raw term
-                // makes it jump the instant the voice does.
-                let drive = (smoothedLevel * 1.1 + level * 0.75 + kick * 0.45)
+                // makes it jump the instant the voice does. Combined gain
+                // stays near 1× so the tallest bars only reach the cap on
+                // genuinely loud speech — headroom, not permanent ceiling.
+                let drive = (smoothedLevel * 0.8 + level * 0.55 + kick * 0.45)
                     * voiceAmp * (0.35 + 0.65 * bandMix)
                 let target = min(maxHalf,
                                  stub + Self.layerScales[layer] * window * (idle + drive * motion))

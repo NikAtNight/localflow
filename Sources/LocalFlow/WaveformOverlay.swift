@@ -299,7 +299,9 @@ private final class HudView: NSView {
     private var frameLevel: CGFloat = 0
     private var frameSpectrum = [CGFloat](repeating: 0, count: 12)
     private var agcReference: CGFloat = 0.0035
-    private var agcLevelReference: CGFloat = 0.4
+    private var agcSpeechPeak: CGFloat = 0.3
+    private var agcNoiseFloor: CGFloat = 0.05
+    private var lastLevelIngest: TimeInterval = 0
     private var time: CGFloat = 0
     private var timer: Timer?
 
@@ -312,12 +314,45 @@ private final class HudView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     func ingest(level: Float) {
-        // Same slow-decay AGC idea as the spectrum path: a Bluetooth HFP mic
-        // runs far quieter than a wired one, and a fixed scale leaves the
-        // bars barely tracking speech. The floor keeps the room's noise
-        // floor from being amplified into apparent speech.
-        agcLevelReference = max(agcLevelReference * 0.995, CGFloat(level), 0.4)
-        latchedLevel = max(latchedLevel, min(1, CGFloat(level) / agcLevelReference * 0.95))
+        // Wall-clock dt: this runs per audio buffer, and cadence varies
+        // wildly by route (~100/s for the desk mic, ~50/s for HFP), so
+        // per-call smoothing factors drift by mic.
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = lastLevelIngest > 0
+            ? min(0.25, max(0.001, CGFloat(now - lastLevelIngest)))
+            : 0.02
+        lastLevelIngest = now
+        let raw = CGFloat(level)
+
+        // Room-noise estimate: falls fast in silence, creeps up slowly so
+        // sustained speech can't masquerade as room tone (inter-word dips
+        // keep pulling it back down to the true floor).
+        agcNoiseFloor = raw < agcNoiseFloor
+            ? agcNoiseFloor + (raw - agcNoiseFloor) * (1 - exp(-dt / 0.5))
+            : min(raw, agcNoiseFloor + 0.008 * dt)
+
+        // Work in log-ratio above the room, not linear gap: a far-field
+        // desk mic's conversational speech peaks a mere ~5 dB over its own
+        // room tone (-45 vs -50 dBFS measured), so any linear span crushes
+        // it to nothing — while the same voice on AirPods' compressed HFP
+        // route sits ~40 dB up. The ratio is what carries the voice on
+        // every route.
+        let snr = max(0, log(raw / max(0.02, agcNoiseFloor)))
+
+        // Speech-peak envelope: how far above the room this speaker + mic
+        // reaches when talking normally. The slow attack means a raised
+        // voice pins the display for seconds before it recalibrates; the
+        // slow release means pauses don't reset the calibration.
+        agcSpeechPeak = snr > agcSpeechPeak
+            ? agcSpeechPeak + (snr - agcSpeechPeak) * (1 - exp(-dt / 6))
+            : max(agcSpeechPeak * exp(-dt / 25), 0.3)
+
+        // Ceiling = the speaker's usual peak + ~6 dB of headroom, so
+        // conversational speech reads mid-strip and louder-than-usual
+        // still has somewhere to tower. The exponent keeps room-tone
+        // jitter hugging the centerline.
+        let normalized = min(1, snr / (agcSpeechPeak + 0.35))
+        latchedLevel = max(latchedLevel, pow(normalized, 1.3))
     }
 
     func ingest(spectrum: [Float]) {
