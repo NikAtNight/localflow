@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/NikAtNight/localflow/compare/v1.1.4...v1.2.0) (2026-09-01)
+
+
+### Features
+
+* give Liquid Glass its own app icon ([cd22291](https://github.com/NikAtNight/localflow/commit/cd2229179e00c9fc6bdb184e2813c767d6200fe7))
+
+
+### Fixes
+
+* scale HUD loudness by log-ratio over the room floor ([8f69581](https://github.com/NikAtNight/localflow/commit/8f695817726143f11a26e1c82611fa1dedf80a92))
+
 ## [1.1.4](https://github.com/NikAtNight/localflow/compare/v1.1.3...v1.1.4) (2026-09-01)
 
 
