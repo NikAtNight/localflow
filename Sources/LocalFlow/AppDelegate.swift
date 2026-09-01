@@ -36,14 +36,100 @@ struct MenuStatusText: Equatable {
 }
 
 enum StartupModelSequence {
+    enum Error: Swift.Error, LocalizedError, Equatable {
+        case timedOut
+
+        var errorDescription: String? {
+            "Whisper model load timed out."
+        }
+    }
+
     static func run(
-        loadWhisper: () async throws -> Void,
+        loadWhisper: @escaping () async throws -> Void,
         onWhisperLoaded: () async -> Void = {},
-        prewarmCleanup: () async -> Void
+        prewarmCleanup: () async -> Void,
+        waitForDeadline: @escaping () async -> Void = {
+            try? await Task.sleep(nanoseconds: 300_000_000_000)
+        },
+        onTimeout: @escaping () async -> Void = {}
     ) async throws {
-        try await loadWhisper()
+        try await withCheckedThrowingContinuation { continuation in
+            let race = StartupDeadlineRace()
+            let loadTask = Task {
+                do {
+                    try await loadWhisper()
+                    if race.loadFinished() { continuation.resume() }
+                } catch {
+                    if race.loadFinished() { continuation.resume(throwing: error) }
+                }
+            }
+            race.installLoadTask(loadTask)
+
+            let deadlineTask = Task {
+                await waitForDeadline()
+                guard race.deadlineReached() else { return }
+                await onTimeout()
+                continuation.resume(throwing: Error.timedOut)
+            }
+            race.installDeadlineTask(deadlineTask)
+        }
         await onWhisperLoaded()
         await prewarmCleanup()
+    }
+}
+
+private final class StartupDeadlineRace: @unchecked Sendable {
+    private enum Loser {
+        case load
+        case deadline
+    }
+
+    private let lock = NSLock()
+    private var resolved = false
+    private var loadTask: Task<Void, Never>?
+    private var deadlineTask: Task<Void, Never>?
+
+    func installLoadTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        let shouldCancel = resolved
+        if !shouldCancel { loadTask = task }
+        lock.unlock()
+        if shouldCancel { task.cancel() }
+    }
+
+    func installDeadlineTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        let shouldCancel = resolved
+        if !shouldCancel { deadlineTask = task }
+        lock.unlock()
+        if shouldCancel { task.cancel() }
+    }
+
+    func loadFinished() -> Bool {
+        resolve(cancel: .deadline)
+    }
+
+    func deadlineReached() -> Bool {
+        resolve(cancel: .load)
+    }
+
+    private func resolve(cancel loser: Loser) -> Bool {
+        lock.lock()
+        guard !resolved else {
+            lock.unlock()
+            return false
+        }
+        resolved = true
+        let task: Task<Void, Never>?
+        switch loser {
+        case .load: task = loadTask
+        case .deadline: task = deadlineTask
+        }
+        loadTask = nil
+        deadlineTask = nil
+        lock.unlock()
+        task?.cancel()
+        return true
     }
 }
 
@@ -202,8 +288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildSettings()
         buildStatusItem()
         requestPermissions()
-        startHotkey()
         loadModel()
+        startHotkey()
         // Command mode's hotkey gate needs Ollama reachability even when
         // cleanup is off, so the probe runs for either feature.
         if Settings.cleanupEnabled || Settings.commandModeEnabled {
@@ -448,19 +534,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let model = Settings.whisperModel
         let cleanupModel = Settings.ollamaModel
         let shouldPrewarmCleanup = Settings.cleanupEnabled
+        let hadLoadedModel = modelLoaded
         Task {
-            // Only gate the hotkey when nothing can transcribe: during a
-            // switch or retry the previous model keeps serving, and clearing
-            // `modelLoaded` would make dictation look dead for the attempt.
-            if !(await transcriber.isLoaded) {
-                guard generation == modelLoadGeneration else { return }
-                modelLoaded = false
-            }
             do {
                 let startedAt = Date()
                 DiagLog.log("model %@ load started", model)
                 try await StartupModelSequence.run(
-                    loadWhisper: { try await self.transcriber.load(model: model) },
+                    loadWhisper: {
+                        // Only gate the hotkey when nothing can transcribe.
+                        // During a switch or retry the previous model serves
+                        // while this attempt runs.
+                        if !(await self.transcriber.isLoaded) {
+                            guard generation == self.modelLoadGeneration else {
+                                throw CancellationError()
+                            }
+                            self.modelLoaded = false
+                        }
+                        try await self.transcriber.load(model: model)
+                    },
                     onWhisperLoaded: {
                         guard generation == self.modelLoadGeneration else { return }
                         DiagLog.log(
@@ -475,6 +566,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     prewarmCleanup: {
                         guard shouldPrewarmCleanup else { return }
                         await self.textModelPolicy.prewarm(model: cleanupModel)
+                    },
+                    onTimeout: {
+                        DiagLog.log(
+                            "model %@ load stalled for 300s; cancelling attempt and retrying",
+                            model
+                        )
                     }
                 )
                 guard generation == modelLoadGeneration else { return } // superseded
@@ -483,7 +580,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DiagLog.log("model load failed: %@", error.localizedDescription)
                 // A failed *switch* leaves the previous model loaded and
                 // serving — keep dictation alive on it while retries run.
-                if await transcriber.isLoaded {
+                if hadLoadedModel {
                     // No recomputeReadyState() here — it would flip straight
                     // back to .idle and the banner would never appear.
                     modelLoaded = true

@@ -15,6 +15,17 @@ import Sparkle
 /// unless the running copy is the real, Developer ID signed article.
 @MainActor
 final class UpdateController: NSObject {
+    struct AutomaticPreferenceChanges {
+        let checks: Bool?
+        let downloads: Bool?
+    }
+
+    enum ManualCheckDisposition: Equatable {
+        case perform
+        case busy
+        case unavailable
+    }
+
     private var updater: SPUStandardUpdaterController?
 
     /// True when this build can actually install an update. A dev build
@@ -45,21 +56,52 @@ final class UpdateController: NSObject {
             DiagLog.log("updates disabled (not a Developer ID signed bundle)")
             return
         }
-        // startingUpdater: true begins the scheduled background checks.
-        updater = SPUStandardUpdaterController(
-            startingUpdater: true,
+        let updater = SPUStandardUpdaterController(
+            startingUpdater: false,
             updaterDelegate: self,
             userDriverDelegate: nil
         )
-        DiagLog.log("update checks active (automatic=%d)", Settings.automaticUpdates ? 1 : 0)
+        self.updater = updater
+        // Configure Sparkle before it starts. Mutating this setting after
+        // start schedules another update cycle even when the value is equal.
         applyAutomaticPreference()
+        updater.startUpdater()
+        DiagLog.log("update checks active (automatic=%d)", Settings.automaticUpdates ? 1 : 0)
     }
 
     /// Mirrors the Settings toggle onto the live updater.
     func applyAutomaticPreference() {
         guard let updater = updater?.updater else { return }
-        updater.automaticallyChecksForUpdates = Settings.automaticUpdates
-        updater.automaticallyDownloadsUpdates = Settings.automaticUpdates
+        let changes = Self.automaticPreferenceChanges(
+            currentChecks: updater.automaticallyChecksForUpdates,
+            currentDownloads: updater.automaticallyDownloadsUpdates,
+            desired: Settings.automaticUpdates
+        )
+        if let checks = changes.checks {
+            updater.automaticallyChecksForUpdates = checks
+        }
+        if let downloads = changes.downloads {
+            updater.automaticallyDownloadsUpdates = downloads
+        }
+    }
+
+    static func automaticPreferenceChanges(
+        currentChecks: Bool,
+        currentDownloads: Bool,
+        desired: Bool
+    ) -> AutomaticPreferenceChanges {
+        AutomaticPreferenceChanges(
+            checks: currentChecks == desired ? nil : desired,
+            downloads: currentDownloads == desired ? nil : desired
+        )
+    }
+
+    static func manualCheckDisposition(
+        canCheckForUpdates: Bool,
+        sessionInProgress: Bool
+    ) -> ManualCheckDisposition {
+        if canCheckForUpdates { return .perform }
+        return sessionInProgress ? .busy : .unavailable
     }
 
     /// Menu action. Always shows UI, even when the background check is off.
@@ -77,11 +119,34 @@ final class UpdateController: NSObject {
             alert.runModal()
             return
         }
-        NSApp.activate(ignoringOtherApps: true)
-        updater.checkForUpdates(sender)
+        let sparkleUpdater = updater.updater
+        switch Self.manualCheckDisposition(
+            canCheckForUpdates: sparkleUpdater.canCheckForUpdates,
+            sessionInProgress: sparkleUpdater.sessionInProgress
+        ) {
+        case .perform:
+            NSApp.activate(ignoringOtherApps: true)
+            updater.checkForUpdates(sender)
+        case .busy:
+            DiagLog.log("manual update check unavailable (sessionInProgress=1)")
+            let alert = NSAlert()
+            alert.messageText = "An update check is already in progress"
+            alert.informativeText = "LocalFlow's updater is busy. Try again in a moment."
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        case .unavailable:
+            DiagLog.log("manual update check unavailable (sessionInProgress=0)")
+            let alert = NSAlert()
+            alert.messageText = "Unable to check for updates"
+            alert.informativeText = "LocalFlow's updater is not ready. Restart the app and try again."
+            alert.addButton(withTitle: "OK")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+        }
     }
 
-    var canCheckForUpdates: Bool { updater != nil }
+    var canCheckForUpdates: Bool { updater?.updater.canCheckForUpdates ?? false }
 }
 
 extension UpdateController: SPUUpdaterDelegate {
