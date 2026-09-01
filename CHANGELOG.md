@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.2](https://github.com/NikAtNight/localflow/compare/v1.1.1...v1.1.2) (2026-09-01)
+
+
+### Fixes
+
+* compact status and serialize model startup ([95814cd](https://github.com/NikAtNight/localflow/commit/95814cd912d8a5d3da910a28ea84ed5e3027488c))
+* compact status and serialize model startup ([7838b5e](https://github.com/NikAtNight/localflow/commit/7838b5e78caf8846d6d18d818710ad52fd51d95f))
+
 ## [1.1.1](https://github.com/NikAtNight/localflow/compare/v1.1.0...v1.1.1) (2026-08-31)
 
 
