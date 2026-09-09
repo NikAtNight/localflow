@@ -239,8 +239,9 @@ final class SettingsModel: ObservableObject {
                 refreshDecoderVocabulary: { [weak self] in self?.onVocabularyChange?($0) }
             ),
             loginItem: .init(
-                isEnabled: { loginAgent.status == .enabled },
+                isEnabled: { !AppIdentity.current.isLocal && loginAgent.status == .enabled },
                 setEnabled: { enabled in
+                    guard !AppIdentity.current.isLocal else { return }
                     if enabled {
                         try loginAgent.register()
                     } else {
@@ -336,12 +337,11 @@ final class SettingsPanelController {
         if window == nil {
             let hosting = NSHostingController(rootView: SettingsView(model: model))
             let w = NSWindow(contentViewController: hosting)
-            w.title = "LocalFlow Settings"
-            w.styleMask = [.titled, .closable, .miniaturizable, .fullSizeContentView]
-            w.titlebarAppearsTransparent = true
-            w.isMovableByWindowBackground = true
-            w.isOpaque = false
-            w.backgroundColor = .clear
+            w.title = "\(AppIdentity.current.name) Settings"
+            w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            w.toolbarStyle = .unified
+            w.setContentSize(NSSize(width: 820, height: 650))
+            w.contentMinSize = NSSize(width: 740, height: 520)
             w.isReleasedWhenClosed = false
             window = w
             // Position is persisted explicitly rather than through
@@ -387,25 +387,18 @@ final class SettingsPanelController {
 
 // MARK: - Views
 
-private struct SettingsWindowBackground: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .underWindowBackground
-        view.blendingMode = .behindWindow
-        view.state = .active
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
-private enum SettingsPane: String, CaseIterable, Identifiable {
+enum SettingsPane: String, CaseIterable, Identifiable {
     case general = "General"
     case dictation = "Dictation"
     case cleanup = "Cleanup"
     case commandMode = "Command mode"
     case text = "Text"
     case history = "History"
+    case diagnostics = "Diagnostics"
+
+    static func available(for identity: AppIdentity) -> [Self] {
+        allCases.filter { $0 != .diagnostics || identity.isLocal }
+    }
 
     var id: Self { self }
 
@@ -417,13 +410,14 @@ private enum SettingsPane: String, CaseIterable, Identifiable {
         case .commandMode: return "wand.and.stars"
         case .text: return "keyboard"
         case .history: return "clock"
+        case .diagnostics: return "waveform.path.ecg"
         }
     }
 }
 
 struct SettingsView: View {
     @ObservedObject var model: SettingsModel
-    @State private var selectedPane: SettingsPane = .general
+    @State private var selectedPane: SettingsPane? = .general
     @State private var newCorrectionWrong = ""
     @State private var newCorrectionRight = ""
     @State private var confirmingHistoryDeletion = false
@@ -437,96 +431,40 @@ struct SettingsView: View {
     }
 
     var body: some View {
-        ZStack {
-            SettingsWindowBackground()
-                .ignoresSafeArea()
-
+        NavigationSplitView {
+            List(SettingsPane.available(for: .current), selection: $selectedPane) { pane in
+                Label(pane.rawValue, systemImage: pane.symbol)
+                    .tag(pane)
+            }
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 180, ideal: 190, max: 230)
+            .safeAreaInset(edge: .bottom) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(AppIdentity.current.name)
+                        .font(.headline)
+                    Text(AppBuildInfo.current.versionLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if AppIdentity.current.isLocal {
+                        Text("Local · \(AppBuildInfo.current.revisionLabel)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+            }
+        } detail: {
             VStack(spacing: 0) {
-                paneSwitcher
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 12)
-
-                Divider()
                 if let issue = model.lastIssue {
                     lastIssueBanner(issue)
                     Divider()
                 }
                 selectedPaneView
             }
-            .padding(.top, 28)
+            .navigationTitle((selectedPane ?? .general).rawValue)
         }
-        .frame(width: 700, height: 680)
-    }
-
-    @ViewBuilder
-    private var paneSwitcher: some View {
-        #if compiler(>=6.2)
-        if #available(macOS 26.0, *) {
-            GlassEffectContainer(spacing: 4) {
-                HStack(spacing: 4) {
-                    ForEach(SettingsPane.allCases) { pane in
-                        if pane == selectedPane {
-                            paneButton(for: pane)
-                                .glassEffect(
-                                    .clear.tint(Color.accentColor.opacity(0.18)).interactive(),
-                                    in: Capsule()
-                                )
-                        } else {
-                            paneButton(for: pane)
-                        }
-                    }
-                }
-                .padding(5)
-                .glassEffect(
-                    .regular,
-                    in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-                )
-            }
-        } else {
-            fallbackPaneSwitcher
-        }
-        #else
-        fallbackPaneSwitcher
-        #endif
-    }
-
-    private var fallbackPaneSwitcher: some View {
-        HStack(spacing: 4) {
-            ForEach(SettingsPane.allCases) { pane in
-                paneButton(for: pane)
-                    .background(
-                        pane == selectedPane ? Color.accentColor.opacity(0.14) : Color.clear,
-                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    )
-            }
-        }
-        .padding(5)
-        .background(
-            .ultraThinMaterial,
-            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
-        )
-    }
-
-    private func paneButton(for pane: SettingsPane) -> some View {
-        Button {
-            selectedPane = pane
-        } label: {
-            VStack(spacing: 4) {
-                Image(systemName: pane.symbol)
-                    .font(.system(size: 17, weight: .medium))
-                Text(pane.rawValue)
-                    .font(.caption)
-                    .lineLimit(1)
-            }
-            .foregroundStyle(pane == selectedPane ? Color.accentColor : Color.primary)
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 7)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("\(pane.rawValue) settings")
-        .accessibilityAddTraits(pane == selectedPane ? .isSelected : [])
+        .frame(minWidth: 740, idealWidth: 820, minHeight: 520, idealHeight: 650)
     }
 
     private func lastIssueBanner(_ issue: UserFacingIssue) -> some View {
@@ -572,43 +510,20 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var selectedPaneView: some View {
-        switch selectedPane {
+        switch selectedPane ?? .general {
         case .general: generalPane
         case .dictation: dictationPane
         case .cleanup: cleanupPane
         case .commandMode: commandModePane
         case .text: textPane
         case .history: historyPane
+        case .diagnostics:
+            if AppIdentity.current.isLocal { DiagnosticsPane() }
         }
     }
 
     private var generalPane: some View {
         Form {
-            Section {
-                HelpRow(symbol: "mic.fill", title: "Dictate anywhere") {
-                    Text("Hold **\(model.hotkey.label)**, speak, let go. The text is pasted where your cursor is. You can start the next dictation while the last one is still working.")
-                }
-                HelpRow(symbol: "text.badge.plus", title: "Say the formatting") {
-                    Text("\u{201C}new line\u{201D}, \u{201C}new paragraph\u{201D}, \u{201C}bullet point\u{201D}, \u{201C}numbered list\u{201D}, \u{201C}next item\u{201D}, and \u{201C}thumbs up emoji\u{201D} (and ~45 other emoji names) become real formatting.")
-                }
-                HelpRow(symbol: "wand.and.stars", title: "Or don't") {
-                    Text("Pause a beat after a finished sentence and you get a new paragraph. Counting off items (\u{201C}First\u{2026} Second\u{2026} Finally\u{2026}\u{201D}) becomes a numbered list on its own.")
-                }
-                if Settings.commandModeActive {
-                    HelpRow(symbol: "pencil.and.outline", title: "Edit with your voice") {
-                        Text("Select text, hold **\(model.commandHotkey.label)** and say what to change (\u{201C}make this shorter\u{201D}). With nothing selected, what you ask for is written at the cursor.")
-                    }
-                }
-                HelpRow(symbol: "arrow.uturn.backward", title: "When it gets a word wrong") {
-                    Text("Fix it in your app, copy it, then pick **Fix Last Dictation\u{2026}** in the menubar. LocalFlow learns the word and starts hearing it correctly.")
-                }
-                HelpRow(symbol: "lock.fill", title: "Everything stays here") {
-                    Text("Speech never leaves this Mac. Transcription and cleanup both run locally, and the history is a plain folder you own.")
-                }
-            } header: {
-                Text("How it works")
-            }
-
             Section("Keyboard shortcut") {
                 Picker("Hold to dictate", selection: $model.hotkey) {
                     ForEach(HotkeyManager.Key.allCases, id: \.self) { key in
@@ -617,30 +532,57 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Startup") {
+            Section {
                 Toggle("Start at login", isOn: $model.startAtLogin)
+                    .disabled(AppIdentity.current.isLocal)
+            } header: {
+                Text("Startup")
+            } footer: {
+                if AppIdentity.current.isLocal {
+                    Text("Unavailable in LocalFlow Local. The production app keeps its login setting so both copies don't start together.")
+                }
             }
 
             Section {
                 Toggle("Install updates automatically", isOn: $model.automaticUpdates)
                     .disabled(!UpdateController.isSupported)
-                if !UpdateController.isSupported {
-                    Text("This is a locally built copy, so it can't self-update. Released builds check daily and install in the background.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
             } header: {
                 Text("Updates")
             } footer: {
-                if UpdateController.isSupported {
+                if !UpdateController.isSupported {
+                    Text("Unavailable in this local build. Rebuild LocalFlow Local to test changes; the production app receives published updates.")
+                } else {
                     Text("Checks once a day and installs the next time you quit. Updates are signed, and one that fails verification is discarded rather than installed. \u{201C}Check for Updates\u{2026}\u{201D} in the menubar looks right now.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
+            Section {
+                DisclosureGroup("Using LocalFlow") {
+                    HelpRow(symbol: "mic.fill", title: "Dictate anywhere") {
+                        Text("Hold **\(model.hotkey.label)**, speak, let go. The text is pasted where your cursor is. You can start the next dictation while the last one is still working.")
+                    }
+                    HelpRow(symbol: "text.badge.plus", title: "Say the formatting") {
+                        Text("\u{201C}new line\u{201D}, \u{201C}new paragraph\u{201D}, \u{201C}bullet point\u{201D}, \u{201C}numbered list\u{201D}, \u{201C}next item\u{201D}, and \u{201C}thumbs up emoji\u{201D} (and ~45 other emoji names) become real formatting.")
+                    }
+                    HelpRow(symbol: "wand.and.stars", title: "Or don't") {
+                        Text("Pause a beat after a finished sentence and you get a new paragraph. Counting off items (\u{201C}First\u{2026} Second\u{2026} Finally\u{2026}\u{201D}) becomes a numbered list on its own.")
+                    }
+                    if Settings.commandModeActive {
+                        HelpRow(symbol: "pencil.and.outline", title: "Edit with your voice") {
+                            Text("Select text, hold **\(model.commandHotkey.label)** and say what to change (\u{201C}make this shorter\u{201D}). With nothing selected, what you ask for is written at the cursor.")
+                        }
+                    }
+                    HelpRow(symbol: "arrow.uturn.backward", title: "When it gets a word wrong") {
+                        Text("Fix it in your app, copy it, then pick **Fix Last Dictation\u{2026}** in the menubar. LocalFlow learns the word and starts hearing it correctly.")
+                    }
+                    HelpRow(symbol: "lock.fill", title: "Everything stays here") {
+                        Text("Speech never leaves this Mac. Transcription and cleanup both run locally, and the history is a plain folder you own.")
+                    }
+                }
+            }
         }
         .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
     }
 
     private var dictationPane: some View {
@@ -680,7 +622,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
     }
 
     private var cleanupPane: some View {
@@ -709,7 +650,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
     }
 
     /// Installed Ollama models as a menu; falls back to a free text field
@@ -784,7 +724,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
     }
 
     private var textPane: some View {
@@ -889,7 +828,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
     }
 
     private var historyPane: some View {
@@ -967,7 +905,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .scrollContentBackground(.hidden)
     }
 
     private var systemDefaultMicrophoneLabel: String {

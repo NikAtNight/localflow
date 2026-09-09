@@ -14,7 +14,7 @@ enum DictationHistory {
 
     static let folder: URL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("LocalFlow/History", isDirectory: true)
+        .appendingPathComponent(AppIdentity.current.historyDirectory, isDirectory: true)
 
     /// Records one dictation. Fire-and-forget; failures are logged, never
     /// surfaced — losing a history line must not disturb a good dictation.

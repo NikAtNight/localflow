@@ -9,7 +9,8 @@ import Darwin
 enum DiagLog {
     private static let queue = DispatchQueue(label: "app.talix.localflow.diaglog", qos: .utility)
     private static let path = (NSHomeDirectory() as NSString)
-        .appendingPathComponent("Library/Logs/LocalFlow-diag.log")
+        .appendingPathComponent("Library/Logs/\(AppIdentity.current.logFilename)")
+    static var fileURL: URL { URL(fileURLWithPath: path) }
     private static let privacyLogVersionKey = "diagLogPrivacyVersion"
     private static let currentPrivacyLogVersion = 1
     private static let stamp: DateFormatter = {

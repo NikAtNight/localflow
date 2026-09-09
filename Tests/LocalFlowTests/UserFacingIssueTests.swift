@@ -60,11 +60,18 @@ final class UserFacingIssueTests: XCTestCase {
             identifier: "openai_whisper-large-v3-v20240930_turbo"
         )
 
-        XCTAssertEqual(status.title, "Loading Whisper model…")
+        XCTAssertEqual(status.title, "Preparing speech recognition… 0s")
         XCTAssertEqual(
             status.details,
-            "Loading openai_whisper-large-v3-v20240930_turbo"
+            "Preparing speech recognition for this Mac. First-time preparation can take a few minutes; later launches usually reuse it.\nModel: openai_whisper-large-v3-v20240930_turbo"
         )
+    }
+
+    func testPreparationElapsedTimeIsReadableAndCannotBecomeNegative() {
+        XCTAssertEqual(MenuStatusText.loadingModel(identifier: "model", elapsedSeconds: 98.9).title,
+                       "Preparing speech recognition… 98s")
+        XCTAssertEqual(MenuStatusText.loadingModel(identifier: "model", elapsedSeconds: -1).title,
+                       "Preparing speech recognition… 0s")
     }
 
     func testEmptySummaryGetsAReadableFallback() {

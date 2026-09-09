@@ -45,8 +45,8 @@ struct LocalFlowMain {
         // twice — easy to hit by launching a fresh build while the login
         // item is still running. (Checked after --transcribe: the CLI mode
         // may run alongside the app.)
-        let alreadyRunning = NSRunningApplication
-            .runningApplications(withBundleIdentifier: "app.talix.localflow")
+        let alreadyRunning = [AppIdentity.productionID, AppIdentity.localID]
+            .flatMap { NSRunningApplication.runningApplications(withBundleIdentifier: $0) }
             .contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
         if alreadyRunning {
             FileHandle.standardError.write(Data("LocalFlow is already running — exiting this instance.\n".utf8))

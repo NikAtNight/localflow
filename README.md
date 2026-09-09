@@ -113,6 +113,49 @@ open build/LocalFlow.app
 ./scripts/make-dmg.sh            # wrap the built app in dist/LocalFlow-<version>.dmg
 ```
 
+For daily testing alongside the production app:
+
+```bash
+./scripts/local-app.sh install     # build release, install local, wait for model readiness
+./scripts/local-app.sh production  # quit local and open the installed production app
+./scripts/local-app.sh local       # switch back without rebuilding
+```
+
+Finish any dictation before switching. Production stays at
+`/Applications/LocalFlow.app`; local builds use `/Applications/LocalFlow Local.app`
+and bundle ID `app.talix.localflow.local`. The local copy disables automatic
+updates and login registration. Production keeps its existing login behavior;
+after logging in, run the local switch command when you want to test.
+Grant Microphone and Accessibility to **LocalFlow Local** on its first launch.
+The stable development signing identity is reused across rebuilds. The first
+local launch may still need Core ML to compile the model for the Neural Engine;
+the install command waits for readiness and prints the measured model load time.
+The app menu shows elapsed preparation time. This moves preparation into setup;
+it does not make compilation itself faster. Failed preparation or a 330-second
+wait timeout makes the install command exit unsuccessfully and leaves the app
+open for inspection. Microphone and Accessibility permission checks remain separate.
+
+Local settings are copied from production on the first install, then evolve
+separately. Local history goes to `~/Library/Application Support/LocalFlow Local/History`
+and diagnostics to `~/Library/Logs/LocalFlow-Local-diag.log`. Downloaded Whisper
+models and the local Ollama service are shared to avoid duplicate model storage.
+Run one app at a time. The switch command quits both identities before opening
+its target. Older production versions do not know about the local identity,
+so use the switch command instead of opening production directly while testing.
+Rebuilding does not commit, push, or publish anything. Local builds include the
+working tree, including uncommitted changes. A previous installed local bundle
+is retained in a hidden `/Applications/.localflow-local.*` directory on replacement.
+
+Settings shows the installed version in the sidebar. Local builds also show the
+source revision and have a **Diagnostics** pane. Open it or click Refresh to read
+retained dictation and model-loading timings, including cleanup fallback and
+injection events. Expand an entry for its event timeline and build metadata.
+The pane reads only structured metrics, never transcripts or raw log messages,
+and does not poll in the background. Dispatch timing measures the paste/typing
+event, not visible text insertion or clipboard restoration. Older entries may
+have been cleared by the existing 5 MB log limit on launch; the viewer reads at
+most the latest 8 MB if a long session exceeds that limit.
+
 For quick dev iteration you can also `swift run`, but then the TCC permissions
 below attach to your *terminal app* instead of LocalFlow — the .app bundle is
 the intended way to run it.
@@ -431,3 +474,9 @@ cleanup.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Local readiness checks can be run without a microphone or model download:
+
+```bash
+python3 -B Tests/StartupReadinessTests.py
+```

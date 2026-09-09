@@ -18,12 +18,28 @@ cd "$(dirname "$0")/.."
 echo "Building (release)..."
 swift build -c release
 
+# Local builds get a separate identity and never use the production installer.
+APP_ID="app.talix.localflow"
 APP="build/LocalFlow.app"
+if [[ "${LOCAL_BUILD:-0}" == "1" ]]; then
+    if [[ "${1:-}" == "--install" ]]; then
+        echo "error: use scripts/local-app.sh install for the local build" >&2
+        exit 1
+    fi
+    APP_ID="app.talix.localflow.local"
+    APP="build/LocalFlow Local.app"
+    UPDATER_ENABLED=false
+fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp .build/release/LocalFlow "$APP/Contents/MacOS/LocalFlow"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+if [[ "${LOCAL_BUILD:-0}" == "1" ]]; then
+    /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_ID" "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleName LocalFlow Local' "$APP/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName LocalFlow Local' "$APP/Contents/Info.plist"
+fi
 
 # Record the source revision for local diagnostic reports before signing.
 BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -33,6 +49,7 @@ if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
 fi
 /usr/libexec/PlistBuddy -c "Add :LFBuildCommit string $BUILD_COMMIT" "$APP/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :LFBuildDirty string $BUILD_DIRTY" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :LFBuildDate string $(date -u +%Y-%m-%dT%H:%M:%SZ)" "$APP/Contents/Info.plist"
 
 if [[ -n "${APP_SHORT_VERSION:-}" && -n "${APP_BUNDLE_VERSION:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_SHORT_VERSION" "$APP/Contents/Info.plist"
@@ -53,8 +70,10 @@ if [[ "$UPDATES_ACTIVE" != "1" && "$UPDATES_ACTIVE" != "true" ]]; then
 fi
 
 # LaunchAgent (SMAppService.agent): relaunches the app after a crash.
-mkdir -p "$APP/Contents/Library/LaunchAgents"
-cp Resources/app.talix.localflow.plist "$APP/Contents/Library/LaunchAgents/"
+if [[ "${LOCAL_BUILD:-0}" != "1" ]]; then
+    mkdir -p "$APP/Contents/Library/LaunchAgents"
+    cp Resources/app.talix.localflow.plist "$APP/Contents/Library/LaunchAgents/"
+fi
 
 # Sparkle ships as a binary framework. `swift build` links against it but
 # does not embed it, so the bundle has to carry its own copy and the binary
@@ -111,7 +130,7 @@ if [[ "$IDENTITIES" == *"$SIGN_ID"* ]]; then
                 "$APP/Contents/Frameworks/Sparkle.framework"
         fi
         codesign --force --sign "$SIGN_ID" \
-            --identifier app.talix.localflow \
+            --identifier "$APP_ID" \
             --options runtime \
             --timestamp \
             --entitlements "$ENTITLEMENTS" \
@@ -121,7 +140,7 @@ if [[ "$IDENTITIES" == *"$SIGN_ID"* ]]; then
         if [[ -d "$APP/Contents/Frameworks/Sparkle.framework" ]]; then
             codesign --force --sign "$SIGN_ID" --deep "$APP/Contents/Frameworks/Sparkle.framework" 2>/dev/null || true
         fi
-        codesign --force --sign "$SIGN_ID" --identifier app.talix.localflow "$APP"
+        codesign --force --sign "$SIGN_ID" --identifier "$APP_ID" "$APP"
     fi
 elif [[ -n "${SIGN_IDENTITY:-}" ]]; then
     # An explicitly requested identity that is missing is a build error:
@@ -131,8 +150,8 @@ elif [[ -n "${SIGN_IDENTITY:-}" ]]; then
 else
     echo "warning: '$SIGN_ID' identity not found - ad-hoc signing with pinned requirement"
     codesign --force --sign - \
-        --identifier app.talix.localflow \
-        -r='designated => identifier "app.talix.localflow"' \
+        --identifier "$APP_ID" \
+        -r="designated => identifier \"$APP_ID\"" \
         "$APP"
 fi
 

@@ -30,8 +30,12 @@ struct MenuStatusText: Equatable {
     let title: String
     let details: String?
 
-    static func loadingModel(identifier: String) -> Self {
-        Self(title: "Loading Whisper model…", details: "Loading \(identifier)")
+    static func loadingModel(identifier: String, elapsedSeconds: TimeInterval = 0) -> Self {
+        let seconds = elapsedSeconds.isFinite ? Int(max(0, min(elapsedSeconds, 86_400))) : 0
+        return Self(
+            title: "Preparing speech recognition… \(seconds)s",
+            details: "Preparing speech recognition for this Mac. First-time preparation can take a few minutes; later launches usually reuse it.\nModel: \(identifier)"
+        )
     }
 }
 
@@ -281,6 +285,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // let the slower (older) load win after the newer one finished.
     private var modelLoadGeneration = 0
     private var modelRetryDelay: TimeInterval = 5
+    private var modelPreparationStartedAt: UInt64?
+    private var modelPreparationTimer: Timer?
+
+    private func beginModelPreparation() {
+        modelPreparationTimer?.invalidate()
+        modelPreparationStartedAt = DispatchTime.now().uptimeNanoseconds
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, case .loadingModel = self.state else { return }
+                self.refreshStatusUI()
+            }
+        }
+        // Keep elapsed time updating while the status menu is open.
+        RunLoop.main.add(timer, forMode: .common)
+        modelPreparationTimer = timer
+    }
+
+    private func endModelPreparation() {
+        modelPreparationTimer?.invalidate()
+        modelPreparationTimer = nil
+        modelPreparationStartedAt = nil
+    }
 
     // MARK: - Lifecycle
 
@@ -428,6 +454,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// "Start at Login" menu toggle rules after that. Retries next launch
     /// if registration fails.
     private func registerLoginItemOnce() {
+        guard !AppIdentity.current.isLocal else { return }
         // v1 registered as a plain login item, which macOS never relaunches
         // after a crash — migrate to the LaunchAgent once.
         if SMAppService.mainApp.status == .enabled {
@@ -531,6 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func loadModel() {
         modelLoadGeneration += 1
         let generation = modelLoadGeneration
+        beginModelPreparation()
         // A model switch mid-recording must not repaint the recording UI.
         if !isRecording { state = .loadingModel }
         let model = Settings.whisperModel
@@ -563,7 +591,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         )
                         self.modelRetryDelay = 5
                         self.modelLoaded = true
+                        self.endModelPreparation()
                         self.recomputeReadyState()
+                        self.refreshStatusUI()
                     },
                     prewarmCleanup: {
                         guard shouldPrewarmCleanup else { return }
@@ -579,6 +609,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard generation == modelLoadGeneration else { return } // superseded
             } catch {
                 guard generation == modelLoadGeneration else { return }
+                endModelPreparation()
                 DiagLog.log("model load failed: %@", error.localizedDescription)
                 // A failed *switch* leaves the previous model loaded and
                 // serving — keep dictation alive on it while retries run.
@@ -1130,16 +1161,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func injectCompletedText(_ text: String) {
         let trace = DictationTrace.current
-        // The success cue waits for the injector's verdict. Hearing it while
-        // nothing was pasted is worse than hearing it late.
+        // The cue acknowledges dispatch. Clipboard restoration happens later
+        // and cannot establish whether the target app inserted the text.
         TextInjector.inject(text, onDispatch: { [weak self] in
             if let ms = trace?.millisecondsSinceRelease {
                 self?.lastLatencyMs = Int(ms)
             }
+            self?.playCue("Bottle")
         }) { [weak self] landed in
             guard let self else { return }
             if landed {
-                self.playCue("Bottle")
                 self.lastError = nil
             } else {
                 DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
@@ -1303,7 +1334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateItem.target = updates
         menu.addItem(updateItem)
 
-        let quitItem = NSMenuItem(title: "Quit LocalFlow", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit \(AppIdentity.current.name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quitItem)
 
         menu.delegate = self
@@ -1318,8 +1349,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusMenuItem?.isEnabled = false
         switch state {
         case .loadingModel:
-            symbol = "arrow.down.circle"
-            let status = MenuStatusText.loadingModel(identifier: Settings.whisperModel)
+            symbol = "hourglass"
+            let elapsed = modelPreparationStartedAt.map {
+                Double(DispatchTime.now().uptimeNanoseconds - $0) / 1_000_000_000
+            } ?? 0
+            let status = modelLoaded && modelPreparationStartedAt == nil
+                ? MenuStatusText(title: "Speech recognition ready", details: "Enable Accessibility for the dictation hotkey.")
+                : MenuStatusText.loadingModel(identifier: Settings.whisperModel, elapsedSeconds: elapsed)
             statusText = status.title
             statusMenuItem?.toolTip = status.details
         case .idle:
@@ -1341,7 +1377,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusMenuItem?.toolTip = issue.details
             statusMenuItem?.isEnabled = true
         }
-        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "LocalFlow")
+        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: AppIdentity.current.name)
+        statusItem.button?.toolTip = AppIdentity.current.name
         statusMenuItem?.title = statusText
         if let lastError {
             lastErrorMenuItem?.title = "Last Error…"

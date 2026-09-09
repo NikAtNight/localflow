@@ -149,7 +149,7 @@ enum ThemeIcon {
 
     /// Same signing scheme as make-app.sh: the stable self-signed identity if
     /// present, else ad-hoc with the pinned identifier requirement — either
-    /// way the designated requirement stays `identifier "app.talix.localflow"`,
+    /// way the designated requirement keeps the active app identifier,
     /// so TCC grants survive the rewrite.
     /// True only when the bundle's existing seal is one this machine can
     /// reproduce exactly: an ad-hoc signature, or the local development
@@ -178,7 +178,7 @@ enum ThemeIcon {
         if identities.contains("Talix Dev Signing") {
             result = run("/usr/bin/codesign", [
                 "--force", "--sign", "Talix Dev Signing",
-                "--identifier", "app.talix.localflow", bundlePath,
+                "--identifier", AppIdentity.current.bundleIdentifier, bundlePath,
             ])
         } else if run("/usr/bin/codesign", ["-dvv", bundlePath]).1.contains("Talix Dev Signing") {
             // The bundle carries the certificate-backed identity but the
@@ -190,8 +190,8 @@ enum ThemeIcon {
         } else {
             result = run("/usr/bin/codesign", [
                 "--force", "--sign", "-",
-                "--identifier", "app.talix.localflow",
-                "-r=designated => identifier \"app.talix.localflow\"", bundlePath,
+                "--identifier", AppIdentity.current.bundleIdentifier,
+                "-r=designated => identifier \"\(AppIdentity.current.bundleIdentifier)\"", bundlePath,
             ])
         }
         if result.0 != 0 {
