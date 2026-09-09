@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/NikAtNight/localflow/compare/v1.3.0...v1.4.0) (2026-09-09)
+
+
+### Features
+
+* recover empty dictations and protect active recordings ([0d91b1b](https://github.com/NikAtNight/localflow/commit/0d91b1bd102ed5af42e53e0e70cef56215087429))
+
 ## [1.3.0](https://github.com/NikAtNight/localflow/compare/v1.2.0...v1.3.0) (2026-09-09)
 
 
