@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/NikAtNight/localflow/compare/v1.2.0...v1.3.0) (2026-09-09)
+
+
+### Features
+
+* add native settings and local diagnostics ([3966f32](https://github.com/NikAtNight/localflow/commit/3966f321422b1ec92d36825ad4316daf4f2d26e7))
+
 ## [1.2.0](https://github.com/NikAtNight/localflow/compare/v1.1.4...v1.2.0) (2026-09-09)
 
 
