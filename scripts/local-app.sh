@@ -27,6 +27,38 @@ if [[ "$ACTION" != "install" && ! -d "$TARGET_APP" ]]; then
     exit 1
 fi
 
+# Older installed builds lack the app's quit guard. Check their current
+# session after building, immediately before requesting termination.
+python3 - <<'PY_CHECK_IDLE'
+import json
+from pathlib import Path
+import subprocess
+
+for name, log_name in (("LocalFlow", "LocalFlow-diag.log"), ("LocalFlow Local", "LocalFlow-Local-diag.log")):
+    running = subprocess.run(["pgrep", "-f", rf"^/Applications/{name}\.app/Contents/MacOS/LocalFlow$"], capture_output=True, text=True)
+    if running.returncode != 0:
+        continue
+    pid = running.stdout.strip()
+    lines = (Path.home() / "Library/Logs" / log_name).read_text().splitlines()
+    starts = [i for i, line in enumerate(lines) if f"session start (pid {pid})" in line]
+    if not starts:
+        raise SystemExit(f"error: cannot verify {name} is idle; finish dictating and quit it before switching")
+    traces = {}
+    for line in lines[starts[-1]:]:
+        if " timing " not in line:
+            continue
+        event = json.loads(line.split(" timing ", 1)[1])
+        if event.get("source") == "dictation":
+            traces.setdefault(event["traceID"], []).append(event)
+    for events in traces.values():
+        names = {event["name"] for event in events}
+        resolved = bool(names & {"cancellationRequested", "injectionSkipped", "clipboardWindowResolved", "typingDispatched"})
+        resolved |= any(event["name"] == "resultReady" and event.get("status") in ("empty", "failed", "insufficientVoice", "cancelled") for event in events)
+        resolved |= any(event["name"] == "pasteDispatched" and event.get("status") == "failed" for event in events)
+        if "hotkeyPressed" in names and not resolved:
+            raise SystemExit(f"error: {name} has an active dictation; finish it and retry switching")
+PY_CHECK_IDLE
+
 # Clean termination keeps the production KeepAlive agent from restarting.
 # Never force-quit a recording or overwrite an app that is still running.
 for APP_NAME in LocalFlow "LocalFlow Local"; do

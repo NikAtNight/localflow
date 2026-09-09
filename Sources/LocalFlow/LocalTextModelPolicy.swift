@@ -177,13 +177,13 @@ final class LocalTextModelPolicy {
         let resolvedModel = await resolvedOllamaModel(model)
         let generation: TextModelGeneration
         do {
-            trace?.record(.ollamaStarted, model: resolvedModel)
+            trace?.record(.ollamaStarted, fields: DictationTrace.runtimeFields(), model: resolvedModel)
             generation = try await ollama.cleanup(rawText, model: resolvedModel, profile: profile)
             try Task.checkCancellation()
-            trace?.record(.ollamaFinished, status: .success, model: resolvedModel)
+            trace?.record(.ollamaFinished, status: .success, fields: DictationTrace.runtimeFields(), model: resolvedModel)
             ollamaReachability = .reachable
         } catch {
-            trace?.record(.ollamaFinished, status: isCancellation(error) || Task.isCancelled ? .cancelled : .failed, model: resolvedModel)
+            trace?.record(.ollamaFinished, status: isCancellation(error) || Task.isCancelled ? .cancelled : .failed, fields: DictationTrace.runtimeFields(), model: resolvedModel)
             try handleOllamaFailure(error)
         }
         return validatedCleanup(generation, raw: rawText)

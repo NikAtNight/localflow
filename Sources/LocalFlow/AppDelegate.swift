@@ -275,6 +275,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // gating presses on `state == .idle` made the hotkey feel dead.
     private var isRecording = false
     private var processingCount = 0
+    private var pendingAudioHandoffs = 0
+    private var pendingInjections = 0
     // Lets a stale async start-failure from an abandoned recording be
     // distinguished from the one currently in flight.
     private var recordingGeneration = 0
@@ -309,6 +311,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Lifecycle
+
+    static func terminationReply(
+        isRecording: Bool, pendingAudioHandoffs: Int, processingCount: Int, pendingInjections: Int
+    ) -> NSApplication.TerminateReply {
+        isRecording || pendingAudioHandoffs > 0 || processingCount > 0 || pendingInjections > 0
+            ? .terminateCancel : .terminateNow
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let reply = Self.terminationReply(
+            isRecording: isRecording, pendingAudioHandoffs: pendingAudioHandoffs,
+            processingCount: processingCount, pendingInjections: pendingInjections
+        )
+        if reply == .terminateCancel {
+            DiagLog.log("quit refused: dictation is still active")
+            lastError = UserFacingIssue(
+                summary: "Finish dictation before quitting",
+                details: "Wait for recording, processing, and clipboard restoration to finish, then quit again."
+            )
+            refreshStatusUI()
+        }
+        return reply
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DiagLog.startSession()
@@ -933,9 +958,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activeDictationGeneration = nil
         incrementalTimer?.cancel()
         incrementalTimer = nil
+        pendingAudioHandoffs += 1
         DictationTrace.$current.withValue(trace) {
             recorder.stop { [weak self] samples in
                 guard let self else { return }
+                defer { self.pendingAudioHandoffs -= 1 }
                 if self.failedCaptureStarts.remove(generation) != nil {
                     if let dictationGeneration {
                         self.dictationPipeline.cancel(generation: dictationGeneration)
@@ -1084,13 +1111,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 text.utf8.count
             )
 
-        case .emptyTranscript:
-            DiagLog.log("transcription produced no text (%.1fs of audio)", pending.duration)
-            injectionCoordinator.complete(pending.sequence, with: .skip)
-            reportHeardNothing()
-            dismissHud(pending.hudGeneration)
-
-        case .failed(_, let message):
+        case .emptyTranscript, .failed:
+            let message: String
+            if case .failed(_, let failure) = outcome {
+                message = failure
+            } else {
+                DiagLog.log("transcription produced no text (%.1fs of audio); kept for retry", pending.duration)
+                message = "Speech recognition returned no text."
+            }
             injectionCoordinator.complete(pending.sequence, with: .skip)
             dismissHud(pending.hudGeneration)
             retrySamples.append(pending.samples)
@@ -1098,7 +1126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             playCue("Basso")
             state = .failed(UserFacingIssue(
                 summary: "Couldn't transcribe audio",
-                details: "\(message) The audio was kept. Use Retry Dictation in the menu."
+                details: "\(message) The audio was kept in memory. Use Retry Dictation in the menu before quitting."
             ))
             scheduleFailureRecovery()
         }
@@ -1160,6 +1188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func injectCompletedText(_ text: String) {
+        pendingInjections += 1
         let trace = DictationTrace.current
         // The cue acknowledges dispatch. Clipboard restoration happens later
         // and cannot establish whether the target app inserted the text.
@@ -1168,18 +1197,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.lastLatencyMs = Int(ms)
             }
             self?.playCue("Bottle")
-        }) { [weak self] landed in
+        }) { [weak self] result in
             guard let self else { return }
-            if landed {
-                self.lastError = nil
-            } else {
-                DiagLog.log("paste may not have landed — transcript kept in Recent Dictations")
+            self.pendingInjections -= 1
+            if let issue = result.userFacingIssue {
+                DiagLog.log("text delivery warning: %@; transcript kept in Recent Dictations", issue.summary)
                 self.playCue("Basso")
-                self.state = .failed(UserFacingIssue(
-                    summary: "Paste may not have landed",
-                    details: "The transcript is available under Recent Dictations in the menu."
-                ))
+                self.state = .failed(issue)
                 self.scheduleFailureRecovery()
+            } else {
+                self.lastError = nil
             }
         }
     }

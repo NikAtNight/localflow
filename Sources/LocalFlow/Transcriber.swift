@@ -245,29 +245,52 @@ actor Transcriber {
         }
         let options = currentDecodingOptions()
         let results: [TranscriptionResult]
+        let text: String
+        let isHallucination: Bool
+        let raw: String
         do {
-            trace?.record(.inferenceStarted)
+            if let trace {
+                let voice = AudioRecorder.voicedMetrics(of: samples)
+                var inputFields = DictationTrace.runtimeFields()
+                inputFields[.samples] = Double(samples.count)
+                inputFields[.voicedSeconds] = voice.voicedSeconds
+                if voice.voicedDBFS.isFinite {
+                    inputFields[.voicedDBFS] = Double(voice.voicedDBFS)
+                }
+                inputFields[.lowEnergy] = lowEnergy ? 1 : 0
+                trace.record(.inferenceStarted, fields: inputFields)
+            }
             results = try await whisperKit.transcribe(
                 audioArray: samples,
                 decodeOptions: options
             )
-            trace?.record(.inferenceFinished, status: Task.isCancelled ? .cancelled : .success)
+            let inferenceFinishedAt = DispatchTime.now().uptimeNanoseconds
+            text = Self.finalize(results)
+            isHallucination = lowEnergy && Self.isCanonicalHallucination(text)
+            raw = results.map(\.text).joined(separator: " ")
+            if let trace {
+                var outputFields = DictationTrace.runtimeFields()
+                outputFields[.rawCharacters] = Double(raw.count)
+                outputFields[.resultCount] = Double(results.count)
+                outputFields[.segmentCount] = Double(results.reduce(0) { $0 + $1.segments.count })
+                outputFields[.hallucinationFiltered] = isHallucination ? 1 : 0
+                trace.record(.inferenceFinished, at: inferenceFinishedAt,
+                             status: Task.isCancelled ? .cancelled : .success, fields: outputFields)
+            }
             await transcriptionGate.release()
         } catch {
-            trace?.record(.inferenceFinished, status: Task.isCancelled || error is CancellationError ? .cancelled : .failed)
+            trace?.record(.inferenceFinished, status: Task.isCancelled || error is CancellationError ? .cancelled : .failed,
+                          fields: DictationTrace.runtimeFields())
             await transcriptionGate.release()
             throw error
         }
-        let text = Self.finalize(results)
-        let isHallucination = lowEnergy && Self.isCanonicalHallucination(text)
         if text.isEmpty || isHallucination {
             // A healthy-audio dictation has produced an empty transcript in
             // the field; the raw hypothesis SIZE tells whether Whisper
             // returned nothing or post-processing ate a real result. Never
             // log the content itself — the diag file must stay free of
             // dictated text.
-            let raw = results.map(\.text).joined(separator: " ")
-            DiagLog.log("[diag] empty transcript: rawChars=%d segments=%d lowEnergy=%d",
+            DiagLog.log("[diag] empty transcript: rawChars=%d results=%d lowEnergy=%d",
                   raw.count, results.count, lowEnergy ? 1 : 0)
         }
         if isHallucination { return "" }

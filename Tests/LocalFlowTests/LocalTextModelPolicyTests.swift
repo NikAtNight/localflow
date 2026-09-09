@@ -23,6 +23,11 @@ final class LocalTextModelPolicyTests: XCTestCase {
         ])
         XCTAssertEqual(events.events[1].status, .failed)
         XCTAssertEqual(events.events.last?.model, "s1-mini")
+        for event in events.events where event.name == .ollamaStarted || event.name == .ollamaFinished {
+            let thermalState = try XCTUnwrap(event.fields["thermalState"])
+            XCTAssertTrue((0...3).contains(thermalState))
+            XCTAssertTrue(event.fields.values.allSatisfy { $0.isFinite })
+        }
         let json = String(decoding: try JSONEncoder().encode(events.events), as: UTF8.self)
         XCTAssertFalse(json.contains("Private"))
     }

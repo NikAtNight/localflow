@@ -49,6 +49,22 @@ dictation history is a separate feature controlled by its existing setting.
 | `typingStarted` / `typingDispatched` | Secure Input fallback's separate serial typing queue |
 | `clipboardWindowResolved` | Restore/supersession bookkeeping, not visible insertion |
 
+Sample-based inference events also record the exact submitted sample count,
+voiced seconds, finite voiced dBFS, and the low-energy flag. Finish events report
+raw character count, result-container count, decoded segment count, and whether
+canonical-phrase filtering removed the output. These counts contain no text.
+Zero returned characters identify an empty decoder result, but do not expose
+Whisper's internal no-speech decision for discarded segments.
+
+Sample inference and Ollama cleanup events include host thermal state and the
+one-minute system load average when available. Thermal values are 0 nominal,
+1 fair, 2 serious, and 3 critical. Load average is not GPU utilization, this
+app's CPU usage, or proof of contention. Pair these fields with existing Ollama
+load, prompt, generation, and token measurements when investigating slow runs.
+The separate `--transcribe` file path does not emit the sample diagnostics;
+use `--replay` for these checks. Inference finish timestamps still bracket the
+Whisper call, excluding analysis of the returned text.
+
 Cancellation requests and eventual request returns are separate events. A
 cancelled result cannot prove an in-flight CoreML prediction stopped immediately.
 No prediction-abort policy is changed by this instrumentation. Hardware event

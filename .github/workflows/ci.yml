@@ -50,6 +50,7 @@ jobs:
         run: |
           swift package resolve
           bash Tests/ReleaseContractTests.sh
+          python3 Tests/LocalAppIdleTests.py
 
       - name: Build
         run: swift build

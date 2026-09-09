@@ -40,6 +40,21 @@ final class DictationTrace: @unchecked Sendable {
         case runIndex, cachePresent, decoderLoadMs, encoderLoadMs, tokenizerLoadMs
         case ollamaLoadMs, ollamaTotalMs, ollamaPromptMs, ollamaEvalMs
         case ollamaPromptTokens, ollamaOutputTokens
+        case thermalState, systemLoad1m
+        case voicedSeconds, voicedDBFS, lowEnergy, rawCharacters, resultCount, segmentCount, hallucinationFiltered
+    }
+
+    /// Host context for slow inference. Load is the system's one-minute load
+    /// average, not a measurement of GPU utilization or this app's CPU usage.
+    static func runtimeFields() -> [Field: Double] {
+        var fields: [Field: Double] = [
+            .thermalState: Double(ProcessInfo.processInfo.thermalState.rawValue)
+        ]
+        var load = 0.0
+        if getloadavg(&load, 1) == 1, load.isFinite, load >= 0 {
+            fields[.systemLoad1m] = load
+        }
+        return fields
     }
 
     struct Event: Codable, Sendable {

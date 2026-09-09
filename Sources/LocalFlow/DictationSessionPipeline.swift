@@ -248,8 +248,7 @@ final class DictationSessionPipeline {
 
         if session.incrementalFailed {
             guard let release = session.releaseAudio else { return }
-            session.trace?.record(.fullRetry, fields: [.samples: Double(release.fullSamples.count)])
-            transcribeFullUtterance(session, samples: release.fullSamples)
+            transcribeFullUtterance(session, samples: release.fullSamples, isRetry: true)
             return
         }
 
@@ -339,7 +338,10 @@ final class DictationSessionPipeline {
         }
     }
 
-    private func transcribeFullUtterance(_ session: Session, samples: [Float]) {
+    private func transcribeFullUtterance(_ session: Session, samples: [Float], isRetry: Bool = false) {
+        if isRetry {
+            session.trace?.record(.fullRetry, fields: [.samples: Double(samples.count)])
+        }
         let request = DictationTranscriptionRequest(
             generation: session.generation,
             segment: .fullUtterance,
@@ -352,7 +354,12 @@ final class DictationSessionPipeline {
                 guard isCurrent(session) else { return }
                 session.activeTask = nil
                 if text.isEmpty {
-                    complete(session, with: .emptyTranscript(generation: session.generation))
+                    // Chunk fallback already spends the session's one recovery attempt.
+                    if !isRetry, AudioRecorder.voicedMetrics(of: samples).voicedSeconds >= 0.3 {
+                        transcribeFullUtterance(session, samples: samples, isRetry: true)
+                    } else {
+                        complete(session, with: .emptyTranscript(generation: session.generation))
+                    }
                 } else {
                     finalize(session, transcript: text)
                 }

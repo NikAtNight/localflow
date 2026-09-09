@@ -2,6 +2,29 @@ import XCTest
 @testable import LocalFlow
 
 final class TextInjectorTests: XCTestCase {
+    @MainActor
+    func testEmptyInputReportsFailureOnceWithoutDispatching() {
+        var results: [TextInjector.InjectionResult] = []
+        var dispatchCount = 0
+
+        TextInjector.inject("", onDispatch: { dispatchCount += 1 }) {
+            results.append($0)
+        }
+
+        XCTAssertEqual(results, [.dispatchFailed])
+        XCTAssertEqual(dispatchCount, 0)
+    }
+
+    @MainActor
+    func testDeliveryWarningsFitMenuWithoutTruncation() throws {
+        XCTAssertNil(TextInjector.InjectionResult.dispatched.userFacingIssue)
+        for result in [TextInjector.InjectionResult.clipboardChanged, .dispatchFailed] {
+            let issue = try XCTUnwrap(result.userFacingIssue)
+            XCTAssertEqual(issue.menuSummary, issue.summary)
+            XCTAssertFalse(issue.details.isEmpty)
+        }
+    }
+
     func testUTF16ChunksRoundTripWithoutSplittingSurrogatePairs() async {
         // Nine ASCII units followed by an emoji puts the high surrogate exactly
         // at a naive ten-unit boundary.

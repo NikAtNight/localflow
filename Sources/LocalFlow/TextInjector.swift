@@ -10,6 +10,32 @@ import Carbon.HIToolbox
 /// we must never leave dictated text on the clipboard in that case).
 @MainActor
 enum TextInjector {
+    enum InjectionResult: Equatable {
+        /// Events were posted. The target app's insertion is not observable.
+        case dispatched
+        /// Paste was posted, but the clipboard changed before restoration.
+        case clipboardChanged
+        /// Some or all keyboard events could not be created.
+        case dispatchFailed
+
+        var userFacingIssue: UserFacingIssue? {
+            switch self {
+            case .dispatched:
+                return nil
+            case .clipboardChanged:
+                return UserFacingIssue(
+                    summary: "Clipboard changed after paste",
+                    details: "The paste shortcut was sent, but the clipboard changed before restoration. Check whether the text appeared before copying it from Recent Dictations."
+                )
+            case .dispatchFailed:
+                return UserFacingIssue(
+                    summary: "Couldn't send dictation",
+                    details: "Some or all text could not be sent. Check the target app before copying the transcript from Recent Dictations."
+                )
+            }
+        }
+    }
+
     // All mutated on the main thread only (inject is called from the app's
     // main-actor pipeline). Tracks one save/restore cycle across possibly
     // overlapping dictations.
@@ -19,14 +45,12 @@ enum TextInjector {
     private static var ourChangeCount = -1
     private static var restoreGeneration = 0
 
-    /// `completion` (main queue) reports whether the paste is believed to
-    /// have landed: true when the restore window resolved with our text
-    /// still on the clipboard (or typing finished, in secure-input mode),
-    /// false when the paste couldn't be posted or the window was disturbed.
-    static func inject(_ text: String, onDispatch: (() -> Void)? = nil, completion: ((Bool) -> Void)? = nil) {
+    /// `completion` runs on the main queue and reports event dispatch and
+    /// clipboard disturbance. Neither confirms insertion into the target app.
+    static func inject(_ text: String, onDispatch: (() -> Void)? = nil, completion: ((InjectionResult) -> Void)? = nil) {
         let trace = DictationTrace.current
         guard !text.isEmpty else {
-            completion?(false)
+            completion?(.dispatchFailed)
             return
         }
 
@@ -66,14 +90,14 @@ enum TextInjector {
                 pasteboard.clearContents()
                 pasteboard.writeObjects(saved)
             }
-            completion?(false)
+            completion?(.dispatchFailed)
             return
         }
         trace?.record(.pasteDispatched, status: .success)
         onDispatch?()
         pendingCompletion = { undisturbed in
             trace?.record(.clipboardWindowResolved, status: undisturbed ? .unchangedClipboard : .changedClipboard)
-            completion?(undisturbed)
+            completion?(undisturbed ? .dispatched : .clipboardChanged)
         }
 
         // Give the frontmost app time to service the paste before restoring —
@@ -182,7 +206,7 @@ enum TextInjector {
     /// Types text as synthesized unicode keyboard events, in chunks (long
     /// strings on a single event get truncated by some apps).
     /// `completion` runs on the main queue once every chunk has been posted.
-    private static func typeString(_ text: String, trace: DictationTrace?, onDispatch: (() -> Void)?, completion: ((Bool) -> Void)? = nil) {
+    private static func typeString(_ text: String, trace: DictationTrace?, onDispatch: (() -> Void)?, completion: ((InjectionResult) -> Void)? = nil) {
         let chunks = utf16Chunks(text)
         typingQueue.async {
             trace?.record(.typingStarted)
@@ -204,7 +228,7 @@ enum TextInjector {
             trace?.record(.typingDispatched, status: allPosted ? .success : .failed)
             DispatchQueue.main.async {
                 if allPosted { onDispatch?() }
-                completion?(allPosted)
+                completion?(allPosted ? .dispatched : .dispatchFailed)
             }
         }
     }

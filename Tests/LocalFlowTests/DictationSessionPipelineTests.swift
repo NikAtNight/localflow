@@ -271,6 +271,147 @@ final class DictationSessionPipelineTests: XCTestCase {
         ])
     }
 
+    func testEmptyFullUtteranceRetriesOnceAndCleansOnlyRecoveredText() async {
+        var requests: [DictationTranscriptionRequest] = []
+        var cleanupTexts: [String] = []
+        let outcomes = OutcomeRecorder()
+        let pipeline = DictationSessionPipeline(
+            transcribe: { request in
+                requests.append(request)
+                return requests.count == 1 ? "" : "Recovered speech."
+            },
+            cleanup: { request in
+                cleanupTexts.append(request.text)
+                return TranscriptCleanupResult(text: request.text, succeeded: true)
+            },
+            onOutcome: { outcomes.append($0) }
+        )
+        pipeline.begin(generation: 60, context: context())
+        pipeline.release(generation: 60, fullSamples: speech)
+
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(requests.map(\.segment), [.fullUtterance, .fullUtterance])
+        XCTAssertTrue(requests.allSatisfy { $0.samples == speech })
+        XCTAssertEqual(cleanupTexts, ["Recovered speech."])
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 60, text: "Recovered speech.")])
+    }
+
+    func testRepeatedEmptyFullUtteranceStopsAndUnblocksLaterDictation() async {
+        var calls = 0
+        let outcomes = OutcomeRecorder()
+        let pipeline = DictationSessionPipeline(
+            transcribe: { request in
+                if request.generation == 61 { calls += 1; return "" }
+                return "Later speech."
+            },
+            cleanup: { request in
+                XCTFail("Empty audio must not reach cleanup")
+                return TranscriptCleanupResult(text: request.text, succeeded: true)
+            },
+            onOutcome: { outcomes.append($0) }
+        )
+        pipeline.begin(generation: 61, context: context(cleanupEnabled: false))
+        pipeline.release(generation: 61, fullSamples: speech)
+        pipeline.begin(generation: 62, context: context(cleanupEnabled: false))
+        pipeline.release(generation: 62, fullSamples: speech)
+
+        expectTrue(await waitForOutcomes(2, in: outcomes))
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(outcomes.values, [
+            .emptyTranscript(generation: 61),
+            .finalTranscript(generation: 62, text: "Later speech.")
+        ])
+    }
+
+    func testFailedAutomaticRetryEmitsFailureWithoutFurtherAttempts() async {
+        var calls = 0
+        let outcomes = OutcomeRecorder()
+        let pipeline = DictationSessionPipeline(
+            transcribe: { _ in
+                calls += 1
+                if calls == 1 { return "" }
+                throw TestError.decodeFailed
+            },
+            cleanup: { request in
+                XCTFail("Failed recognition must not reach cleanup")
+                return TranscriptCleanupResult(text: request.text, succeeded: true)
+            },
+            onOutcome: { outcomes.append($0) }
+        )
+        pipeline.begin(generation: 67, context: context())
+        pipeline.release(generation: 67, fullSamples: speech)
+
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(calls, 2)
+        guard case .failed(generation: 67, message: _) = outcomes.values.first else {
+            return XCTFail("Expected the retry error to remain recoverable")
+        }
+    }
+
+    func testEmptySilentFullUtteranceDoesNotRetry() async {
+        var calls = 0
+        let outcomes = OutcomeRecorder()
+        let pipeline = DictationSessionPipeline(
+            transcribe: { _ in calls += 1; return "" },
+            cleanup: { request in
+                XCTFail("Silent audio must not reach cleanup")
+                return TranscriptCleanupResult(text: request.text, succeeded: true)
+            },
+            onOutcome: { outcomes.append($0) }
+        )
+        pipeline.begin(generation: 63, context: context())
+        pipeline.release(generation: 63, fullSamples: [Float](repeating: 0, count: speech.count))
+
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(outcomes.values, [.emptyTranscript(generation: 63)])
+    }
+
+    func testEmptyChunkRecoveryDoesNotRetryFullUtteranceAgain() async {
+        var segments: [DictationTranscriptionSegment] = []
+        let outcomes = OutcomeRecorder()
+        let pipeline = DictationSessionPipeline(
+            transcribe: { request in segments.append(request.segment); return "" },
+            cleanup: { request in
+                XCTFail("Empty results must not reach cleanup")
+                return TranscriptCleanupResult(text: request.text, succeeded: true)
+            },
+            onOutcome: { outcomes.append($0) }
+        )
+        pipeline.begin(generation: 64, context: context())
+        pipeline.processIncrementalChunk(generation: 64, samples: speech, pauseSecondsAfterChunk: 0)
+        pipeline.release(generation: 64, fullSamples: speech + speech)
+
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        XCTAssertEqual(segments, [.incrementalChunk(index: 0), .fullUtterance])
+        XCTAssertEqual(outcomes.values, [.emptyTranscript(generation: 64)])
+    }
+
+    func testCancelledEmptyResultRetryCannotDeliverLateText() async {
+        let transcriber = ControlledTranscriber()
+        let cleaner = RecordingCleaner(mode: .unchanged)
+        let outcomes = OutcomeRecorder()
+        let pipeline = makePipeline(transcriber: transcriber, cleaner: cleaner, outcomes: outcomes)
+        pipeline.begin(generation: 65, context: context())
+        pipeline.release(generation: 65, fullSamples: speech)
+        expectTrue(await waitForCall(.fullUtterance, generation: 65, in: transcriber))
+        expectTrue(await transcriber.succeed("", segment: .fullUtterance, generation: 65))
+        let retryStarted = await waitForCall(.fullUtterance, generation: 65, in: transcriber, minimumCount: 2)
+        XCTAssertTrue(retryStarted)
+        guard retryStarted else { return }
+
+        pipeline.cancel(generation: 65)
+        pipeline.begin(generation: 66, context: context())
+        pipeline.release(generation: 66, fullSamples: speech)
+        expectTrue(await waitForCall(.fullUtterance, generation: 66, in: transcriber))
+        expectTrue(await transcriber.succeed("Current speech.", segment: .fullUtterance, generation: 66))
+        expectTrue(await waitForOutcomes(1, in: outcomes))
+        expectTrue(await transcriber.succeed("Stale speech.", segment: .fullUtterance, generation: 65))
+        await settleAsyncWork()
+        XCTAssertEqual(outcomes.values, [.finalTranscript(generation: 66, text: "Current speech.")])
+        expectEqual(await cleaner.requestTexts(), ["Current speech."])
+    }
+
     private func makePipeline(
         transcriber: ControlledTranscriber,
         cleaner: RecordingCleaner,
@@ -301,10 +442,11 @@ final class DictationSessionPipelineTests: XCTestCase {
     private func waitForCall(
         _ segment: DictationTranscriptionSegment,
         generation: Int,
-        in transcriber: ControlledTranscriber
+        in transcriber: ControlledTranscriber,
+        minimumCount: Int = 1
     ) async -> Bool {
         for _ in 0..<10_000 {
-            if await transcriber.hasCall(segment, generation: generation) { return true }
+            if await transcriber.callCount(segment, generation: generation) >= minimumCount { return true }
             await Task.yield()
         }
         return false

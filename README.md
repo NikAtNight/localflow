@@ -121,7 +121,10 @@ For daily testing alongside the production app:
 ./scripts/local-app.sh local       # switch back without rebuilding
 ```
 
-Finish any dictation before switching. Production stays at
+Finish any dictation before switching. The installer checks again after the
+build and refuses to switch if a dictation is active. The app also refuses Quit
+during recording, processing, or clipboard restoration; try again after it finishes.
+Production stays at
 `/Applications/LocalFlow.app`; local builds use `/Applications/LocalFlow Local.app`
 and bundle ID `app.talix.localflow.local`. The local copy disables automatic
 updates and login registration. Production keeps its existing login behavior;
@@ -207,8 +210,11 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   - **Recent Dictations** — the last 5 transcripts; click one to copy it back
     to the clipboard (the safety net if a paste ever goes astray).
   - **Open Dictation History** — today's log in Finder (see below).
-  - **Retry Failed Dictation** — appears if a transcription errored; the
-    audio is kept so your words aren't lost.
+  - **Retry Dictation** appears if transcription errors or still returns no
+    text after recovery. Empty voiced recordings get one automatic retry;
+    chunk fallback counts as that retry. Up to three unsuccessful recordings
+    stay in memory for manual retry, oldest first. They are lost when you quit;
+    audio is never saved to disk.
   - **Clean up transcripts** — toggle the LLM cleanup pass (Apple
     Intelligence on-device when available, else Ollama — see below).
   - **Sound Cues** — start/finish sounds, plus a low "Basso" when something
@@ -218,6 +224,8 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   an idle warm session. A specifically selected mic stays pinned while it's
   connected.
 - Your previous clipboard contents are saved and restored after the paste.
+  If the clipboard changes first, the app reports "Clipboard changed after paste".
+  Check whether your text appeared before copying it again from Recent Dictations.
 - Recordings cap at 5 minutes, and putting the Mac to sleep mid-hold discards
   the recording (rather than pasting it somewhere surprising at wake).
 - Start at Login uses a LaunchAgent that relaunches LocalFlow if it ever
