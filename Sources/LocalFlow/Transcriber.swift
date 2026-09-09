@@ -82,15 +82,23 @@ actor Transcriber {
     /// keeps serving transcriptions until the replacement is actually ready,
     /// so a failed download never strands the app with no model.
     func load(model: String) async throws {
-        if loadedModel == model, whisperKit != nil { return }
+        let trace = DictationTrace(source: .modelLoad)
+        trace.record(.modelLoadRequested, model: model)
+        if loadedModel == model, whisperKit != nil {
+            trace.record(.modelLoadFinished, status: .warm, model: model)
+            return
+        }
         loadGeneration += 1
         let generation = loadGeneration
 
+        trace.record(.modelLoadWaitStarted)
         await loadGate.acquire()
+        trace.record(.modelLoadAcquired)
         // A newer load was requested while this one queued; let it win
         // without building (and briefly double-retaining) a stale pipeline.
         guard generation == loadGeneration else {
             await loadGate.release()
+            trace.record(.modelLoadFinished, status: .stale)
             return
         }
 
@@ -99,12 +107,14 @@ actor Transcriber {
         // Load now so the app's ready state is truthful and the first hotkey
         // release does not pay model initialization latency.
         let cachedFolder = Self.cachedModelFolder(for: model)
+        trace.record(.modelCacheChecked, fields: [.cachePresent: cachedFolder == nil ? 0 : 1])
         let pipe: WhisperKit
         do {
             if let cachedFolder {
                 do {
-                    pipe = try await WhisperKit(Self.config(modelFolder: cachedFolder))
+                    pipe = try await Self.measuredLoad(Self.config(modelFolder: cachedFolder), trace: trace)
                 } catch {
+                    trace.record(.modelLoadFallback, status: .fallback)
                     // Directory presence is only a fast completeness signal. If
                     // CoreML or tokenizer loading finds corruption, let the Hub
                     // path verify/repair the cache instead of stranding startup.
@@ -113,23 +123,42 @@ actor Transcriber {
                         model,
                         error.localizedDescription
                     )
-                    pipe = try await WhisperKit(Self.config(model: model))
+                    pipe = try await Self.measuredLoad(Self.config(model: model), trace: trace)
                 }
             } else {
-                pipe = try await WhisperKit(Self.config(model: model))
+                pipe = try await Self.measuredLoad(Self.config(model: model), trace: trace)
             }
         } catch {
             await loadGate.release()
+            trace.record(.modelLoadFinished, status: error is CancellationError ? .cancelled : .failed)
             throw error
         }
         await loadGate.release()
 
         // The actor is reentrant across those awaits: a later load may have
         // started (and even finished) meanwhile. Last requested wins.
-        guard generation == loadGeneration else { return }
+        guard generation == loadGeneration else {
+            trace.record(.modelLoadFinished, status: .stale)
+            return
+        }
         whisperKit = pipe
         loadedModel = model
         refreshVocabularyTokens()
+        trace.record(.modelLoadFinished, status: .success)
+    }
+
+    private static func measuredLoad(_ config: WhisperKitConfig, trace: DictationTrace) async throws -> WhisperKit {
+        try await DictationTrace.$current.withValue(trace) {
+            trace.record(.modelAttemptStarted)
+            do {
+                let pipeline = try await StartupMeasuredWhisperKit(config)
+                trace.record(.modelAttemptFinished, status: .success)
+                return pipeline
+            } catch {
+                trace.record(.modelAttemptFinished, status: error is CancellationError ? .cancelled : .failed)
+                throw error
+            }
+        }
     }
 
     /// Names and jargon to bias decoding toward (people, products,
@@ -203,7 +232,10 @@ actor Transcriber {
         lowEnergy: Bool = false
     ) async throws -> String {
         guard whisperKit != nil else { throw TranscriberError.notLoaded }
+        let trace = DictationTrace.current
+        trace?.record(.engineWaitStarted)
         await transcriptionGate.acquire()
+        trace?.record(.engineAcquired, model: loadedModel)
         // Snapshot pipeline + options together AFTER the gate: a model
         // switch while queued regenerates the vocabulary tokens, and the
         // old pipeline must never decode with the new model's token IDs.
@@ -214,12 +246,15 @@ actor Transcriber {
         let options = currentDecodingOptions()
         let results: [TranscriptionResult]
         do {
+            trace?.record(.inferenceStarted)
             results = try await whisperKit.transcribe(
                 audioArray: samples,
                 decodeOptions: options
             )
+            trace?.record(.inferenceFinished, status: Task.isCancelled ? .cancelled : .success)
             await transcriptionGate.release()
         } catch {
+            trace?.record(.inferenceFinished, status: Task.isCancelled || error is CancellationError ? .cancelled : .failed)
             await transcriptionGate.release()
             throw error
         }
@@ -243,7 +278,10 @@ actor Transcriber {
     /// Used by the `--transcribe` CLI mode for testing and benchmarking.
     func transcribe(file path: String) async throws -> String {
         guard whisperKit != nil else { throw TranscriberError.notLoaded }
+        let trace = DictationTrace.current
+        trace?.record(.engineWaitStarted)
         await transcriptionGate.acquire()
+        trace?.record(.engineAcquired, model: loadedModel)
         guard let whisperKit else {
             await transcriptionGate.release()
             throw TranscriberError.notLoaded
@@ -251,12 +289,15 @@ actor Transcriber {
         let options = currentDecodingOptions()
         let results: [TranscriptionResult]
         do {
+            trace?.record(.inferenceStarted)
             results = try await whisperKit.transcribe(
                 audioPath: path,
                 decodeOptions: options
             )
+            trace?.record(.inferenceFinished, status: Task.isCancelled ? .cancelled : .success)
             await transcriptionGate.release()
         } catch {
+            trace?.record(.inferenceFinished, status: Task.isCancelled || error is CancellationError ? .cancelled : .failed)
             await transcriptionGate.release()
             throw error
         }

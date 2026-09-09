@@ -4,6 +4,29 @@ import XCTest
 
 @MainActor
 final class LocalTextModelPolicyTests: XCTestCase {
+    func testTraceSeparatesAppleFailureDiscoveryAndOllamaFallbackWithoutContent() async throws {
+        let apple = AppleBackendSpy(isAvailable: true)
+        apple.cleanupResults = [.failure(URLError(.cannotDecodeContentData))]
+        let ollama = OllamaBackendSpy()
+        ollama.installedModelsResults = [.success(["s1-mini"])]
+        ollama.cleanupResults = [.success(.init(text: "Private cleaned sentence.", finishReason: .complete))]
+        let policy = LocalTextModelPolicy(apple: apple, ollama: ollama)
+        let events = TraceEvents()
+        let trace = DictationTrace(sink: { events.append($0) })
+        let result = try await DictationTrace.$current.withValue(trace) {
+            try await policy.cleanup("Private raw sentence.", model: "s1-mini", profile: .general)
+        }
+        XCTAssertEqual(result.text, "Private cleaned sentence.")
+        XCTAssertEqual(events.events.map(\.name), [
+            .appleStarted, .appleFinished, .cleanupFallback,
+            .ollamaDiscoveryStarted, .ollamaDiscoveryFinished, .ollamaStarted, .ollamaFinished
+        ])
+        XCTAssertEqual(events.events[1].status, .failed)
+        XCTAssertEqual(events.events.last?.model, "s1-mini")
+        let json = String(decoding: try JSONEncoder().encode(events.events), as: UTF8.self)
+        XCTAssertFalse(json.contains("Private"))
+    }
+
     func testCleanupPrefersAppleWithoutCallingOllama() async throws {
         let apple = AppleBackendSpy(isAvailable: true)
         apple.cleanupResults = [.success(.init(text: "Cleaned by Apple.", finishReason: .complete))]
@@ -331,6 +354,30 @@ final class LocalTextModelPolicyTests: XCTestCase {
 
 @MainActor
 final class OllamaClientTests: XCTestCase {
+    func testServerDurationsAreConvertedWithoutLoggingResponse() async throws {
+        let client = makeClient { request in
+            Self.response(for: request, status: 200, json: #"{"response":"private response","done_reason":"stop","total_duration":2000000000,"load_duration":100000000,"prompt_eval_duration":300000000,"eval_duration":1600000000,"prompt_eval_count":12,"eval_count":8}"#)
+        }
+        let events = TraceEvents()
+        let trace = DictationTrace(sink: { events.append($0) })
+        let result = try await DictationTrace.$current.withValue(trace) {
+            try await client.generate(OllamaCleaner.generateRequest("private prompt", model: "s1-mini", profile: .general))
+        }
+        XCTAssertEqual(result.text, "private response")
+        XCTAssertEqual(events.events.first?.fields["ollamaLoadMs"], 100)
+        XCTAssertEqual(events.events.first?.fields["ollamaTotalMs"], 2_000)
+        XCTAssertEqual(events.events.first?.fields["ollamaOutputTokens"], 8)
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(events.events), as: UTF8.self).contains("private"))
+    }
+
+    func testMalformedOptionalTimingDoesNotRejectValidCleanup() async throws {
+        let client = makeClient { request in
+            Self.response(for: request, status: 200, json: #"{"response":"valid edit","load_duration":"unknown","eval_count":null}"#)
+        }
+        let result = try await client.generate(OllamaCleaner.generateRequest("raw", model: "s1-mini", profile: .general))
+        XCTAssertEqual(result.text, "valid edit")
+    }
+
     override func tearDown() {
         URLProtocolStub.reset()
         super.tearDown()

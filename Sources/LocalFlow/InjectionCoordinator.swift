@@ -17,6 +17,7 @@ final class InjectionCoordinator {
 
     private struct Operation {
         let kind: OperationKind
+        let trace: DictationTrace?
         var outcome: Outcome?
     }
 
@@ -49,10 +50,10 @@ final class InjectionCoordinator {
 
     var pendingCount: Int { operations.count }
 
-    func begin(kind: OperationKind) -> Int {
+    func begin(kind: OperationKind, trace: DictationTrace? = DictationTrace.current) -> Int {
         let sequence = sequenceNumberCounter
         sequenceNumberCounter += 1
-        operations[sequence] = Operation(kind: kind, outcome: nil)
+        operations[sequence] = Operation(kind: kind, trace: trace, outcome: nil)
         onProcessingCountChange(operations.count)
         return sequence
     }
@@ -62,6 +63,9 @@ final class InjectionCoordinator {
             return
         }
         operation.outcome = outcome
+        operation.trace?.record(.injectionQueued, fields: [
+            .sequence: Double(sequence), .pendingCount: Double(operations.count)
+        ])
         operations[sequence] = operation
         drain()
     }
@@ -82,7 +86,8 @@ final class InjectionCoordinator {
 
             switch outcome {
             case .inject(let text):
-                onInject(text)
+                operation.trace?.record(.injectionStarted, fields: [.sequence: Double(nextSequenceToDrain - 1)])
+                DictationTrace.$current.withValue(operation.trace) { onInject(text) }
                 onProcessingCountChange(operations.count)
                 drainPending = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + injectionInterval) { [weak self] in
@@ -92,6 +97,7 @@ final class InjectionCoordinator {
                 }
                 return
             case .skip:
+                operation.trace?.record(.injectionSkipped)
                 onProcessingCountChange(operations.count)
             }
         }
@@ -117,6 +123,7 @@ final class InjectionCoordinator {
                   self.nextSequenceToDrain == stalledSequence else { return }
 
             self.operations.removeValue(forKey: stalledSequence)
+            stalled.trace?.record(.injectionSkipped, status: .cancelled)
             self.nextSequenceToDrain += 1
             self.onCancel(stalledSequence, stalled.kind)
             self.onProcessingCountChange(self.operations.count)

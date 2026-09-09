@@ -11,6 +11,21 @@ struct LocalFlowMain {
 
     static func main() {
         let arguments = CommandLine.arguments
+        if let flagIndex = arguments.firstIndex(of: "--replay") {
+            Task { @MainActor in
+                do {
+                    try await DictationReplay.run(arguments: Array(arguments.dropFirst(flagIndex + 1)))
+                    exit(0)
+                } catch {
+                    FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+                    exit(1)
+                }
+            }
+            // Unlike --transcribe, replay uses the main-actor session and
+            // its timers. Blocking the main thread on a semaphore deadlocks it.
+            RunLoop.main.run()
+            return
+        }
         if let flagIndex = arguments.firstIndex(of: "--transcribe"), flagIndex + 1 < arguments.count {
             transcribeFile(
                 arguments[flagIndex + 1],
@@ -50,8 +65,8 @@ struct LocalFlowMain {
 
     /// Headless mode for testing and latency benchmarking:
     ///   LocalFlow --transcribe recording.wav
-    /// Loads the configured Whisper model, transcribes the file with the same
-    /// pipeline the app uses (including optional local model cleanup), and prints
+    /// Loads the configured Whisper model and transcribes the full file,
+    /// including corrections, voice formatting, and optional cleanup. Prints
     /// per-stage timings to stderr and the final text to stdout.
     private static func transcribeFile(_ path: String, cleanupEnabled: Bool) {
         let done = DispatchSemaphore(value: 0)

@@ -185,10 +185,11 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
 - **Initial startup or a model switch can take minutes**: LocalFlow downloads,
   loads, and CoreML-specializes the model before the menubar reports Ready.
   Once Ready, the first transcription no longer pays that setup cost.
-- End-to-end latency (hotkey release → text pasted) is logged on every
-  dictation. Follow `~/Library/Logs/LocalFlow-diag.log`, or open Console.app
-  and filter for "LocalFlow:". Launch the app bundle normally so macOS keeps
-  Microphone and Accessibility permission attribution on LocalFlow.
+- Local timing diagnostics distinguish capture, inference, cleanup, queue
+  waiting, paste-event dispatch, and clipboard restoration. They contain no
+  transcript text. See [Measuring dictation latency](docs/dictation-timings.md).
+  Launch the app bundle normally so macOS keeps Microphone and Accessibility
+  permission attribution on LocalFlow.
 
 ### Automatic formatting
 
@@ -228,8 +229,24 @@ point" mid-sentence starts a list item.
 
 ### Headless testing / benchmarking
 
-The same binary doubles as a CLI for measuring the pipeline without touching
-the mic (the plan's "measure hotkey-release → pasted-text early" step):
+For repeatable processing comparisons, `--replay` keeps one Whisper engine
+loaded and feeds a supplied recording through the session pipeline in real
+time, including incremental transcription, formatting, snippets, and cleanup:
+
+```bash
+build/LocalFlow.app/Contents/MacOS/LocalFlow --replay /path/to/test.wav --runs 5 --no-cleanup
+build/LocalFlow.app/Contents/MacOS/LocalFlow --replay /path/to/test.wav --runs 5 --cleanup
+```
+
+Only the supplied file is read. Replay does not capture the microphone, paste,
+or save dictation history. Text goes to stdout for accuracy comparison; timing
+events go to stderr. It does not measure hotkey-to-visible-text latency.
+See the [measurement protocol](docs/dictation-timings.md) for cold/warm conditions
+and model overrides.
+
+For a single full-file transcription, the older `--transcribe` mode reports
+coarse model-load, transcription, and cleanup timings. It bypasses incremental
+scheduling and injection:
 
 ```bash
 say -o /tmp/test.aiff "This is a test sentence."
@@ -238,8 +255,8 @@ build/LocalFlow.app/Contents/MacOS/LocalFlow --transcribe /tmp/test.aiff
 # Add --no-cleanup to benchmark Whisper alone regardless of saved settings.
 ```
 
-Measured on this machine (M-series, small.en, warm): **~790 ms** for 7 s of
-speech, model load ~1.8 s at app startup.
+Record the hardware, build, model, and warm state with every benchmark;
+timings from different configurations are not a before/after comparison.
 
 ## Optional: LLM cleanup (the WhisperFlow "magic" pass)
 

@@ -23,7 +23,8 @@ enum TextInjector {
     /// have landed: true when the restore window resolved with our text
     /// still on the clipboard (or typing finished, in secure-input mode),
     /// false when the paste couldn't be posted or the window was disturbed.
-    static func inject(_ text: String, completion: ((Bool) -> Void)? = nil) {
+    static func inject(_ text: String, onDispatch: (() -> Void)? = nil, completion: ((Bool) -> Void)? = nil) {
+        let trace = DictationTrace.current
         guard !text.isEmpty else {
             completion?(false)
             return
@@ -31,7 +32,7 @@ enum TextInjector {
 
         if IsSecureEventInputEnabled() {
             // Password field or similar: avoid the clipboard entirely.
-            typeString(text, completion: completion)
+            typeString(text, trace: trace, onDispatch: onDispatch, completion: completion)
             return
         }
 
@@ -58,6 +59,7 @@ enum TextInjector {
         pasteboard.setString(text, forType: .string)
         ourChangeCount = pasteboard.changeCount
         guard postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_V), flags: .maskCommand) else {
+            trace?.record(.pasteDispatched, status: .failed)
             // No Cmd-V went out — put the user's clipboard back right away.
             if let saved = savedItems {
                 savedItems = nil
@@ -67,7 +69,12 @@ enum TextInjector {
             completion?(false)
             return
         }
-        pendingCompletion = completion
+        trace?.record(.pasteDispatched, status: .success)
+        onDispatch?()
+        pendingCompletion = { undisturbed in
+            trace?.record(.clipboardWindowResolved, status: undisturbed ? .unchangedClipboard : .changedClipboard)
+            completion?(undisturbed)
+        }
 
         // Give the frontmost app time to service the paste before restoring —
         // slow apps can take well over a second, and restoring too early
@@ -175,9 +182,10 @@ enum TextInjector {
     /// Types text as synthesized unicode keyboard events, in chunks (long
     /// strings on a single event get truncated by some apps).
     /// `completion` runs on the main queue once every chunk has been posted.
-    private static func typeString(_ text: String, completion: ((Bool) -> Void)? = nil) {
+    private static func typeString(_ text: String, trace: DictationTrace?, onDispatch: (() -> Void)?, completion: ((Bool) -> Void)? = nil) {
         let chunks = utf16Chunks(text)
         typingQueue.async {
+            trace?.record(.typingStarted)
             let source = CGEventSource(stateID: .combinedSessionState)
             var allPosted = true
 
@@ -193,8 +201,10 @@ enum TextInjector {
                 }
                 if index < chunks.count - 1 { usleep(8_000) }
             }
-            if let completion {
-                DispatchQueue.main.async { completion(allPosted) }
+            trace?.record(.typingDispatched, status: allPosted ? .success : .failed)
+            DispatchQueue.main.async {
+                if allPosted { onDispatch?() }
+                completion?(allPosted)
             }
         }
     }

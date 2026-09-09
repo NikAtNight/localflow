@@ -77,6 +77,9 @@ final class HotkeyManager {
     private var _key: Key = .rightOption // main-thread copy for UI reads
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
+    /// Set only while a real event's main-queue handler runs. Synthetic
+    /// releases have no hardware timestamp and must not reuse an old one.
+    private(set) var callbackUptimeNs: UInt64?
     /// Called on the main queue when the verified tap later stops delivering
     /// events entirely (sleep/wake, TCC churn) — the owner should restart it.
     var onTapDied: (() -> Void)?
@@ -363,9 +366,12 @@ final class HotkeyManager {
 
         let handler = pressed ? onPress : onRelease
         let flags = event.flags.rawValue
+        let receivedAt = DispatchTime.now().uptimeNanoseconds
         // NSLog can block. Keep all diagnostics out of the event-tap
         // callback, and run the latency-sensitive owner action first.
         DispatchQueue.main.async {
+            self.callbackUptimeNs = receivedAt
+            defer { self.callbackUptimeNs = nil }
             handler?()
             DiagLog.log("hotkey flagsChanged keycode=%d flags=0x%llx isDown=%d",
                   keyCode, flags, wasDown ? 1 : 0)

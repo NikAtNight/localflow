@@ -17,10 +17,35 @@ final class OllamaClient: @unchecked Sendable {
     private struct GenerateResponse: Decodable {
         let response: String
         let doneReason: String?
+        let totalDuration: Double?
+        let loadDuration: Double?
+        let promptEvalDuration: Double?
+        let evalDuration: Double?
+        let promptEvalCount: Double?
+        let evalCount: Double?
 
         enum CodingKeys: String, CodingKey {
             case response
             case doneReason = "done_reason"
+            case totalDuration = "total_duration"
+            case loadDuration = "load_duration"
+            case promptEvalDuration = "prompt_eval_duration"
+            case evalDuration = "eval_duration"
+            case promptEvalCount = "prompt_eval_count"
+            case evalCount = "eval_count"
+        }
+
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            response = try values.decode(String.self, forKey: .response)
+            doneReason = try values.decodeIfPresent(String.self, forKey: .doneReason)
+            // Optional diagnostics must never reject an otherwise valid edit.
+            totalDuration = try? values.decode(Double.self, forKey: .totalDuration)
+            loadDuration = try? values.decode(Double.self, forKey: .loadDuration)
+            promptEvalDuration = try? values.decode(Double.self, forKey: .promptEvalDuration)
+            evalDuration = try? values.decode(Double.self, forKey: .evalDuration)
+            promptEvalCount = try? values.decode(Double.self, forKey: .promptEvalCount)
+            evalCount = try? values.decode(Double.self, forKey: .evalCount)
         }
     }
 
@@ -69,6 +94,20 @@ final class OllamaClient: @unchecked Sendable {
         let (data, response) = try await session.data(for: request)
         try requireSuccess(response)
         let result = try JSONDecoder().decode(GenerateResponse.self, from: data)
+        if let trace = DictationTrace.current {
+            let values: [(DictationTrace.Field, Double?)] = [
+                (.ollamaTotalMs, result.totalDuration.map { $0 / 1_000_000 }),
+                (.ollamaLoadMs, result.loadDuration.map { $0 / 1_000_000 }),
+                (.ollamaPromptMs, result.promptEvalDuration.map { $0 / 1_000_000 }),
+                (.ollamaEvalMs, result.evalDuration.map { $0 / 1_000_000 }),
+                (.ollamaPromptTokens, result.promptEvalCount),
+                (.ollamaOutputTokens, result.evalCount)
+            ]
+            let fields = Dictionary(uniqueKeysWithValues: values.compactMap { key, value in
+                value.flatMap { $0.isFinite && $0 >= 0 ? (key, $0) : nil }
+            })
+            if !fields.isEmpty { trace.record(.ollamaServerMetrics, fields: fields) }
+        }
         return TextModelGeneration(
             text: result.response,
             finishReason: result.doneReason == "length" ? .length : .complete

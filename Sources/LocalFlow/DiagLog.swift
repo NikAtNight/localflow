@@ -1,11 +1,11 @@
 import Foundation
+import Darwin
 
 /// Diagnostic sink that works regardless of how the app was launched.
 /// NSLog is redacted in the unified log and only visible when the binary
 /// runs from a terminal — which also changes TCC attribution and has
 /// broken the mic. Lines land in ~/Library/Logs/LocalFlow-diag.log
-/// (transcript CONTENT must never be logged here except the raw-Whisper
-/// line for empty transcripts, which by definition carries none).
+/// Transcript content must never be logged here.
 enum DiagLog {
     private static let queue = DispatchQueue(label: "app.talix.localflow.diaglog", qos: .utility)
     private static let path = (NSHomeDirectory() as NSString)
@@ -39,6 +39,7 @@ enum DiagLog {
                 try? FileManager.default.removeItem(atPath: path)
             }
             write("=== LocalFlow session start (pid \(ProcessInfo.processInfo.processIdentifier)) ===")
+            write(environmentLine())
         }
     }
 
@@ -51,6 +52,52 @@ enum DiagLog {
             NSLog("LocalFlow: %@", message)
             write(message)
         }
+    }
+
+    static func timing(_ event: DictationTrace.Event) {
+        queue.async {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            guard let data = try? encoder.encode(event),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            write("timing " + json)
+        }
+    }
+
+    /// Build and host metadata only. Excludes usernames, serial numbers,
+    /// vocabulary, corrections, snippets, and clipboard contents.
+    static func environmentLine() -> String {
+        #if DEBUG
+        let configuration = "debug"
+        #else
+        let configuration = "release"
+        #endif
+        let process = ProcessInfo.processInfo
+        let bundle = Bundle.main
+        let values: [String: String] = [
+            "schemaVersion": "1", "pid": String(process.processIdentifier),
+            "osVersion": process.operatingSystemVersionString,
+            "processorCount": String(process.processorCount),
+            "memoryBytes": String(process.physicalMemory),
+            "hardwareModel": systemString("hw.model"),
+            "chip": systemString("machdep.cpu.brand_string"),
+            "appVersion": bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unbundled",
+            "buildConfiguration": configuration,
+            "buildCommit": bundle.object(forInfoDictionaryKey: "LFBuildCommit") as? String ?? "unknown",
+            "buildDirty": bundle.object(forInfoDictionaryKey: "LFBuildDirty") as? String ?? "unknown"
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: values, options: [.sortedKeys]),
+              let json = String(data: data, encoding: .utf8) else { return "timing_environment unavailable" }
+        return "timing_environment " + json
+    }
+
+    private static func systemString(_ name: String) -> String {
+        var length = 0
+        guard sysctlbyname(name, nil, &length, nil, 0) == 0, length > 0 else { return "unknown" }
+        var bytes = [CChar](repeating: 0, count: length)
+        guard sysctlbyname(name, &bytes, &length, nil, 0) == 0 else { return "unknown" }
+        return String(cString: bytes)
     }
 
     private static func write(_ message: String) {

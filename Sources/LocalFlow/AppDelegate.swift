@@ -206,6 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingDictations: [Int: PendingDictation] = [:]
     private var nextDictationGeneration = 0
     private var activeDictationGeneration: Int?
+    private var activeDictationTrace: DictationTrace?
     private var incrementalTimer: DispatchWorkItem?
     private lazy var dictationPipeline = DictationSessionPipeline(
         transcribe: { [weak self] request in
@@ -409,7 +410,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             recordingGeneration += 1
             cancelActiveDictationSession()
             overlay.hide()
-            recorder.stop { _ in }
+            DictationTrace.$current.withValue(activeDictationTrace) { recorder.stop { _ in } }
+            activeDictationTrace = nil
             state = restingState
         }
         // Sleep must not carry an open mic through the nap — release any
@@ -670,14 +672,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        let trace = recordingIsCommand ? nil : DictationTrace(start: hotkey.callbackUptimeNs)
+        activeDictationTrace = trace
+        trace?.record(.hotkeyPressed, at: hotkey.callbackUptimeNs, fields: [
+            .keepMicWarm: Settings.keepMicWarm ? 1 : 0
+        ], model: Settings.whisperModel)
         if Settings.cleanupEnabled && !recordingIsCommand {
             let model = Settings.ollamaModel
-            Task { await textModelPolicy.prewarm(model: model) }
+            Task {
+                await DictationTrace.$current.withValue(trace) {
+                    await textModelPolicy.prewarm(model: model)
+                }
+            }
         }
         // A denied mic yields an engine that happily records silence —
         // every dictation would "succeed" with nothing to show. Fail loudly.
         let micAuth = AVCaptureDevice.authorizationStatus(for: .audio)
         if micAuth == .denied || micAuth == .restricted {
+            trace?.record(.captureFailed)
+            activeDictationTrace = nil
             // This early-out was silent in the logs once — presses that
             // "did nothing" with no trace. Never again.
             DiagLog.log("hotkey press refused: microphone authorization is %d", micAuth.rawValue)
@@ -702,7 +715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // while the visual state is updated in parallel. The "speak now"
         // cue fires on the first sustained audio, not on engine start, and
         // only for THIS recording's generation.
-        recorder.start(onCaptureLive: { [weak self] in
+        recorder.start(trace: trace, onCaptureLive: { [weak self] in
             DispatchQueue.main.async {
                 guard let self, self.isRecording, generation == self.recordingGeneration else { return }
                 self.overlay.captureLive()
@@ -754,8 +767,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static let maxRecordingSeconds: TimeInterval = 300
-    private static let incrementalStartSeconds: TimeInterval = 8
-    private static let incrementalTickSeconds: TimeInterval = 4
 
     private func captureDictationContext() -> DictationSessionContext {
         DictationSessionContext(
@@ -774,9 +785,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activeDictationGeneration = generation
         dictationPipeline.begin(
             generation: generation,
-            context: captureDictationContext()
+            context: captureDictationContext(),
+            trace: activeDictationTrace
         )
-        scheduleIncrementalTick(generation: generation, after: Self.incrementalStartSeconds)
+        scheduleIncrementalTick(generation: generation, after: DictationSessionPipeline.incrementalStartSeconds)
     }
 
     private func scheduleIncrementalTick(generation: Int, after delay: TimeInterval) {
@@ -789,27 +801,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func runIncrementalTick(generation: Int) {
         guard activeDictationGeneration == generation, isRecording else { return }
-        scheduleIncrementalTick(generation: generation, after: Self.incrementalTickSeconds)
-        guard dictationPipeline.canAcceptIncrementalChunk(generation: generation) else { return }
+        scheduleIncrementalTick(generation: generation, after: DictationSessionPipeline.incrementalTickSeconds)
+        guard dictationPipeline.canAcceptIncrementalChunk(generation: generation) else {
+            activeDictationTrace?.record(.incrementalSkipped, status: .busy)
+            return
+        }
 
         recorder.snapshot { [weak self] samples in
             guard let self,
                   self.activeDictationGeneration == generation,
-                  self.isRecording,
-                  samples.count >= Int(Self.incrementalStartSeconds * AudioRecorder.sampleRate),
-                  self.dictationPipeline.canAcceptIncrementalChunk(generation: generation) else { return }
-            let start = self.dictationPipeline.incrementalSampleEnd(generation: generation) ?? 0
-            guard let cut = AudioRecorder.incrementalCutPoint(in: samples, after: start) else { return }
-            let chunk = AudioRecorder.trimmingSilence(Array(samples[start..<cut]))
-            let voice = AudioRecorder.voicedMetrics(of: chunk)
-            guard voice.voicedSeconds >= Self.minVoicedSeconds else { return }
-            let pause = AudioRecorder.incrementalPauseSeconds(in: samples, around: cut)
-            self.dictationPipeline.processIncrementalChunk(
-                generation: generation,
-                samples: chunk,
-                pauseSecondsAfterChunk: pause,
-                sourceEndIndex: cut
-            )
+                  self.isRecording else { return }
+            self.dictationPipeline.processIncrementalSnapshot(generation: generation, samples: samples)
         }
     }
 
@@ -880,6 +882,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hotkeyReleased() {
         let releasedAt = Date()
         guard isRecording else { return }
+        let trace = activeDictationTrace
+        activeDictationTrace = nil
+        trace?.record(.hotkeyReleased, at: hotkey.callbackUptimeNs,
+                      status: hotkey.callbackUptimeNs == nil ? .synthetic : nil)
         isRecording = false
         // The HUD stays up as a loading state until this dictation resolves;
         // the generation ties the eventual dismissHud to this dictation so a
@@ -896,18 +902,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activeDictationGeneration = nil
         incrementalTimer?.cancel()
         incrementalTimer = nil
-        recorder.stop { [weak self] samples in
-            guard let self else { return }
-            if self.failedCaptureStarts.remove(generation) != nil {
-                if let dictationGeneration {
-                    self.dictationPipeline.cancel(generation: dictationGeneration)
+        DictationTrace.$current.withValue(trace) {
+            recorder.stop { [weak self] samples in
+                guard let self else { return }
+                if self.failedCaptureStarts.remove(generation) != nil {
+                    if let dictationGeneration {
+                        self.dictationPipeline.cancel(generation: dictationGeneration)
+                    }
+                    self.dismissHud(generation)
+                    return
                 }
-                self.dismissHud(generation)
-                return
+                DictationTrace.$current.withValue(trace) {
+                    self.process(samples: samples, releasedAt: releasedAt,
+                             hudGeneration: generation, asCommand: asCommand,
+                             dictationGeneration: dictationGeneration)
+                }
             }
-            self.process(samples: samples, releasedAt: releasedAt,
-                         hudGeneration: generation, asCommand: asCommand,
-                         dictationGeneration: dictationGeneration)
         }
         overlay.beginProcessing()
     }
@@ -943,6 +953,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let duration = Double(samples.count) / AudioRecorder.sampleRate
         let voice = AudioRecorder.voicedMetrics(of: samples)
         guard voice.voicedSeconds >= Self.minVoicedSeconds else {
+            DictationTrace.current?.record(.resultReady, status: .insufficientVoice)
             DiagLog.log("skipping transcription: %.2fs voiced (of %.2fs) at %.0f dBFS is below the gate",
                   voice.voicedSeconds, duration, voice.voicedDBFS)
             if let dictationGeneration {
@@ -1034,9 +1045,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             dismissHud(pending.hudGeneration)
 
             let ms = Int(Date().timeIntervalSince(pending.releasedAt) * 1000)
-            lastLatencyMs = ms
             DiagLog.log(
-                "end-to-end %dms (%.1fs audio, cleanup=%@, outputBytes=%d)",
+                "release-to-result-delivery %dms (%.1fs audio, cleanup=%@, outputBytes=%d; paste may still be queued)",
                 ms,
                 pending.duration,
                 pending.cleanupEnabled ? "on" : "off",
@@ -1119,9 +1129,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func injectCompletedText(_ text: String) {
+        let trace = DictationTrace.current
         // The success cue waits for the injector's verdict. Hearing it while
         // nothing was pasted is worse than hearing it late.
-        TextInjector.inject(text) { [weak self] landed in
+        TextInjector.inject(text, onDispatch: { [weak self] in
+            if let ms = trace?.millisecondsSinceRelease {
+                self?.lastLatencyMs = Int(ms)
+            }
+        }) { [weak self] landed in
             guard let self else { return }
             if landed {
                 self.playCue("Bottle")

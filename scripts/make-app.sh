@@ -25,6 +25,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp .build/release/LocalFlow "$APP/Contents/MacOS/LocalFlow"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 
+# Record the source revision for local diagnostic reports before signing.
+BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+BUILD_DIRTY=false
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
+    BUILD_DIRTY=true
+fi
+/usr/libexec/PlistBuddy -c "Add :LFBuildCommit string $BUILD_COMMIT" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :LFBuildDirty string $BUILD_DIRTY" "$APP/Contents/Info.plist"
+
 if [[ -n "${APP_SHORT_VERSION:-}" && -n "${APP_BUNDLE_VERSION:-}" ]]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $APP_SHORT_VERSION" "$APP/Contents/Info.plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $APP_BUNDLE_VERSION" "$APP/Contents/Info.plist"

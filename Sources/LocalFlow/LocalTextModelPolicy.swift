@@ -104,18 +104,23 @@ final class LocalTextModelPolicy {
         model: String,
         profile: AppStyleProfile
     ) async throws -> TranscriptCleanupResult {
+        let trace = DictationTrace.current
         if apple.isAvailable {
             do {
+                trace?.record(.appleStarted)
                 let generation = try await apple.cleanup(rawText, profile: profile)
                 try Task.checkCancellation()
                 let result = validatedCleanup(generation, raw: rawText)
+                trace?.record(.appleFinished, status: result.succeeded ? .success : .fallback)
                 if result.succeeded { return result }
             } catch {
+                trace?.record(.appleFinished, status: isCancellation(error) || Task.isCancelled ? .cancelled : .failed)
                 if isCancellation(error) || Task.isCancelled {
                     throw CancellationError()
                 }
                 try Task.checkCancellation()
             }
+            trace?.record(.cleanupFallback, status: .ollama)
         }
 
         do {
@@ -168,13 +173,17 @@ final class LocalTextModelPolicy {
         model: String,
         profile: AppStyleProfile
     ) async throws -> TranscriptCleanupResult {
+        let trace = DictationTrace.current
         let resolvedModel = await resolvedOllamaModel(model)
         let generation: TextModelGeneration
         do {
+            trace?.record(.ollamaStarted, model: resolvedModel)
             generation = try await ollama.cleanup(rawText, model: resolvedModel, profile: profile)
             try Task.checkCancellation()
+            trace?.record(.ollamaFinished, status: .success, model: resolvedModel)
             ollamaReachability = .reachable
         } catch {
+            trace?.record(.ollamaFinished, status: isCancellation(error) || Task.isCancelled ? .cancelled : .failed, model: resolvedModel)
             try handleOllamaFailure(error)
         }
         return validatedCleanup(generation, raw: rawText)
@@ -204,7 +213,10 @@ final class LocalTextModelPolicy {
     }
 
     private func resolvedOllamaModel(_ configuredModel: String) async -> String {
+        let trace = DictationTrace.current
+        trace?.record(.ollamaDiscoveryStarted, model: configuredModel)
         let models = await installedOllamaModels()
+        trace?.record(.ollamaDiscoveryFinished, status: Task.isCancelled ? .cancelled : nil)
         guard !models.isEmpty, !models.contains(configuredModel) else {
             return configuredModel
         }
@@ -219,9 +231,14 @@ final class LocalTextModelPolicy {
     }
 
     func prewarm(model: String) async {
+        let trace = DictationTrace.current
+        trace?.record(.prewarmStarted, model: model)
+        var status: DictationTrace.Status?
+        defer { trace?.record(.prewarmReturned, status: status, model: model) }
         let key = isAppleAvailable ? PrewarmKey.apple : .ollama(model)
 
         if let operation = prewarmOperations[key] {
+            status = .shared
             await operation.task.value
             return
         }
@@ -229,16 +246,19 @@ final class LocalTextModelPolicy {
         let now = now()
         if let lastPrewarm = lastPrewarmByKey[key],
            now.timeIntervalSince(lastPrewarm) < prewarmCooldown {
+            status = .cooldown
             return
         }
         lastPrewarmByKey[key] = now
 
         if key == .apple {
+            status = .apple
             apple.prewarm()
             return
         }
 
         let id = UUID()
+        status = .ollama
         let task = Task { [ollama] in
             await ollama.prewarm(model: model)
         }

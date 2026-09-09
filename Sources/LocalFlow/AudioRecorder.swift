@@ -276,6 +276,7 @@ final class AudioRecorder {
     private var recordingGeneration = 0 // touched only on `controlQueue`
     private var captureGeneration = 0 // guarded by `lock`
     private let lock = NSLock()
+    private var trace: DictationTrace? // guarded by lock
 
     // Session start/stop can block (mic hardware spin-up, TCC prompts) —
     // keep that off the main thread. Serial, so a rapid press→release→press
@@ -289,17 +290,21 @@ final class AudioRecorder {
     /// AUDIBLE audio. Neither session start nor buffer arrival means the
     /// mic is hearing — AirPods stream digital zeros for seconds while
     /// their mic path spins up — and the "speak now" cue must not lie.
-    func start(onCaptureLive: (() -> Void)? = nil, completion: @escaping (Error?) -> Void) {
+    func start(trace: DictationTrace? = nil, onCaptureLive: (() -> Void)? = nil, completion: @escaping (Error?) -> Void) {
+        trace?.record(.captureEnqueued)
         controlQueue.async {
+            trace?.record(.captureStarted)
             // Installed here, after any queued stop() has fully drained the
             // previous session, so old audio can never fire this callback.
             self.lock.lock()
+            self.trace = trace
             self.onLiveCallback = onCaptureLive
             self.lock.unlock()
             do {
                 try self.startCapture()
                 DispatchQueue.main.async { completion(nil) }
             } catch {
+                trace?.record(.captureFailed)
                 DispatchQueue.main.async { completion(error) }
             }
         }
@@ -311,7 +316,10 @@ final class AudioRecorder {
     /// the next start is instant; a session that never went live is on a
     /// suspect route and is torn down as before.
     func stop(completion: @escaping ([Float]) -> Void) {
+        let stopTrace = DictationTrace.current
+        stopTrace?.record(.stopEnqueued)
         controlQueue.async {
+            stopTrace?.record(.stopStarted)
             self.recordingGeneration += 1
             // Drain conversion work already queued at release time so the
             // tail of the utterance is included in the returned samples.
@@ -322,14 +330,22 @@ final class AudioRecorder {
             let wasLive = self.captureLive
             let warmWanted = self._keepWarm
             self.recordingActive = false
+            self.trace = nil
             self.lock.unlock()
+            stopTrace?.record(.audioDetached, fields: [.samples: Double(captured.count)])
             if warmWanted, wasLive, self.session != nil {
                 self.scheduleWarmTeardown()
-                DispatchQueue.main.async { completion(captured) }
+                DispatchQueue.main.async {
+                    stopTrace?.record(.audioHandoff)
+                    completion(captured)
+                }
             } else {
                 // Hardware shutdown can block. The immutable sample Array is
                 // already detached, so let transcription start in parallel.
-                DispatchQueue.main.async { completion(captured) }
+                DispatchQueue.main.async {
+                    stopTrace?.record(.audioHandoff)
+                    completion(captured)
+                }
                 self.tearDownSession()
             }
         }
@@ -442,6 +458,11 @@ final class AudioRecorder {
         // onCaptureLive. Wrong device (setting changed, default moved, a
         // fallback mic was pinned last time) rebuilds from scratch.
         if let session, session.isRunning, sessionDeviceUID == currentWantedDeviceUID() {
+            lock.lock()
+            let captureTrace = trace
+            lock.unlock()
+            captureTrace?.record(.captureReady, status: .warm,
+                                 microphone: (session.inputs.first as? AVCaptureDeviceInput)?.device.localizedName)
             DiagLog.log("[diag] reusing warm capture session on %@", sessionDeviceUID ?? "?")
             armNoAudioWatchdog(rebuildsLeft: 2)
             return
@@ -654,7 +675,9 @@ final class AudioRecorder {
         sessionDeviceUID = device.uniqueID
         lock.lock()
         sessionEpoch = Date()
+        let captureTrace = trace
         lock.unlock()
+        captureTrace?.record(.captureReady, status: .cold, microphone: device.localizedName)
         DiagLog.log("[diag] capture running on %@ (startRunning blocked %.0fms)",
               device.localizedName, Date().timeIntervalSince(startBegan) * 1000)
     }
@@ -785,7 +808,9 @@ final class AudioRecorder {
             peakDBFSWindow = -.infinity
         }
         let liveCallback = (!wasLive && nowLive) ? onLiveCallback : nil
+        let liveTrace = (!wasLive && nowLive) ? trace : nil
         lock.unlock()
+        liveTrace?.record(.microphoneLive)
         if completedSecond >= 0 && completedSecond < 20 {
             DiagLog.log("[diag] level s%d peak %.1f dBFS", completedSecond, completedPeak)
         }
