@@ -74,6 +74,8 @@ final class DictationSessionPipeline {
         let generation: Int
         let context: DictationSessionContext
         let trace: DictationTrace?
+        let diagnostics: DictationDiagnosticStore.Recording?
+        var capturedAudioSaved = false
         var pendingChunks: [IncrementalChunk] = []
         var activeTask: Task<Void, Never>?
         var releaseAudio: ReleaseAudio?
@@ -86,10 +88,11 @@ final class DictationSessionPipeline {
         var incrementalFailed = false
         var cancelled = false
 
-        init(generation: Int, context: DictationSessionContext, trace: DictationTrace?) {
+        init(generation: Int, context: DictationSessionContext, trace: DictationTrace?, diagnostics: DictationDiagnosticStore.Recording?) {
             self.generation = generation
             self.context = context
             self.trace = trace
+            self.diagnostics = diagnostics
         }
     }
 
@@ -116,11 +119,13 @@ final class DictationSessionPipeline {
         self.stalledGenerationTimeout = stalledGenerationTimeout
     }
 
-    func begin(generation: Int, context: DictationSessionContext, trace: DictationTrace? = DictationTrace.current) {
+    func begin(generation: Int, context: DictationSessionContext, trace: DictationTrace? = DictationTrace.current,
+               diagnostics: DictationDiagnosticStore.Recording? = nil) {
         if sessions[generation] != nil || generationOrder.contains(generation) {
             cancel(generation: generation)
         }
-        sessions[generation] = Session(generation: generation, context: context, trace: trace)
+        sessions[generation] = Session(generation: generation, context: context, trace: trace, diagnostics: diagnostics)
+        trace?.retain(in: diagnostics)
         trace?.record(.sessionStarted, fields: [.cleanupEnabled: context.cleanupEnabled ? 1 : 0], model: context.ollamaModel)
         generationOrder.append(generation)
     }
@@ -198,6 +203,13 @@ final class DictationSessionPipeline {
         advance(session)
     }
 
+    func recordCapturedAudio(generation: Int, samples: [Float]) {
+        guard let session = sessions[generation], !session.capturedAudioSaved else { return }
+        session.capturedAudioSaved = true
+        session.diagnostics?.saveAudio(samples)
+        session.diagnostics?.record(.init(stage: "capture", sampleCount: samples.count))
+    }
+
     func release(
         generation: Int,
         fullSamples: [Float],
@@ -207,6 +219,7 @@ final class DictationSessionPipeline {
               !session.cancelled,
               session.releaseAudio == nil else { return }
 
+        recordCapturedAudio(generation: generation, samples: fullSamples)
         let derivedTail: [Float]
         if let tailSamples {
             derivedTail = tailSamples
@@ -232,6 +245,7 @@ final class DictationSessionPipeline {
         let trace = sessions[generation]?.trace ?? completed[generation]?.trace
         trace?.record(.cancellationRequested)
         if let session = sessions.removeValue(forKey: generation) {
+            session.diagnostics?.record(.init(stage: "outcome", status: "cancelled"))
             session.cancelled = true
             session.pendingChunks.removeAll()
             session.activeTask?.cancel()
@@ -375,6 +389,7 @@ final class DictationSessionPipeline {
     }
 
     private func finalize(_ session: Session, transcript: String) {
+        session.diagnostics?.record(.init(stage: "assembledTranscript", text: transcript))
         let composed = Snippets.expand(
             VoiceFormatter.apply(
                 TranscriptCorrections.apply(
@@ -384,6 +399,7 @@ final class DictationSessionPipeline {
             ),
             snippets: session.context.snippets
         )
+        session.diagnostics?.record(.init(stage: "cleanupInput", text: composed))
         guard !composed.isEmpty else {
             complete(session, with: .emptyTranscript(generation: session.generation))
             return
@@ -406,8 +422,12 @@ final class DictationSessionPipeline {
             guard let self, let session else { return }
             session.trace?.record(.cleanupStarted)
             let result = await DictationTrace.$current.withValue(session.trace) {
-                await self.cleanup(request)
+                await DictationDiagnosticStore.Recording.$current.withValue(session.diagnostics) {
+                    await self.cleanup(request)
+                }
             }
+            session.diagnostics?.record(.init(stage: "cleanupOutput", text: result.text,
+                                              status: result.succeeded ? "success" : "fallback"))
             session.trace?.record(.cleanupFinished, status: Task.isCancelled ? .cancelled : (result.succeeded ? .success : .fallback))
             guard isCurrent(session) else { return }
             session.activeTask = nil
@@ -425,6 +445,14 @@ final class DictationSessionPipeline {
         case .finalTranscript: status = .success
         case .emptyTranscript: status = .empty
         case .failed: status = .failed
+        }
+        switch outcome {
+        case .finalTranscript(_, let text):
+            session.diagnostics?.record(.init(stage: "finalTranscript", text: text, status: status.rawValue))
+        case .failed(_, let message):
+            session.diagnostics?.record(.init(stage: "outcome", text: message, status: status.rawValue))
+        case .emptyTranscript:
+            session.diagnostics?.record(.init(stage: "outcome", status: status.rawValue))
         }
         session.trace?.record(.resultReady, status: status)
         sessions.removeValue(forKey: session.generation)
@@ -464,14 +492,22 @@ final class DictationSessionPipeline {
     }
 
     private func runTranscription(_ request: DictationTranscriptionRequest, session: Session) async throws -> String {
+        session.diagnostics?.record(.init(stage: "transcriptionRequest", segment: request.segment, sampleCount: request.samples.count))
         session.trace?.record(.transcriptionRequested, fields: [.samples: Double(request.samples.count)], segment: request.segment)
         do {
             let text = try await DictationTrace.$current.withValue(session.trace) {
-                try await transcribe(request)
+                try await DictationDiagnosticStore.Recording.$current.withValue(session.diagnostics) {
+                    try await transcribe(request)
+                }
             }
+            session.diagnostics?.record(.init(stage: "transcriptionResult", text: text,
+                                              status: Task.isCancelled ? "cancelled" : (text.isEmpty ? "empty" : "success"),
+                                              segment: request.segment))
             session.trace?.record(.transcriptionFinished, status: Task.isCancelled ? .cancelled : (text.isEmpty ? .empty : .success))
             return text
         } catch {
+            session.diagnostics?.record(.init(stage: "transcriptionResult", text: error.localizedDescription,
+                                              status: Task.isCancelled ? "cancelled" : "failed", segment: request.segment))
             session.trace?.record(.transcriptionFinished, status: Task.isCancelled || error is CancellationError ? .cancelled : .failed)
             throw error
         }
@@ -487,8 +523,10 @@ final class DictationSessionPipeline {
                   !self.completed.isEmpty else { return }
             self.stallTimer = nil
             self.stalledGeneration = nil
+            let message = "Transcription timed out while a later dictation was waiting."
             let session = self.sessions.removeValue(forKey: generation)
             if let session {
+                session.diagnostics?.record(.init(stage: "outcome", text: message, status: "failed"))
                 session.trace?.record(.cancellationRequested)
                 session.cancelled = true
                 session.activeTask?.cancel()
@@ -496,7 +534,7 @@ final class DictationSessionPipeline {
             session?.trace?.record(.resultReady, status: .failed)
             self.completed[generation] = (.failed(
                 generation: generation,
-                message: "Transcription timed out while a later dictation was waiting."
+                message: message
             ), session?.trace)
             self.drainCompletedOutcomes()
         }

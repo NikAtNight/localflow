@@ -34,6 +34,7 @@ enum Settings {
         static let customVocabulary = "customVocabulary"
         static let corrections = "corrections"
         static let saveHistory = "saveHistory"
+        static let saveDiagnosticRecordings = "saveDiagnosticRecordings"
         static let commandHotkey = "commandHotkey"
         static let commandModeEnabled = "commandModeEnabled"
         static let snippets = "snippets"
@@ -198,6 +199,12 @@ enum Settings {
     static var saveHistory: Bool {
         get { defaults.object(forKey: Key.saveHistory) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.saveHistory) }
+    }
+
+    /// Retain audio and transcript stages locally for troubleshooting when enabled.
+    static var saveDiagnosticRecordings: Bool {
+        get { defaults.bool(forKey: Key.saveDiagnosticRecordings) }
+        set { defaults.set(newValue, forKey: Key.saveDiagnosticRecordings) }
     }
 
     static var soundCues: Bool {

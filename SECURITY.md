@@ -30,8 +30,15 @@ observe or record character keystrokes.
 
 Nowhere. There is no account, no server, and no telemetry.
 
-- **Audio** is transcribed on-device by WhisperKit (CoreML) and is never
-  written to disk or sent anywhere.
+- **Audio** is transcribed on-device by WhisperKit. It stays in memory by
+  default. Opt-in diagnostic recordings save captured audio, recognition inputs,
+  transcript stages, vocabulary/correction/snippet settings, and build/timing
+  metadata under `Application Support/LocalFlow/DiagnosticRecordings/`. Local
+  builds use `LocalFlow Local/DiagnosticRecordings/`. Directories use 0700 and
+  files use 0600 permissions. No archive is uploaded. Retention is 7 days and
+  1 GB, enforced at launch, on saves, and hourly while the app is open. Settings
+  can disable new recordings or delete the diagnostic archive independently
+  of transcript history. Command mode is excluded.
 - **Transcripts** are appended to a daily Markdown file under
   `~/Library/Application Support/LocalFlow/History/` (owner-only permissions,
   and deliberately not in `~/Documents`, which iCloud syncs). You can turn

@@ -3,7 +3,13 @@ import XCTest
 
 @MainActor
 final class DictationSessionStallTests: XCTestCase {
-    func testHungHeadTimesOutBeforeCompletedLaterTranscriptIsDelivered() async {
+    func testHungHeadTimesOutBeforeCompletedLaterTranscriptIsDelivered() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = DictationDiagnosticStore(folder: root)
+        let id = UUID()
+        let recording = store.begin(.init(traceID: id, context: context, whisperModel: "test",
+                                          microphone: "test", vocabulary: ""))
         let hungGeneration = 60
         let laterGeneration = 61
         let transcriber = StallCaseTranscriber(
@@ -31,7 +37,7 @@ final class DictationSessionStallTests: XCTestCase {
             pipeline.cancel(generation: laterGeneration)
         }
 
-        pipeline.begin(generation: hungGeneration, context: context)
+        pipeline.begin(generation: hungGeneration, context: context, diagnostics: recording)
         pipeline.release(
             generation: hungGeneration,
             fullSamples: speech,
@@ -57,6 +63,16 @@ final class DictationSessionStallTests: XCTestCase {
             ),
             .finalTranscript(generation: laterGeneration, text: "later transcript")
         ])
+        store.flush()
+        let data = try Data(contentsOf: root.appendingPathComponent("\(id)/events.jsonl"))
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let events = try data.split(separator: 0x0a).map {
+            try decoder.decode(DictationDiagnosticStore.Event.self, from: Data($0))
+        }
+        let outcome = events.first { $0.stage == "outcome" }
+        XCTAssertEqual(outcome?.status, "failed")
+        XCTAssertEqual(outcome?.text, "Transcription timed out while a later dictation was waiting.")
     }
 
     func testLaterCompletionDoesNotRestartArmedStallDeadline() async {

@@ -24,8 +24,9 @@ paste dispatch. A second empty result emits `emptyTranscript`; a thrown error
 emits `failed`. Neither outcome pastes text or writes transcript history.
 `AppDelegate.handleDictationOutcome` routes both outcomes through the existing
 failure path: skip injection, keep audio in `retrySamples`, and show an error
-explaining Retry Dictation. The queue retains the latest three failed recordings
-in memory only. Quitting loses them. `retryFailedDictation` drains the queue oldest
+explaining Retry Dictation. The retry queue retains the latest three failed recordings
+in memory. Quitting loses the queue. Optional [diagnostic recordings](diagnostic-recordings.md)
+preserve separate disk copies for replay; they do not restore the menu retry queue. `retryFailedDictation` drains the queue oldest
 first into `process`, using current settings and the usual voice gate. A failed
 manual attempt is retained again. Cancellation discards stale results.
 

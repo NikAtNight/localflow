@@ -332,11 +332,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             refreshStatusUI()
         }
+        if reply == .terminateNow { DictationDiagnosticStore.shared.flush() }
         return reply
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         DiagLog.startSession()
+        DictationDiagnosticStore.shared.startMaintenance()
         buildSettings()
         buildStatusItem()
         requestPermissions()
@@ -834,15 +836,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    private func diagnosticRecording(context: DictationSessionContext, trace: DictationTrace?) -> DictationDiagnosticStore.Recording? {
+        guard Settings.saveDiagnosticRecordings else { return nil }
+        return DictationDiagnosticStore.shared.begin(.init(
+            traceID: trace?.id ?? UUID(), context: context,
+            whisperModel: Settings.whisperModel,
+            microphone: Settings.inputDeviceUID ?? "systemDefault",
+            vocabulary: Settings.effectiveVocabulary
+        ))
+    }
+
     private func beginDictationSession() {
         cancelActiveDictationSession()
         let generation = nextDictationGeneration
         nextDictationGeneration += 1
         activeDictationGeneration = generation
+        let context = captureDictationContext()
         dictationPipeline.begin(
             generation: generation,
-            context: captureDictationContext(),
-            trace: activeDictationTrace
+            context: context,
+            trace: activeDictationTrace,
+            diagnostics: diagnosticRecording(context: context, trace: activeDictationTrace)
         )
         scheduleIncrementalTick(generation: generation, after: DictationSessionPipeline.incrementalStartSeconds)
     }
@@ -1005,6 +1019,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         asCommand: Bool = false,
         dictationGeneration: Int? = nil
     ) {
+        if !asCommand, let dictationGeneration {
+            dictationPipeline.recordCapturedAudio(generation: dictationGeneration, samples: rawSamples)
+        }
         // Silent bookends are Whisper's main hallucination trigger and pure
         // wasted encode time.
         let samples = AudioRecorder.trimmingSilence(rawSamples)
@@ -1067,9 +1084,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             generation = nextDictationGeneration
             nextDictationGeneration += 1
+            let context = captureDictationContext()
+            let trace = DictationTrace.current ?? (Settings.saveDiagnosticRecordings ? DictationTrace() : nil)
             dictationPipeline.begin(
-                generation: generation,
-                context: captureDictationContext()
+                generation: generation, context: context, trace: trace,
+                diagnostics: diagnosticRecording(context: context, trace: trace)
             )
         }
         pendingDictations[generation] = PendingDictation(
@@ -1077,7 +1096,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             releasedAt: releasedAt,
             hudGeneration: hudGeneration,
             duration: duration,
-            samples: samples,
+            samples: rawSamples,
             cleanupEnabled: Settings.cleanupEnabled
         )
         dictationPipeline.release(generation: generation, fullSamples: rawSamples)

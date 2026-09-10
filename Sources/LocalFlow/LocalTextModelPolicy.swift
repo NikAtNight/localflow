@@ -110,6 +110,9 @@ final class LocalTextModelPolicy {
                 trace?.record(.appleStarted)
                 let generation = try await apple.cleanup(rawText, profile: profile)
                 try Task.checkCancellation()
+                DictationDiagnosticStore.Recording.current?.record(.init(
+                    stage: "cleanupCandidate", text: generation.text,
+                    status: String(describing: generation.finishReason), model: "apple"))
                 let result = validatedCleanup(generation, raw: rawText)
                 trace?.record(.appleFinished, status: result.succeeded ? .success : .fallback)
                 if result.succeeded { return result }
@@ -179,6 +182,9 @@ final class LocalTextModelPolicy {
         do {
             trace?.record(.ollamaStarted, fields: DictationTrace.runtimeFields(), model: resolvedModel)
             generation = try await ollama.cleanup(rawText, model: resolvedModel, profile: profile)
+            DictationDiagnosticStore.Recording.current?.record(.init(
+                stage: "cleanupCandidate", text: generation.text,
+                status: String(describing: generation.finishReason), model: resolvedModel))
             try Task.checkCancellation()
             trace?.record(.ollamaFinished, status: .success, fields: DictationTrace.runtimeFields(), model: resolvedModel)
             ollamaReachability = .reachable

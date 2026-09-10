@@ -27,6 +27,7 @@ final class SettingsApplication {
         var ollamaCommandModel: String
         var commandReasoning: ReasoningLevel
         var saveHistory: Bool
+        var saveDiagnosticRecordings: Bool
     }
 
     enum Change: Equatable {
@@ -47,6 +48,7 @@ final class SettingsApplication {
         case ollamaCommandModel(String)
         case commandReasoning(ReasoningLevel)
         case saveHistory(Bool)
+        case saveDiagnosticRecordings(Bool)
     }
 
     enum Failure: Error, Equatable {
@@ -146,6 +148,11 @@ final class SettingsApplication {
             rawValue: defaults.string(forKey: Settings.Key.commandReasoning) ?? ""
         ) ?? .off
         let saveHistory = Self.loadBool(from: defaults, key: Settings.Key.saveHistory, default: true)
+        let saveDiagnosticRecordings = Self.loadBool(
+            from: defaults,
+            key: Settings.Key.saveDiagnosticRecordings,
+            default: false
+        )
 
         values = Values(
             hotkey: hotkey,
@@ -164,7 +171,8 @@ final class SettingsApplication {
             ollamaModel: ollamaModel,
             ollamaCommandModel: ollamaCommandModel,
             commandReasoning: commandReasoning,
-            saveHistory: saveHistory
+            saveHistory: saveHistory,
+            saveDiagnosticRecordings: saveDiagnosticRecordings
         )
 
         // Repair missing or malformed values without treating startup as a
@@ -189,6 +197,7 @@ final class SettingsApplication {
         defaults.set(ollamaCommandModel, forKey: Settings.Key.ollamaCommandModel)
         defaults.set(commandReasoning.rawValue, forKey: Settings.Key.commandReasoning)
         defaults.set(saveHistory, forKey: Settings.Key.saveHistory)
+        defaults.set(saveDiagnosticRecordings, forKey: Settings.Key.saveDiagnosticRecordings)
     }
 
     @discardableResult
@@ -306,6 +315,11 @@ final class SettingsApplication {
             guard saveHistory != values.saveHistory else { return .success(()) }
             defaults.set(saveHistory, forKey: Settings.Key.saveHistory)
             values.saveHistory = saveHistory
+
+        case .saveDiagnosticRecordings(let enabled):
+            guard enabled != values.saveDiagnosticRecordings else { return .success(()) }
+            defaults.set(enabled, forKey: Settings.Key.saveDiagnosticRecordings)
+            values.saveDiagnosticRecordings = enabled
         }
 
         return .success(())

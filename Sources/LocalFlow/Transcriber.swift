@@ -244,6 +244,10 @@ actor Transcriber {
             throw TranscriberError.notLoaded
         }
         let options = currentDecodingOptions()
+        let diagnostic = DictationDiagnosticStore.Recording.current
+        let audioFile = "inference-\(UUID().uuidString).wav"
+        diagnostic?.saveAudio(samples, named: audioFile)
+        diagnostic?.record(.init(stage: "inferenceInput", model: loadedModel, audioFile: audioFile, sampleCount: samples.count))
         let results: [TranscriptionResult]
         let text: String
         let isHallucination: Bool
@@ -268,6 +272,15 @@ actor Transcriber {
             text = Self.finalize(results)
             isHallucination = lowEnergy && Self.isCanonicalHallucination(text)
             raw = results.map(\.text).joined(separator: " ")
+            diagnostic?.record(.init(
+                stage: "whisperRaw", text: raw,
+                status: Task.isCancelled ? "cancelled" : "success", model: loadedModel, audioFile: audioFile,
+                segments: results.flatMap { $0.segments.map {
+                    .init(text: $0.text, start: $0.start, end: $0.end)
+                } }
+            ))
+            diagnostic?.record(.init(stage: "whisperPostprocessed", text: isHallucination ? "" : text,
+                                      status: isHallucination ? "hallucinationFiltered" : "success", audioFile: audioFile))
             if let trace {
                 var outputFields = DictationTrace.runtimeFields()
                 outputFields[.rawCharacters] = Double(raw.count)

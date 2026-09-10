@@ -94,7 +94,7 @@ event tap does and does not observe (modifier keys only, never characters),
 where transcripts are stored, and how to report a vulnerability.
 
 The short version: there is no account, no server, and no telemetry. Audio is
-transcribed on-device and never written to disk. The only outbound request
+transcribed on-device. Audio stays in memory unless you enable diagnostic recordings. The only outbound request
 LocalFlow makes on its own is the one-time Whisper model download.
 
 The repository runs CodeQL static analysis on every push, keeps dependencies
@@ -214,7 +214,7 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
     text after recovery. Empty voiced recordings get one automatic retry;
     chunk fallback counts as that retry. Up to three unsuccessful recordings
     stay in memory for manual retry, oldest first. They are lost when you quit;
-    audio is never saved to disk.
+    audio stays in memory unless diagnostic recordings are enabled.
   - **Clean up transcripts** — toggle the LLM cleanup pass (Apple
     Intelligence on-device when available, else Ollama — see below).
   - **Sound Cues** — start/finish sounds, plus a low "Basso" when something
@@ -241,6 +241,31 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
   transcript text. See [Measuring dictation latency](docs/dictation-timings.md).
   Launch the app bundle normally so macOS keeps Microphone and Accessibility
   permission attribution on LocalFlow.
+
+### Diagnostic recordings
+
+To investigate missing words, enable **Settings > History > Save audio and
+transcript stages for diagnostics**. This is separate from the daily text log
+and is off by default. It saves every subsequent dictation, including successful
+results, since a partial transcript can still be reported as a success.
+
+Each folder contains the captured 16 kHz mono audio before silence trimming,
+the exact audio sent to each recognition attempt, raw Whisper text and segment
+timestamps, text before and after cleanup, the final transcript, settings/build
+metadata, and timing events. Data stays under
+`~/Library/Application Support/LocalFlow/DiagnosticRecordings/`, or
+`LocalFlow Local/DiagnosticRecordings/` for the local build. The files have
+owner-only permissions. They contain speech and transcript content, so they
+are separate from the content-free diagnostic log.
+
+The app removes recordings older than 7 days and evicts the oldest folders to
+stay within 1 GB. Cleanup runs at launch, after saves, and hourly while open;
+it cannot run while the app is closed. Settings has separate buttons to open
+the folder or delete diagnostics. Turning retention off affects new dictations;
+an already-started archive can finish. Existing files still expire normally.
+
+See [diagnostic recording and replay](docs/flows/diagnostic-recordings.md) for
+file details, replay commands, and limits. Command-mode recordings are excluded.
 
 ### Automatic formatting
 

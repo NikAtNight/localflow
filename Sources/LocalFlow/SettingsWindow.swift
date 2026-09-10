@@ -100,6 +100,13 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    @Published var saveDiagnosticRecordings: Bool = Settings.saveDiagnosticRecordings {
+        didSet {
+            guard oldValue != saveDiagnosticRecordings, !isSynchronizingApplicationValues else { return }
+            apply(.saveDiagnosticRecordings(saveDiagnosticRecordings))
+        }
+    }
+
     @Published var automaticUpdates: Bool = Settings.automaticUpdates {
         didSet {
             guard oldValue != automaticUpdates, !isSynchronizingApplicationValues else { return }
@@ -284,6 +291,7 @@ final class SettingsModel: ObservableObject {
         ollamaCommandModel = settingsApplication.values.ollamaCommandModel
         commandReasoning = settingsApplication.values.commandReasoning
         saveHistory = settingsApplication.values.saveHistory
+        saveDiagnosticRecordings = settingsApplication.values.saveDiagnosticRecordings
         let applicationCorrections = settingsApplication.values.corrections
         if corrections.map({ SettingsApplication.Correction(wrong: $0.wrong, right: $0.right) })
             != applicationCorrections {
@@ -423,6 +431,9 @@ struct SettingsView: View {
     @State private var newCorrectionWrong = ""
     @State private var newCorrectionRight = ""
     @State private var confirmingHistoryDeletion = false
+    @State private var confirmingDiagnosticDeletion = false
+    @State private var deletingDiagnostics = false
+    @State private var diagnosticFileError: String?
     @State private var newSnippetTrigger = ""
     @State private var newSnippetExpansion = ""
 
@@ -905,8 +916,73 @@ struct SettingsView: View {
             } message: {
                 Text("Every daily log file is removed. This can't be undone.")
             }
+
+            Section {
+                Toggle(
+                    "Save audio and transcript stages for diagnostics",
+                    isOn: $model.saveDiagnosticRecordings
+                )
+                HStack {
+                    Button("Open diagnostic folder") {
+                        do {
+                            try FileManager.default.createDirectory(
+                                at: DictationDiagnosticStore.folder,
+                                withIntermediateDirectories: true,
+                                attributes: [.posixPermissions: 0o700]
+                            )
+                            diagnosticFileError = NSWorkspace.shared.open(DictationDiagnosticStore.folder)
+                                ? nil : "Couldn't open the diagnostic folder."
+                        } catch {
+                            diagnosticFileError = "Couldn't open the diagnostic folder: \(error.localizedDescription)"
+                        }
+                    }
+                    Spacer()
+                    Button("Delete all diagnostics…", role: .destructive) {
+                        confirmingDiagnosticDeletion = true
+                    }
+                    .disabled(deletingDiagnostics)
+                }
+                if let diagnosticFileError {
+                    Text(diagnosticFileError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+            } header: {
+                Text("Diagnostic recordings")
+            } footer: {
+                Text("Saves recordings and transcript stages on this Mac, keeping 7 days within a 1 GB limit. Cleanup runs at launch, on saves, and hourly while LocalFlow is open. Files may contain sensitive speech. Turning this off stops saving new recordings; Delete all diagnostics removes saved files now.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .confirmationDialog(
+                "Delete all diagnostic recordings and transcripts?",
+                isPresented: $confirmingDiagnosticDeletion,
+                titleVisibility: .visible
+            ) {
+                Button("Delete all diagnostics", role: .destructive) {
+                    deletingDiagnostics = true
+                    diagnosticFileError = nil
+                    DictationDiagnosticStore.shared.deleteAll { succeeded in
+                        deletingDiagnostics = false
+                        if !succeeded {
+                            diagnosticFileError = "Couldn't delete all diagnostic files. Try again."
+                        }
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Saved audio and transcript stages are removed. Daily history logs are kept. This can't be undone.")
+            }
         }
         .formStyle(.grouped)
+        .onAppear {
+            if DictationDiagnosticStore.shared.hasWriteFailure {
+                diagnosticFileError = "Could not save diagnostics. The archive may be incomplete. Check available disk space."
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: DictationDiagnosticStore.writeFailedNotification)) { _ in
+            diagnosticFileError = "Could not save diagnostics. The archive may be incomplete. Check available disk space."
+        }
     }
 
     private var systemDefaultMicrophoneLabel: String {

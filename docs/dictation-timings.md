@@ -97,6 +97,12 @@ feedback submission.
 
 ## Reusing identical audio
 
+Opt-in [diagnostic recordings](flows/diagnostic-recordings.md) now retain live
+dictation audio, transcript stages, and a copy of the timing events. The normal
+log remains content-free. Use a saved `original.wav` with the replay commands
+below, or an `inference-*.wav` with `--transcribe` to isolate one recognition
+attempt.
+
 Supply an explicit local path. WAV, AIFF, and other formats supported by the
 existing WhisperKit audio loader can be used. Replay rejects audio longer than
 300 seconds and gates insufficient voiced audio using the app's current rules.

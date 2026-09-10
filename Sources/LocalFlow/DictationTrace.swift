@@ -82,6 +82,7 @@ final class DictationTrace: @unchecked Sendable {
     private let now: @Sendable () -> UInt64
     private let sink: @Sendable (Event) -> Void
     private let lock = NSLock()
+    private var diagnosticRecording: DictationDiagnosticStore.Recording?
     private var ordinal = 0
     private var releasedAt: UInt64?
 
@@ -101,6 +102,12 @@ final class DictationTrace: @unchecked Sendable {
         self.source = source
         self.origin = start ?? now()
         self.sink = sink
+    }
+
+    func retain(in recording: DictationDiagnosticStore.Recording?) {
+        lock.lock()
+        diagnosticRecording = recording
+        lock.unlock()
     }
 
     @discardableResult
@@ -127,6 +134,7 @@ final class DictationTrace: @unchecked Sendable {
         )
         ordinal += 1
         sink(event)
+        diagnosticRecording?.recordTiming(event)
         return event
     }
 

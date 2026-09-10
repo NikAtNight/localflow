@@ -57,6 +57,32 @@ final class SettingsApplicationRoutingTests: XCTestCase {
         ])
     }
 
+    func testDiagnosticRetentionDefaultsOffAndPersistsThroughSettingsModel() {
+        let defaults = makeDefaults()
+        let system = FakeLiveSystem()
+        let application = makeApplication(defaults: defaults, system: system)
+        let model = SettingsModel(settingsApplication: application)
+
+        XCTAssertFalse(model.saveDiagnosticRecordings)
+        XCTAssertFalse(application.values.saveDiagnosticRecordings)
+
+        model.saveDiagnosticRecordings = true
+
+        XCTAssertTrue(application.values.saveDiagnosticRecordings)
+        XCTAssertEqual(defaults.object(forKey: Settings.Key.saveDiagnosticRecordings) as? Bool, true)
+        let reloaded = makeApplication(defaults: defaults, system: system)
+        XCTAssertTrue(reloaded.values.saveDiagnosticRecordings)
+        XCTAssertTrue(SettingsModel(settingsApplication: reloaded).saveDiagnosticRecordings)
+
+        XCTAssertSuccess(model.apply(.saveDiagnosticRecordings(false)))
+
+        XCTAssertFalse(model.saveDiagnosticRecordings)
+        XCTAssertFalse(application.values.saveDiagnosticRecordings)
+        XCTAssertEqual(defaults.object(forKey: Settings.Key.saveDiagnosticRecordings) as? Bool, false)
+        XCTAssertTrue(application.values.saveHistory)
+        XCTAssertTrue(system.events.isEmpty)
+    }
+
     private func makeDefaults() -> UserDefaults {
         let name = "LocalFlow.SettingsApplicationRoutingTests.\(UUID().uuidString)"
         defaultsToRemove.append(name)
