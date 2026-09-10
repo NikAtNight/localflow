@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.4.1](https://github.com/NikAtNight/localflow/compare/v1.4.0...v1.4.1) (2026-09-10)
+
+
+### Fixes
+
+* match Liquid Glass icon to the listening waveform ([ab1848d](https://github.com/NikAtNight/localflow/commit/ab1848d15e1e99863ddb91521b19f7f52c00aa02))
+* use compact native toolbar in settings ([601fee5](https://github.com/NikAtNight/localflow/commit/601fee53a3d9f5de87c7e7e2d74d300546ffd112))
+
 ## [1.4.0](https://github.com/NikAtNight/localflow/compare/v1.3.0...v1.4.0) (2026-09-09)
 
 
