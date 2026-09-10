@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 /// Regenerates the app icon for the selected listening theme. Theme glyphs sit
 /// on a dark rounded plate. Liquid Glass uses a fixed frame of its HUD renderer.
@@ -73,12 +74,13 @@ enum ThemeIcon {
             DiagLog.log("bundle not writable — Launchpad icon left as-is")
             return
         }
-        // A distributed build is signed with a Developer ID and carries a
-        // stapled notarization ticket. Any re-sign here invalidates that
-        // ticket (it is bound to the signature), which is far worse than a
-        // stale Launchpad icon: Gatekeeper would start questioning the app
-        // and its TCC grants could be dropped. The running app still shows
-        // the themed icon via NSApp.applicationIconImage.
+        // Distributed builds are left alone when quarantined or when this
+        // machine lacks their signing key: re-signing invalidates the stapled
+        // notarization ticket, which Gatekeeper re-checks for quarantined
+        // apps. A developer's own non-quarantined copy is re-signed with the
+        // same Developer ID identity, preserving its designated requirement
+        // and TCC grants. The running app still shows the themed icon via
+        // NSApp.applicationIconImage.
         guard canSafelyResign(bundlePath) else {
             DiagLog.log("release-signed bundle — leaving the Launchpad icon alone")
             return
@@ -148,36 +150,67 @@ enum ThemeIcon {
     /// present, else ad-hoc with the pinned identifier requirement — either
     /// way the designated requirement keeps the active app identifier,
     /// so TCC grants survive the rewrite.
-    /// True only when the bundle's existing seal is one this machine can
-    /// reproduce exactly: an ad-hoc signature, or the local development
-    /// identity. Anything issued by Apple (Developer ID, Apple
-    /// Development) belongs to a distributed build and must be left alone.
+    /// True when this machine can reproduce the existing seal without
+    /// affecting Gatekeeper or TCC: ad-hoc, the local development identity,
+    /// or a non-quarantined Developer ID bundle whose exact identity is in
+    /// the keychain. Distributed builds without that key, and quarantined
+    /// distributed builds, are left alone.
     private static func canSafelyResign(_ bundlePath: String) -> Bool {
-        let description = run("/usr/bin/codesign", ["-dvv", bundlePath]).1
-        let authorities = description
-            .components(separatedBy: .newlines)
-            .filter { $0.hasPrefix("Authority=") }
-            .map { String($0.dropFirst("Authority=".count)) }
-        guard let authority = authorities.first else {
+        guard let authority = signingAuthority(bundlePath) else {
             // No authority line: ad-hoc. Nothing to invalidate.
             return true
         }
-        guard authority == localSigningIdentity else { return false }
         let identities = run("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"]).1
-        return identities.contains(localSigningIdentity)
+        if authority == localSigningIdentity {
+            return identities.contains(localSigningIdentity)
+        }
+        guard authority.hasPrefix("Developer ID Application:") else { return false }
+        guard identities.contains(authority) else {
+            DiagLog.log("Developer ID signing identity not in keychain, leaving the Launchpad icon alone")
+            return false
+        }
+        guard !hasQuarantineAttribute(bundlePath) else {
+            DiagLog.log("quarantined Developer ID bundle, leaving the Launchpad icon alone")
+            return false
+        }
+        return true
     }
 
     private static let localSigningIdentity = "Talix Dev Signing"
 
+    private static func signingAuthority(_ bundlePath: String) -> String? {
+        run("/usr/bin/codesign", ["-dvv", bundlePath]).1
+            .components(separatedBy: .newlines)
+            .first { $0.hasPrefix("Authority=") }
+            .map { String($0.dropFirst("Authority=".count)) }
+    }
+
+    private static func hasQuarantineAttribute(_ bundlePath: String) -> Bool {
+        bundlePath.withCString { path in
+            "com.apple.quarantine".withCString { name in
+                let result = getxattr(path, name, nil, 0, 0, 0)
+                return result != -1 || errno != ENOATTR
+            }
+        }
+    }
+
     private static func resign(_ bundlePath: String) -> Bool {
         let (_, identities) = run("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"])
         let result: (Int32, String)
-        if identities.contains("Talix Dev Signing") {
+        let authority = signingAuthority(bundlePath)
+        if let authority, authority.hasPrefix("Developer ID Application:"), identities.contains(authority) {
+            result = run("/usr/bin/codesign", [
+                "--force", "--sign", authority,
+                "--identifier", AppIdentity.current.bundleIdentifier,
+                "--preserve-metadata=entitlements,requirements,flags,runtime",
+                "--timestamp=none", bundlePath,
+            ])
+        } else if identities.contains("Talix Dev Signing") {
             result = run("/usr/bin/codesign", [
                 "--force", "--sign", "Talix Dev Signing",
                 "--identifier", AppIdentity.current.bundleIdentifier, bundlePath,
             ])
-        } else if run("/usr/bin/codesign", ["-dvv", bundlePath]).1.contains("Talix Dev Signing") {
+        } else if authority == localSigningIdentity {
             // The bundle carries the certificate-backed identity but the
             // keychain can't produce it right now (locked, transient error).
             // Downgrading to ad-hoc would change the designated requirement
