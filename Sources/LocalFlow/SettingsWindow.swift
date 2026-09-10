@@ -339,7 +339,9 @@ final class SettingsPanelController {
             let w = NSWindow(contentViewController: hosting)
             w.title = "\(AppIdentity.current.name) Settings"
             w.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-            w.toolbarStyle = .unified
+            // A native toolbar gives the window controls their standard vertical inset.
+            w.toolbar = NSToolbar(identifier: "LocalFlowSettingsToolbar")
+            w.toolbarStyle = .unifiedCompact
             w.setContentSize(NSSize(width: 820, height: 650))
             w.contentMinSize = NSSize(width: 740, height: 520)
             w.isReleasedWhenClosed = false
