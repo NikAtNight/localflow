@@ -721,9 +721,18 @@ final class MercuryRenderer: HudRenderer {
 // MARK: - Liquid Glass (Apple Intelligence ribbons held in glass)
 
 final class LiquidGlassRenderer: HudRenderer {
+    private let showsGlow: Bool
+    private let barCount: Int
+
+    init(showsGlow: Bool = true, barCount: Int = 56) {
+        precondition(barCount >= 2)
+        self.showsGlow = showsGlow
+        self.barCount = barCount
+        heights = [CGFloat](repeating: 0, count: Self.layerCount * barCount)
+        velocities = [CGFloat](repeating: 0, count: Self.layerCount * barCount)
+    }
+
     private static let layerCount = 3
-    private static let barCount = 56
-    private static let stateCount = layerCount * barCount
     private static let gradientLocations = (0..<8).map { CGFloat($0) / 7 }
     // Per-layer variation: relative amplitude, wave speed, and phase offset,
     // so the three hue lines share one motion language without ever moving
@@ -732,8 +741,8 @@ final class LiquidGlassRenderer: HudRenderer {
     private static let layerSpeeds: [CGFloat] = [1.0, 1.34, 0.78]
 
     // Half-heights of the symmetric bars, one spring per bar per layer.
-    private var heights = [CGFloat](repeating: 0, count: stateCount)
-    private var velocities = [CGFloat](repeating: 0, count: stateCount)
+    private var heights: [CGFloat]
+    private var velocities: [CGFloat]
     private var smoothedBands = [CGFloat](repeating: 0, count: 12)
     private var smoothedLevel: CGFloat = 0
     private var smoothedCentroid: CGFloat = 0.5
@@ -752,8 +761,8 @@ final class LiquidGlassRenderer: HudRenderer {
     private let warmTint = HudColor("#FF6841")
 
     func reset() {
-        heights = [CGFloat](repeating: 0, count: Self.stateCount)
-        velocities = [CGFloat](repeating: 0, count: Self.stateCount)
+        heights = [CGFloat](repeating: 0, count: Self.layerCount * barCount)
+        velocities = [CGFloat](repeating: 0, count: Self.layerCount * barCount)
         smoothedBands = [CGFloat](repeating: 0, count: 12)
         smoothedLevel = 0
         smoothedCentroid = 0.5
@@ -800,8 +809,8 @@ final class LiquidGlassRenderer: HudRenderer {
         for layer in 0..<Self.layerCount {
             let layerPhase = CGFloat(layer) * 2.4
             let speed = Self.layerSpeeds[layer]
-            for bar in 0..<Self.barCount {
-                let u = CGFloat(bar) / CGFloat(Self.barCount - 1)
+            for bar in 0..<barCount {
+                let u = CGFloat(bar) / CGFloat(barCount - 1)
                 // Voice shape: the 12 bands spread across the strip.
                 let bandPosition = u * CGFloat(smoothedBands.count - 1)
                 let low = Int(bandPosition)
@@ -825,7 +834,7 @@ final class LiquidGlassRenderer: HudRenderer {
                     * voiceAmp * (0.35 + 0.65 * bandMix)
                 let target = min(maxHalf,
                                  stub + Self.layerScales[layer] * window * (idle + drive * motion))
-                let index = layer * Self.barCount + bar
+                let index = layer * barCount + bar
                 velocities[index] += (target - heights[index]) * 150 * frameTime
                 velocities[index] *= exp(-14 * frameTime)
                 heights[index] += velocities[index] * frameTime
@@ -834,7 +843,7 @@ final class LiquidGlassRenderer: HudRenderer {
 
         let inset = min(bounds.width * 0.08, height * 0.34)
         let width = bounds.width - inset * 2
-        let barWidth = max(1.2, width / CGFloat(Self.barCount) * 0.42)
+        let barWidth = max(1.2, width / CGFloat(barCount) * 0.42)
         let pitchBias = smoothedCentroid - 0.5
 
         // Each layer's gradient starts at a different point in the palette,
@@ -860,10 +869,10 @@ final class LiquidGlassRenderer: HudRenderer {
 
         func layerPath(_ layer: Int) -> CGPath {
             let path = CGMutablePath()
-            for bar in 0..<Self.barCount {
-                let u = CGFloat(bar) / CGFloat(Self.barCount - 1)
+            for bar in 0..<barCount {
+                let u = CGFloat(bar) / CGFloat(barCount - 1)
                 let x = inset + u * width
-                let half = max(stub, heights[layer * Self.barCount + bar])
+                let half = max(stub, heights[layer * barCount + bar])
                 path.move(to: CGPoint(x: x, y: bounds.midY - half))
                 path.addLine(to: CGPoint(x: x, y: bounds.midY + half))
             }
@@ -898,9 +907,11 @@ final class LiquidGlassRenderer: HudRenderer {
             let path = layerPath(layer)
             let layerGradient = gradient(for: layer)
             // Soft halo pass, then the bright bar core.
-            drawPass(path, gradient: layerGradient,
-                     width: barWidth * 2.8,
-                     alpha: (0.05 + smoothedLevel * 0.05 + kick * 0.03) * presence)
+            if showsGlow {
+                drawPass(path, gradient: layerGradient,
+                         width: barWidth * 2.8,
+                         alpha: (0.05 + smoothedLevel * 0.05 + kick * 0.03) * presence)
+            }
             drawPass(path, gradient: layerGradient,
                      width: barWidth,
                      alpha: (0.30 + smoothedLevel * 0.26 + kick * 0.10) * presence)

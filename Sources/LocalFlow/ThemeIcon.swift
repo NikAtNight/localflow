@@ -1,10 +1,7 @@
 import AppKit
 
-/// Regenerates the app icon for the active listening theme. Every theme's
-/// icon is the same composition as the original hand-made icon — the organic
-/// glowing waveform from generate-icon.swift on a dark squircle — recolored
-/// with that theme's palette. (Baking a literal frame of the HUD renderer
-/// was tried first and read as mud at icon sizes.)
+/// Regenerates the app icon for the selected listening theme. Theme glyphs sit
+/// on a dark rounded plate. Liquid Glass uses a fixed frame of its HUD renderer.
 ///
 /// The running process gets the new image immediately, while Finder and
 /// Launchpad read the bundle's AppIcon.icns. Rewriting it breaks the code seal,
@@ -545,37 +542,25 @@ enum ThemeIcon {
         ctx.strokePath()
     }
 
-    /// The Apple Intelligence bar wave — the marketing site's hero waveform,
-    /// frozen mid-phrase: symmetric rounded bars through the four-hue
-    /// gradient, each with the renderer's soft halo behind a bright core.
+    /// A fixed speaking frame without the HUD's halo, keeping the icon's bars crisp.
     private static func liquidGlassGlyph(_ ctx: CGContext, _ S: CGFloat) {
-        let heights: [CGFloat] = [14, 26, 40, 58, 44, 70, 52, 82, 60, 88, 66,
-                                  90, 58, 76, 46, 64, 38, 52, 28, 40, 18, 30, 12]
-        let intelligence = HudRamp([
-            (0.00, "#0A84FF"), (0.25, "#BF5AF2"), (0.50, "#FF375F"),
-            (0.75, "#FF9F0A"), (1.00, "#0A84FF"),
-        ])
-        let left = S * 0.175
-        let pitch = S * 0.65 / CGFloat(heights.count)
-        let core = pitch * 0.40
-        let midY = S * 0.5
-        let maxHalf = S * 0.21
+        let renderer = LiquidGlassRenderer(showsGlow: false, barCount: 28)
+        let bounds = CGRect(x: 0, y: 0, width: 324, height: 90)
+        let spectrum: [CGFloat] = [0.35, 0.55, 0.72, 0.62, 0.48, 0.7,
+                                   0.85, 0.6, 0.42, 0.5, 0.32, 0.18]
         ctx.saveGState()
-        ctx.setBlendMode(.plusLighter)
-        for (i, h) in heights.enumerated() {
-            let u = (CGFloat(i) + 0.5) / CGFloat(heights.count)
-            let color = intelligence.at(u)
-            let half = max(S * 0.010, maxHalf * h / 100)
-            let x = left + (CGFloat(i) + 0.5) * pitch
-            func bar(_ w: CGFloat, _ alpha: CGFloat) {
-                ctx.setFillColor(color.cg(alpha))
-                ctx.addPath(roundedRect(x - w / 2, midY - half, w, half * 2, w / 2))
-                ctx.fillPath()
-            }
-            bar(core * 2.8, 0.10)
-            bar(core * 1.7, 0.22)
-            bar(core, 0.95)
+        ctx.translateBy(x: S * 0.14, y: S * 0.31)
+        ctx.scaleBy(x: S * 0.72 / bounds.width, y: S * 0.38 / bounds.height)
+        // Settle the springs without painting the preceding animation frames.
+        ctx.saveGState()
+        ctx.clip(to: .zero)
+        for frame in 0..<120 {
+            renderer.render(in: ctx, bounds: bounds, t: CGFloat(frame) / 30,
+                            dt: 1 / 30, level: 0.7, spectrum: spectrum)
         }
+        ctx.restoreGState()
+        renderer.render(in: ctx, bounds: bounds, t: 4, dt: 1 / 30,
+                        level: 0.7, spectrum: spectrum)
         ctx.restoreGState()
     }
 
