@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.5.0](https://github.com/NikAtNight/localflow/compare/v1.4.1...v1.5.0) (2026-09-10)
+
+
+### Features
+
+* retain and review local personal voice recordings ([f635daf](https://github.com/NikAtNight/localflow/commit/f635daf109ef096cae3a55cd509a54e66fb2c81d))
+* retain local audio and transcript stages for diagnostics ([7c12e64](https://github.com/NikAtNight/localflow/commit/7c12e64355a739cc3a16100c3a8c51e09a676f5f))
+
+
+### Fixes
+
+* preserve Developer ID identity when updating theme icons ([84f6ce9](https://github.com/NikAtNight/localflow/commit/84f6ce94787859c87dc9e93159d2aca992abda3c))
+
 ## [1.4.1](https://github.com/NikAtNight/localflow/compare/v1.4.0...v1.4.1) (2026-09-10)
 
 
