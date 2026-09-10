@@ -263,6 +263,7 @@ final class AudioRecorder {
     private var forwarder: SampleForwarder?
     private var runtimeObserver: NSObjectProtocol?
     private var samples: [Float] = []
+    private var nativeAudio: NativeAudioAccumulator? // guarded by `lock`
     private var sessionDeviceUID: String? // touched only on `controlQueue`
     private var warmTeardown: DispatchWorkItem? // touched only on `controlQueue`
     private var recordingActive = false // guarded by `lock`
@@ -290,7 +291,7 @@ final class AudioRecorder {
     /// AUDIBLE audio. Neither session start nor buffer arrival means the
     /// mic is hearing — AirPods stream digital zeros for seconds while
     /// their mic path spins up — and the "speak now" cue must not lie.
-    func start(trace: DictationTrace? = nil, onCaptureLive: (() -> Void)? = nil, completion: @escaping (Error?) -> Void) {
+    func start(trace: DictationTrace? = nil, retainNativeAudio: Bool = false, onCaptureLive: (() -> Void)? = nil, completion: @escaping (Error?) -> Void) {
         trace?.record(.captureEnqueued)
         controlQueue.async {
             trace?.record(.captureStarted)
@@ -301,9 +302,13 @@ final class AudioRecorder {
             self.onLiveCallback = onCaptureLive
             self.lock.unlock()
             do {
-                try self.startCapture()
+                try self.startCapture(retainNativeAudio: retainNativeAudio)
                 DispatchQueue.main.async { completion(nil) }
             } catch {
+                self.lock.lock()
+                self.nativeAudio = nil
+                self.recordingActive = false
+                self.lock.unlock()
                 trace?.record(.captureFailed)
                 DispatchQueue.main.async { completion(error) }
             }
@@ -315,7 +320,7 @@ final class AudioRecorder {
     /// audio stays running (discarding buffers) for `warmWindowSeconds` so
     /// the next start is instant; a session that never went live is on a
     /// suspect route and is torn down as before.
-    func stop(completion: @escaping ([Float]) -> Void) {
+    func stop(nativeCompletion: ((NativeAudioRecording?) -> Void)? = nil, completion: @escaping ([Float]) -> Void) {
         let stopTrace = DictationTrace.current
         stopTrace?.record(.stopEnqueued)
         controlQueue.async {
@@ -323,20 +328,25 @@ final class AudioRecorder {
             self.recordingGeneration += 1
             // Drain conversion work already queued at release time so the
             // tail of the utterance is included in the returned samples.
-            self.sampleQueue.sync {}
-            self.lock.lock()
-            let captured = self.samples
-            self.samples = []
-            let wasLive = self.captureLive
-            let warmWanted = self._keepWarm
-            self.recordingActive = false
-            self.trace = nil
-            self.lock.unlock()
+            let (captured, native, wasLive, warmWanted) = self.sampleQueue.sync {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                let captured = self.samples
+                let native = self.nativeAudio?.recording
+                self.samples = []
+                self.nativeAudio = nil
+                let wasLive = self.captureLive
+                let warmWanted = self._keepWarm
+                self.recordingActive = false
+                self.trace = nil
+                return (captured, native, wasLive, warmWanted)
+            }
             stopTrace?.record(.audioDetached, fields: [.samples: Double(captured.count)])
             if warmWanted, wasLive, self.session != nil {
                 self.scheduleWarmTeardown()
                 DispatchQueue.main.async {
                     stopTrace?.record(.audioHandoff)
+                    nativeCompletion?(native)
                     completion(captured)
                 }
             } else {
@@ -344,6 +354,7 @@ final class AudioRecorder {
                 // already detached, so let transcription start in parallel.
                 DispatchQueue.main.async {
                     stopTrace?.record(.audioHandoff)
+                    nativeCompletion?(native)
                     completion(captured)
                 }
                 self.tearDownSession()
@@ -438,21 +449,24 @@ final class AudioRecorder {
         DiagLog.log("[diag] keeping mic warm for %.0fs", Self.warmWindowSeconds)
     }
 
-    private func startCapture() throws {
+    private func startCapture(retainNativeAudio: Bool) throws {
         warmTeardown?.cancel()
         warmTeardown = nil
         recordingGeneration += 1
-        lock.lock()
-        samples.removeAll(keepingCapacity: true)
-        captureLive = false
-        audibleStreak = 0
-        pendingAudible = []
-        buffersThisSession = 0
-        levelWindowSecond = 0
-        peakDBFSWindow = -.infinity
-        recordingActive = true
-        sessionEpoch = Date()
-        lock.unlock()
+        sampleQueue.sync {
+            lock.lock()
+            samples.removeAll(keepingCapacity: true)
+            nativeAudio = retainNativeAudio ? NativeAudioAccumulator() : nil
+            captureLive = false
+            audibleStreak = 0
+            pendingAudible = []
+            buffersThisSession = 0
+            levelWindowSecond = 0
+            peakDBFSWindow = -.infinity
+            recordingActive = true
+            sessionEpoch = Date()
+            lock.unlock()
+        }
         // A warm session on the right device skips spin-up entirely — the
         // next audible buffer (one is usually already in flight) re-fires
         // onCaptureLive. Wrong device (setting changed, default moved, a
@@ -648,7 +662,9 @@ final class AudioRecorder {
         session.addInput(input)
 
         let output = AVCaptureAudioDataOutput()
-        let forwarder = SampleForwarder(targetFormat: Self.targetFormat) { [weak self] converted in
+        let forwarder = SampleForwarder(targetFormat: Self.targetFormat, onRaw: { [weak self] raw in
+            self?.appendNative(raw, from: generation)
+        }) { [weak self] converted in
             self?.append(converted, from: generation)
         }
         output.setSampleBufferDelegate(forwarder, queue: sampleQueue)
@@ -701,6 +717,9 @@ final class AudioRecorder {
                 self.tearDownSession()
                 return
             }
+            self.lock.lock()
+            self.nativeAudio?.markIncomplete()
+            self.lock.unlock()
             DiagLog.log("capture session error mid-recording — resuming capture")
             do {
                 try self.captureWithFallback()
@@ -723,6 +742,9 @@ final class AudioRecorder {
         // from this session must never enter a replacement session.
         lock.lock()
         captureGeneration &+= 1
+        if recordingActive, let nativeAudio, !nativeAudio.recording.samples.isEmpty {
+            nativeAudio.markIncomplete()
+        }
         lock.unlock()
         if let runtimeObserver {
             NotificationCenter.default.removeObserver(runtimeObserver)
@@ -733,6 +755,17 @@ final class AudioRecorder {
         self.session = nil
         forwarder = nil
         sessionDeviceUID = nil
+    }
+
+    private func appendNative(_ buffer: AVAudioPCMBuffer?, from generation: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard recordingActive, generation == captureGeneration, let nativeAudio else { return }
+        if let buffer {
+            nativeAudio.append(buffer)
+        } else {
+            nativeAudio.markIncomplete()
+        }
     }
 
     private func append(_ converted: AVAudioPCMBuffer, from generation: Int) {
@@ -862,10 +895,13 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
     private var rawBuffer: AVAudioPCMBuffer?
     private var convertedBuffer: AVAudioPCMBuffer?
     private let onPCM: (AVAudioPCMBuffer) -> Void
+    private let onRaw: (AVAudioPCMBuffer?) -> Void
 
-    init(targetFormat: AVAudioFormat, onPCM: @escaping (AVAudioPCMBuffer) -> Void) {
+    init(targetFormat: AVAudioFormat, onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
+         onPCM: @escaping (AVAudioPCMBuffer) -> Void) {
         self.targetFormat = targetFormat
         self.onPCM = onPCM
+        self.onRaw = onRaw
     }
 
     func captureOutput(
@@ -874,18 +910,27 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
         from connection: AVCaptureConnection
     ) {
         guard let desc = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc) else { return }
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc) else {
+            onRaw(nil)
+            return
+        }
         let incomingDescription = asbd.pointee
         if sourceDescription.map({ !Self.matches($0, incomingDescription) }) ?? true {
             guard let format = AVAudioFormat(streamDescription: asbd),
-                  let converter = AVAudioConverter(from: format, to: targetFormat) else { return }
+                  let converter = AVAudioConverter(from: format, to: targetFormat) else {
+                onRaw(nil)
+                return
+            }
             sourceDescription = incomingDescription
             sourceFormat = format
             self.converter = converter
             rawBuffer = nil
             convertedBuffer = nil
         }
-        guard let sourceFormat, let converter else { return }
+        guard let sourceFormat, let converter else {
+            onRaw(nil)
+            return
+        }
 
         let frames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
         guard frames > 0 else { return }
@@ -893,14 +938,21 @@ private final class SampleForwarder: NSObject, AVCaptureAudioDataOutputSampleBuf
         if let rawBuffer, rawBuffer.frameCapacity >= frames {
             raw = rawBuffer
         } else {
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames) else { return }
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: frames) else {
+                onRaw(nil)
+                return
+            }
             rawBuffer = buffer
             raw = buffer
         }
         raw.frameLength = frames
         guard CMSampleBufferCopyPCMDataIntoAudioBufferList(
             sampleBuffer, at: 0, frameCount: Int32(frames), into: raw.mutableAudioBufferList
-        ) == noErr else { return }
+        ) == noErr else {
+            onRaw(nil)
+            return
+        }
+        onRaw(raw)
 
         let ratio = targetFormat.sampleRate / sourceFormat.sampleRate
         let capacity = AVAudioFrameCount(Double(raw.frameLength) * ratio) + 32

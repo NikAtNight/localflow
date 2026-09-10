@@ -214,7 +214,8 @@ Accessibility, remove LocalFlow with the − button and re-add the new build
     text after recovery. Empty voiced recordings get one automatic retry;
     chunk fallback counts as that retry. Up to three unsuccessful recordings
     stay in memory for manual retry, oldest first. They are lost when you quit;
-    audio stays in memory unless diagnostic recordings are enabled.
+    audio stays in memory unless diagnostic recordings or local personal voice
+    collection are enabled.
   - **Clean up transcripts** — toggle the LLM cleanup pass (Apple
     Intelligence on-device when available, else Ollama — see below).
   - **Sound Cues** — start/finish sounds, plus a low "Basso" when something
@@ -266,6 +267,34 @@ an already-started archive can finish. Existing files still expire normally.
 
 See [diagnostic recording and replay](docs/flows/diagnostic-recordings.md) for
 file details, replay commands, and limits. Command-mode recordings are excluded.
+
+### Personal voice archive
+
+LocalFlow Local has a separate **Settings > Personal voice** pane. Collection
+is off by default. Enable it to keep one original recording per dictation under
+`~/Library/Application Support/LocalFlow Local/PersonalVoice/` until you delete
+it. New audio saves pause at 20 GB without evicting existing clips. Transcript
+edits remain available at the limit and can increase storage slightly beyond it.
+Turning collection off keeps existing files. Command mode and manual retries
+do not add clips.
+
+New recordings preserve the microphone's sample rate as mono Float32 WAV. If
+native capture is incomplete, the archive saves the 16 kHz dictation audio and
+labels the fallback. Raw recognition and final dictation text are stored
+separately. Neither is assumed to match the audio word for word.
+
+Use **Import existing diagnostic recordings** to copy completed originals into
+the permanent archive. Imported clips start unreviewed. Play each clip, correct
+its verbatim transcript, and approve it before exporting. Exports contain only
+approved WAV/text pairs in a new folder with a `manifest.jsonl`; they never
+overwrite an earlier export. Deleting an archive clip leaves diagnostic copies
+and exports intact. No recordings or transcripts are uploaded.
+
+See the [personal voice workflow](docs/flows/personal-voice.md) for file and
+failure details, and the [local voice trial](docs/voice-clone-trial.md) for the
+optional reference-based voice synthesis script. The trial downloads public
+model weights once and can then run offline. It does not train a model from
+the archive automatically.
 
 ### Automatic formatting
 

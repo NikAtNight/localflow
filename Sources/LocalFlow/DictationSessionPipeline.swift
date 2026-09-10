@@ -75,6 +75,7 @@ final class DictationSessionPipeline {
         let context: DictationSessionContext
         let trace: DictationTrace?
         let diagnostics: DictationDiagnosticStore.Recording?
+        let personalVoice: PersonalVoiceStore.Recording?
         var capturedAudioSaved = false
         var pendingChunks: [IncrementalChunk] = []
         var activeTask: Task<Void, Never>?
@@ -88,11 +89,12 @@ final class DictationSessionPipeline {
         var incrementalFailed = false
         var cancelled = false
 
-        init(generation: Int, context: DictationSessionContext, trace: DictationTrace?, diagnostics: DictationDiagnosticStore.Recording?) {
+        init(generation: Int, context: DictationSessionContext, trace: DictationTrace?, diagnostics: DictationDiagnosticStore.Recording?, personalVoice: PersonalVoiceStore.Recording?) {
             self.generation = generation
             self.context = context
             self.trace = trace
             self.diagnostics = diagnostics
+            self.personalVoice = personalVoice
         }
     }
 
@@ -120,11 +122,11 @@ final class DictationSessionPipeline {
     }
 
     func begin(generation: Int, context: DictationSessionContext, trace: DictationTrace? = DictationTrace.current,
-               diagnostics: DictationDiagnosticStore.Recording? = nil) {
+               diagnostics: DictationDiagnosticStore.Recording? = nil, personalVoice: PersonalVoiceStore.Recording? = nil) {
         if sessions[generation] != nil || generationOrder.contains(generation) {
             cancel(generation: generation)
         }
-        sessions[generation] = Session(generation: generation, context: context, trace: trace, diagnostics: diagnostics)
+        sessions[generation] = Session(generation: generation, context: context, trace: trace, diagnostics: diagnostics, personalVoice: personalVoice)
         trace?.retain(in: diagnostics)
         trace?.record(.sessionStarted, fields: [.cleanupEnabled: context.cleanupEnabled ? 1 : 0], model: context.ollamaModel)
         generationOrder.append(generation)
@@ -203,10 +205,11 @@ final class DictationSessionPipeline {
         advance(session)
     }
 
-    func recordCapturedAudio(generation: Int, samples: [Float]) {
+    func recordCapturedAudio(generation: Int, samples: [Float], nativeAudio: NativeAudioRecording? = nil) {
         guard let session = sessions[generation], !session.capturedAudioSaved else { return }
         session.capturedAudioSaved = true
         session.diagnostics?.saveAudio(samples)
+        session.personalVoice?.capture(native: nativeAudio, fallback: samples)
         session.diagnostics?.record(.init(stage: "capture", sampleCount: samples.count))
     }
 
@@ -246,6 +249,7 @@ final class DictationSessionPipeline {
         trace?.record(.cancellationRequested)
         if let session = sessions.removeValue(forKey: generation) {
             session.diagnostics?.record(.init(stage: "outcome", status: "cancelled"))
+            session.personalVoice?.finish(status: "cancelled")
             session.cancelled = true
             session.pendingChunks.removeAll()
             session.activeTask?.cancel()
@@ -390,6 +394,7 @@ final class DictationSessionPipeline {
 
     private func finalize(_ session: Session, transcript: String) {
         session.diagnostics?.record(.init(stage: "assembledTranscript", text: transcript))
+        session.personalVoice?.setRawTranscript(transcript)
         let composed = Snippets.expand(
             VoiceFormatter.apply(
                 TranscriptCorrections.apply(
@@ -449,11 +454,13 @@ final class DictationSessionPipeline {
         switch outcome {
         case .finalTranscript(_, let text):
             session.diagnostics?.record(.init(stage: "finalTranscript", text: text, status: status.rawValue))
+            session.personalVoice?.setFinalTranscript(text)
         case .failed(_, let message):
             session.diagnostics?.record(.init(stage: "outcome", text: message, status: status.rawValue))
         case .emptyTranscript:
             session.diagnostics?.record(.init(stage: "outcome", status: status.rawValue))
         }
+        session.personalVoice?.finish(status: status.rawValue)
         session.trace?.record(.resultReady, status: status)
         sessions.removeValue(forKey: session.generation)
         completed[session.generation] = (outcome, session.trace)
@@ -527,6 +534,7 @@ final class DictationSessionPipeline {
             let session = self.sessions.removeValue(forKey: generation)
             if let session {
                 session.diagnostics?.record(.init(stage: "outcome", text: message, status: "failed"))
+                session.personalVoice?.finish(status: "failed")
                 session.trace?.record(.cancellationRequested)
                 session.cancelled = true
                 session.activeTask?.cancel()

@@ -28,6 +28,7 @@ final class SettingsApplication {
         var commandReasoning: ReasoningLevel
         var saveHistory: Bool
         var saveDiagnosticRecordings: Bool
+        var savePersonalVoice: Bool
     }
 
     enum Change: Equatable {
@@ -49,6 +50,7 @@ final class SettingsApplication {
         case commandReasoning(ReasoningLevel)
         case saveHistory(Bool)
         case saveDiagnosticRecordings(Bool)
+        case savePersonalVoice(Bool)
     }
 
     enum Failure: Error, Equatable {
@@ -154,6 +156,12 @@ final class SettingsApplication {
             default: false
         )
 
+        let savePersonalVoice = Self.loadBool(
+            from: defaults,
+            key: Settings.Key.savePersonalVoice,
+            default: false
+        )
+
         values = Values(
             hotkey: hotkey,
             whisperModel: whisperModel,
@@ -172,7 +180,8 @@ final class SettingsApplication {
             ollamaCommandModel: ollamaCommandModel,
             commandReasoning: commandReasoning,
             saveHistory: saveHistory,
-            saveDiagnosticRecordings: saveDiagnosticRecordings
+            saveDiagnosticRecordings: saveDiagnosticRecordings,
+            savePersonalVoice: savePersonalVoice
         )
 
         // Repair missing or malformed values without treating startup as a
@@ -198,6 +207,7 @@ final class SettingsApplication {
         defaults.set(commandReasoning.rawValue, forKey: Settings.Key.commandReasoning)
         defaults.set(saveHistory, forKey: Settings.Key.saveHistory)
         defaults.set(saveDiagnosticRecordings, forKey: Settings.Key.saveDiagnosticRecordings)
+        defaults.set(savePersonalVoice, forKey: Settings.Key.savePersonalVoice)
     }
 
     @discardableResult
@@ -320,6 +330,11 @@ final class SettingsApplication {
             guard enabled != values.saveDiagnosticRecordings else { return .success(()) }
             defaults.set(enabled, forKey: Settings.Key.saveDiagnosticRecordings)
             values.saveDiagnosticRecordings = enabled
+
+        case .savePersonalVoice(let enabled):
+            guard enabled != values.savePersonalVoice else { return .success(()) }
+            defaults.set(enabled, forKey: Settings.Key.savePersonalVoice)
+            values.savePersonalVoice = enabled
         }
 
         return .success(())

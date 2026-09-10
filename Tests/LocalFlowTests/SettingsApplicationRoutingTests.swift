@@ -83,6 +83,39 @@ final class SettingsApplicationRoutingTests: XCTestCase {
         XCTAssertTrue(system.events.isEmpty)
     }
 
+    func testPersonalVoiceCollectionDefaultsOffAndPersistsSeparatelyFromDiagnostics() {
+        let defaults = makeDefaults()
+        let system = FakeLiveSystem()
+        let application = makeApplication(defaults: defaults, system: system)
+        let model = SettingsModel(settingsApplication: application)
+
+        XCTAssertFalse(model.savePersonalVoice)
+        XCTAssertFalse(application.values.savePersonalVoice)
+        model.savePersonalVoice = true
+
+        XCTAssertTrue(application.values.savePersonalVoice)
+        XCTAssertEqual(defaults.object(forKey: Settings.Key.savePersonalVoice) as? Bool, true)
+        let reloaded = makeApplication(defaults: defaults, system: system)
+        XCTAssertTrue(SettingsModel(settingsApplication: reloaded).savePersonalVoice)
+        XCTAssertFalse(reloaded.values.saveDiagnosticRecordings)
+
+        XCTAssertSuccess(model.apply(.savePersonalVoice(false)))
+        XCTAssertFalse(model.savePersonalVoice)
+        XCTAssertFalse(application.values.savePersonalVoice)
+        XCTAssertEqual(defaults.object(forKey: Settings.Key.savePersonalVoice) as? Bool, false)
+        XCTAssertTrue(application.values.saveHistory)
+        XCTAssertTrue(system.events.isEmpty)
+    }
+
+    func testPersonalVoicePaneIsAvailableOnlyInLocalBuilds() {
+        XCTAssertTrue(SettingsPane.available(for: AppIdentity(bundleIdentifier: AppIdentity.localID))
+            .contains(.personalVoice))
+        for id in [AppIdentity.productionID, "other.bundle", nil] {
+            XCTAssertFalse(SettingsPane.available(for: AppIdentity(bundleIdentifier: id))
+                .contains(.personalVoice))
+        }
+    }
+
     private func makeDefaults() -> UserDefaults {
         let name = "LocalFlow.SettingsApplicationRoutingTests.\(UUID().uuidString)"
         defaultsToRemove.append(name)

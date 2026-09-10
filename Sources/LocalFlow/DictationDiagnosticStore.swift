@@ -185,19 +185,7 @@ final class DictationDiagnosticStore: @unchecked Sendable {
             guard FileManager.default.fileExists(atPath: self.directory(id).path) else { return }
             self.performWrite {
                 let url = self.directory(id).appendingPathComponent(name)
-                try self.write(Data(), to: url)
-                let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.sampleRate,
-                                           channels: 1, interleaved: false)!
-                let file = try AVAudioFile(forWriting: url, settings: format.settings)
-                if !samples.isEmpty {
-                    guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)),
-                          let channel = buffer.floatChannelData?[0] else {
-                        throw CocoaError(.fileWriteUnknown)
-                    }
-                    buffer.frameLength = AVAudioFrameCount(samples.count)
-                    samples.withUnsafeBufferPointer { channel.update(from: $0.baseAddress!, count: samples.count) }
-                    try file.write(from: buffer)
-                }
+                try RetainedAudioFile.write(samples: samples, sampleRate: AudioRecorder.sampleRate, to: url)
             }
             // Close the WAV before measuring size or pruning it.
             self.performWrite { try self.pruneNow() }

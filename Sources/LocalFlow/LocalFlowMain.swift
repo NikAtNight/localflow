@@ -11,6 +11,30 @@ struct LocalFlowMain {
 
     static func main() {
         let arguments = CommandLine.arguments
+        if arguments.contains("--import-voice-diagnostics") {
+            guard AppIdentity.current.isLocal else {
+                FileHandle.standardError.write(Data("Personal voice collection is available only in LocalFlow Local.\n".utf8))
+                exit(1)
+            }
+            let anotherLocalApp = NSRunningApplication.runningApplications(withBundleIdentifier: AppIdentity.localID)
+                .contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+            guard !anotherLocalApp else {
+                FileHandle.standardError.write(Data("Quit LocalFlow Local before importing from the command line, or use Import in Personal voice settings.\n".utf8))
+                exit(1)
+            }
+            Task {
+                do {
+                    let count = try await PersonalVoiceStore.shared.importDiagnostics()
+                    print("Imported \(count) recordings as unreviewed personal voice clips.")
+                    exit(0)
+                } catch {
+                    FileHandle.standardError.write(Data("error: \(error.localizedDescription)\n".utf8))
+                    exit(1)
+                }
+            }
+            RunLoop.main.run()
+            return
+        }
         if let flagIndex = arguments.firstIndex(of: "--replay") {
             Task { @MainActor in
                 do {

@@ -107,6 +107,13 @@ final class SettingsModel: ObservableObject {
         }
     }
 
+    @Published var savePersonalVoice: Bool = Settings.savePersonalVoice {
+        didSet {
+            guard oldValue != savePersonalVoice, !isSynchronizingApplicationValues else { return }
+            apply(.savePersonalVoice(savePersonalVoice))
+        }
+    }
+
     @Published var automaticUpdates: Bool = Settings.automaticUpdates {
         didSet {
             guard oldValue != automaticUpdates, !isSynchronizingApplicationValues else { return }
@@ -292,6 +299,7 @@ final class SettingsModel: ObservableObject {
         commandReasoning = settingsApplication.values.commandReasoning
         saveHistory = settingsApplication.values.saveHistory
         saveDiagnosticRecordings = settingsApplication.values.saveDiagnosticRecordings
+        savePersonalVoice = settingsApplication.values.savePersonalVoice
         let applicationCorrections = settingsApplication.values.corrections
         if corrections.map({ SettingsApplication.Correction(wrong: $0.wrong, right: $0.right) })
             != applicationCorrections {
@@ -405,9 +413,10 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case text = "Text"
     case history = "History"
     case diagnostics = "Diagnostics"
+    case personalVoice = "Personal voice"
 
     static func available(for identity: AppIdentity) -> [Self] {
-        allCases.filter { $0 != .diagnostics || identity.isLocal }
+        allCases.filter { identity.isLocal || ($0 != .diagnostics && $0 != .personalVoice) }
     }
 
     var id: Self { self }
@@ -421,6 +430,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
         case .text: return "keyboard"
         case .history: return "clock"
         case .diagnostics: return "waveform.path.ecg"
+        case .personalVoice: return "person.wave.2"
         }
     }
 }
@@ -532,6 +542,8 @@ struct SettingsView: View {
         case .history: historyPane
         case .diagnostics:
             if AppIdentity.current.isLocal { DiagnosticsPane() }
+        case .personalVoice:
+            if AppIdentity.current.isLocal { PersonalVoicePane(model: model) }
         }
     }
 

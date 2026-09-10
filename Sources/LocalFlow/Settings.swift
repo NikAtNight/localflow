@@ -35,6 +35,7 @@ enum Settings {
         static let corrections = "corrections"
         static let saveHistory = "saveHistory"
         static let saveDiagnosticRecordings = "saveDiagnosticRecordings"
+        static let savePersonalVoice = "savePersonalVoice"
         static let commandHotkey = "commandHotkey"
         static let commandModeEnabled = "commandModeEnabled"
         static let snippets = "snippets"
@@ -205,6 +206,12 @@ enum Settings {
     static var saveDiagnosticRecordings: Bool {
         get { defaults.bool(forKey: Key.saveDiagnosticRecordings) }
         set { defaults.set(newValue, forKey: Key.saveDiagnosticRecordings) }
+    }
+
+    /// Separate, opt-in collection for the local app's personal voice dataset.
+    static var savePersonalVoice: Bool {
+        get { defaults.bool(forKey: Key.savePersonalVoice) }
+        set { defaults.set(newValue, forKey: Key.savePersonalVoice) }
     }
 
     static var soundCues: Bool {

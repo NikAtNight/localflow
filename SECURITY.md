@@ -39,6 +39,20 @@ Nowhere. There is no account, no server, and no telemetry.
   1 GB, enforced at launch, on saves, and hourly while the app is open. Settings
   can disable new recordings or delete the diagnostic archive independently
   of transcript history. Command mode is excluded.
+- **Personal voice collection** is a separate opt-in setting available only in
+  LocalFlow Local. It saves original-rate mono audio, raw and final transcripts,
+  reviewed text, and dictation metadata under
+  `Application Support/LocalFlow Local/PersonalVoice/`, with 0700 directories
+  and 0600 files. Clips have no expiry. New audio saves stop at 20 GB; metadata
+  edits remain possible beyond the limit. Nothing is evicted automatically.
+  Turning collection off preserves existing files. Import copies completed
+  diagnostic originals without deleting them. Export copies only explicitly
+  approved WAV/text pairs to the chosen directory. Exports have their own
+  lifetime and are outside archive deletion controls. Command mode and manual
+  retries do not add clips. The optional developer voice trial downloads public
+  model weights, then supports offline synthesis. It does not upload audio or
+  text. Its cache and generated files stay in the ignored `build/voice-clone/`
+  folder until explicitly removed.
 - **Transcripts** are appended to a daily Markdown file under
   `~/Library/Application Support/LocalFlow/History/` (owner-only permissions,
   and deliberately not in `~/Documents`, which iCloud syncs). You can turn

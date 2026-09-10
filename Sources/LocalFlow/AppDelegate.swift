@@ -332,7 +332,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             refreshStatusUI()
         }
-        if reply == .terminateNow { DictationDiagnosticStore.shared.flush() }
+        if reply == .terminateNow {
+            DictationDiagnosticStore.shared.flush()
+            PersonalVoiceStore.shared.flush()
+        }
         return reply
     }
 
@@ -773,7 +776,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // while the visual state is updated in parallel. The "speak now"
         // cue fires on the first sustained audio, not on engine start, and
         // only for THIS recording's generation.
-        recorder.start(trace: trace, onCaptureLive: { [weak self] in
+        recorder.start(trace: trace, retainNativeAudio: AppIdentity.current.isLocal && Settings.savePersonalVoice && !recordingIsCommand, onCaptureLive: { [weak self] in
             DispatchQueue.main.async {
                 guard let self, self.isRecording, generation == self.recordingGeneration else { return }
                 self.overlay.captureLive()
@@ -846,6 +849,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ))
     }
 
+    private func personalVoiceRecording(context: DictationSessionContext, trace: DictationTrace?) -> PersonalVoiceStore.Recording? {
+        guard AppIdentity.current.isLocal, Settings.savePersonalVoice else { return nil }
+        return PersonalVoiceStore.shared.begin(.init(
+            traceID: trace?.id ?? UUID(), context: context,
+            whisperModel: Settings.whisperModel,
+            microphone: Settings.inputDeviceUID ?? "systemDefault",
+            vocabulary: Settings.effectiveVocabulary
+        ))
+    }
+
     private func beginDictationSession() {
         cancelActiveDictationSession()
         let generation = nextDictationGeneration
@@ -856,7 +869,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             generation: generation,
             context: context,
             trace: activeDictationTrace,
-            diagnostics: diagnosticRecording(context: context, trace: activeDictationTrace)
+            diagnostics: diagnosticRecording(context: context, trace: activeDictationTrace),
+            personalVoice: personalVoiceRecording(context: context, trace: activeDictationTrace)
         )
         scheduleIncrementalTick(generation: generation, after: DictationSessionPipeline.incrementalStartSeconds)
     }
@@ -974,7 +988,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         incrementalTimer = nil
         pendingAudioHandoffs += 1
         DictationTrace.$current.withValue(trace) {
-            recorder.stop { [weak self] samples in
+            var nativeAudio: NativeAudioRecording?
+            recorder.stop(nativeCompletion: { nativeAudio = $0 }) { [weak self] samples in
                 guard let self else { return }
                 defer { self.pendingAudioHandoffs -= 1 }
                 if self.failedCaptureStarts.remove(generation) != nil {
@@ -987,7 +1002,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DictationTrace.$current.withValue(trace) {
                     self.process(samples: samples, releasedAt: releasedAt,
                              hudGeneration: generation, asCommand: asCommand,
-                             dictationGeneration: dictationGeneration)
+                             dictationGeneration: dictationGeneration, nativeAudio: nativeAudio)
                 }
             }
         }
@@ -1017,10 +1032,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         releasedAt: Date,
         hudGeneration: Int? = nil,
         asCommand: Bool = false,
-        dictationGeneration: Int? = nil
+        dictationGeneration: Int? = nil,
+        nativeAudio: NativeAudioRecording? = nil
     ) {
         if !asCommand, let dictationGeneration {
-            dictationPipeline.recordCapturedAudio(generation: dictationGeneration, samples: rawSamples)
+            dictationPipeline.recordCapturedAudio(generation: dictationGeneration, samples: rawSamples, nativeAudio: nativeAudio)
         }
         // Silent bookends are Whisper's main hallucination trigger and pure
         // wasted encode time.
