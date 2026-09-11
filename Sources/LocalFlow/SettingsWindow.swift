@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import ServiceManagement
 
 /// One finished dictation, kept in memory for this session only.
 struct RecentDictation: Identifiable {
@@ -26,22 +25,10 @@ struct SnippetPair: Identifiable, Equatable {
 // MARK: - Model
 
 /// Observable settings-window state. SettingsApplication validates and
-/// persists live changes before AppDelegate hooks update running objects.
+/// persists changes and updates running objects through its injected effects.
 @MainActor
 final class SettingsModel: ObservableObject {
-    var onHotkeyChange: ((HotkeyManager.Key) -> Void)?
-    var onModelChange: (() -> Void)?
-    var onMicChange: ((String?) -> Void)?
-    var onCleanupToggle: (() -> Void)?
-    var onKeepWarmChange: (() -> Void)?
-    var onThemeChange: (() -> Void)?
-    var onVocabularyChange: ((String) -> Void)?
-    var onCommandModeChange: (() -> Void)?
-    var onAutomaticUpdatesChange: (() -> Void)?
-
-    private let loginAgent = SMAppService.agent(plistName: "app.talix.localflow.plist")
-    private let injectedSettingsApplication: SettingsApplication?
-    private lazy var settingsApplication = injectedSettingsApplication ?? makeSettingsApplication()
+    private let settingsApplication: SettingsApplication
     private var isSynchronizingApplicationValues = false
 
     @Published var theme: HudTheme = HudTheme.current {
@@ -228,42 +215,9 @@ final class SettingsModel: ObservableObject {
     @Published var recentDictations: [RecentDictation] = []
     @Published var lastIssue: UserFacingIssue?
 
-    init(settingsApplication: SettingsApplication? = nil) {
-        injectedSettingsApplication = settingsApplication
+    init(settingsApplication: SettingsApplication) {
+        self.settingsApplication = settingsApplication
         synchronizeApplicationValues()
-    }
-
-    private func makeSettingsApplication() -> SettingsApplication {
-        let loginAgent = self.loginAgent
-        return SettingsApplication(
-            defaults: .standard,
-            supportedWhisperModels: Settings.whisperModels.map(\.name),
-            defaultWhisperModel: Settings.defaultWhisperModel,
-            effects: .init(
-                applyHotkey: { [weak self] in self?.onHotkeyChange?($0) },
-                reloadWhisperModel: { [weak self] _ in self?.onModelChange?() },
-                selectMicrophone: { [weak self] in self?.onMicChange?($0) },
-                applyAutomaticUpdates: { [weak self] _ in self?.onAutomaticUpdatesChange?() },
-                applyCommandHotkey: { [weak self] _ in self?.onCommandModeChange?() },
-                applyKeepMicWarm: { [weak self] _ in self?.onKeepWarmChange?() },
-                applyCleanupEnabled: { [weak self] _ in self?.onCleanupToggle?() },
-                applyCommandModeEnabled: { [weak self] _ in self?.onCommandModeChange?() },
-                applyTheme: { [weak self] _ in self?.onThemeChange?() },
-                applySoundCues: { _ in },
-                refreshDecoderVocabulary: { [weak self] in self?.onVocabularyChange?($0) }
-            ),
-            loginItem: .init(
-                isEnabled: { !AppIdentity.current.isLocal && loginAgent.status == .enabled },
-                setEnabled: { enabled in
-                    guard !AppIdentity.current.isLocal else { return }
-                    if enabled {
-                        try loginAgent.register()
-                    } else {
-                        try loginAgent.unregister()
-                    }
-                }
-            )
-        )
     }
 
     /// Menu actions can use this entry point to share validation, persistence,

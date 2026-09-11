@@ -348,7 +348,7 @@ final class DictationSessionPipelineTests: XCTestCase {
         }
     }
 
-    func testEmptySilentFullUtteranceDoesNotRetry() async {
+    func testSilentFullUtteranceSkipsInferenceAndRetry() async {
         var calls = 0
         let outcomes = OutcomeRecorder()
         let pipeline = DictationSessionPipeline(
@@ -363,8 +363,8 @@ final class DictationSessionPipelineTests: XCTestCase {
         pipeline.release(generation: 63, fullSamples: [Float](repeating: 0, count: speech.count))
 
         expectTrue(await waitForOutcomes(1, in: outcomes))
-        XCTAssertEqual(calls, 1)
-        XCTAssertEqual(outcomes.values, [.emptyTranscript(generation: 63)])
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(outcomes.values, [.insufficientVoice(generation: 63)])
     }
 
     func testEmptyChunkRecoveryDoesNotRetryFullUtteranceAgain() async {

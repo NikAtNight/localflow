@@ -70,12 +70,12 @@ final class UpdateController: NSObject {
     }
 
     /// Mirrors the Settings toggle onto the live updater.
-    func applyAutomaticPreference() {
+    func applyAutomaticPreference(_ enabled: Bool = Settings.automaticUpdates) {
         guard let updater = updater?.updater else { return }
         let changes = Self.automaticPreferenceChanges(
             currentChecks: updater.automaticallyChecksForUpdates,
             currentDownloads: updater.automaticallyDownloadsUpdates,
-            desired: Settings.automaticUpdates
+            desired: enabled
         )
         if let checks = changes.checks {
             updater.automaticallyChecksForUpdates = checks

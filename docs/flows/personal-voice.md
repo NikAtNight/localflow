@@ -30,15 +30,20 @@ this change.
 `AppDelegate.beginDictationSession` creates a `PersonalVoiceStore.Recording`
 only for local dictation when `Settings.savePersonalVoice` is enabled.
 `AudioRecorder.start(retainNativeAudio:)` accumulates original-rate mono samples
-alongside the existing 16 kHz recognition samples. Its stop callback detaches
-both arrays after queued conversion finishes. `NativeAudioAccumulator` caps
+alongside the existing 16 kHz recognition samples. Its stop callback returns one captured recording containing both arrays and any
+start error after queued conversion finishes. `NativeAudioAccumulator` caps
 retained samples at 310 seconds or 64 MiB and marks incomplete capture instead
 of silently treating a truncated native recording as complete.
 
-`DictationSessionPipeline.recordCapturedAudio` retains the first original before
+`DictationDelivery.release` passes both audio formats to
+`DictationSessionPipeline.recordCapturedAudio`, which retains the first original before
 silence trimming. `finalize` records assembled recognition before corrections,
 formatting, snippets, and cleanup. Completion saves final text and outcome.
 These are separate fields because cleaned text is not a verbatim label.
+
+`AudioCaptureLifecycleTests` exercises the same recorder queues with a synthetic
+input, covering paired tails, teardown overlap, stale buffers, failed starts,
+and snapshots. It does not verify microphone hardware or route changes.
 
 `PersonalVoiceStore` writes on a utility queue, with a file lock shared by app
 and CLI writers. Audio and metadata are staged privately before publishing a

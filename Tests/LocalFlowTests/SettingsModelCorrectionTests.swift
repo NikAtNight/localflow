@@ -38,6 +38,28 @@ final class SettingsModelCorrectionTests: XCTestCase {
         XCTAssertEqual(system.decoderVocabulary, ["LocalFlow, Talix"])
     }
 
+    func testSynchronizingAnUnrelatedChangePreservesCorrectionIdentityAndRemoval() {
+        let defaults = makeDefaults()
+        defaults.set("LocalFlow", forKey: Settings.Key.customVocabulary)
+        defaults.set(["talex\tTalix"], forKey: Settings.Key.corrections)
+        let system = FakeLiveSystem()
+        let application = makeApplication(defaults: defaults, system: system)
+        let model = SettingsModel(settingsApplication: application)
+        let correctionID = model.corrections[0].id
+
+        model.automaticUpdates = false
+
+        XCTAssertEqual(model.corrections[0].id, correctionID)
+        XCTAssertTrue(system.decoderVocabulary.isEmpty)
+
+        model.removeCorrection(correctionID)
+
+        XCTAssertTrue(model.corrections.isEmpty)
+        XCTAssertTrue(application.values.corrections.isEmpty)
+        XCTAssertEqual(defaults.stringArray(forKey: Settings.Key.corrections), [])
+        XCTAssertEqual(system.decoderVocabulary, ["LocalFlow"])
+    }
+
     private func makeDefaults() -> UserDefaults {
         let name = "LocalFlow.SettingsModelCorrectionTests.\(UUID().uuidString)"
         defaultsToRemove.append(name)

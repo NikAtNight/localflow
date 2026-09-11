@@ -28,10 +28,34 @@ enum DictationTranscriptionSegment: Equatable, Codable, Sendable {
     case fullUtterance
 }
 
+/// Shared admission and decoder preparation for live dictation, commands, and replay.
+struct DictationAudioPreparation {
+    let samples: [Float]
+    let voicedSeconds: Double
+    let voicedDBFS: Float
+    let rawVoicedSeconds: Double
+
+    init(samples: [Float]) {
+        rawVoicedSeconds = AudioRecorder.voicedMetrics(of: samples).voicedSeconds
+        self.samples = AudioRecorder.trimmingSilence(samples)
+        let voice = AudioRecorder.voicedMetrics(of: self.samples)
+        voicedSeconds = voice.voicedSeconds
+        voicedDBFS = voice.voicedDBFS
+    }
+
+    var isAdmitted: Bool { voicedSeconds >= 0.3 }
+    // Recovery historically uses the original analysis windows. Trimming can
+    // shift their alignment, so admission and recovery keep distinct metrics.
+    var canRetryEmptyResult: Bool { rawVoicedSeconds >= 0.3 }
+    var lowEnergy: Bool { voicedDBFS < -40 }
+    var duration: TimeInterval { Double(samples.count) / AudioRecorder.sampleRate }
+}
+
 struct DictationTranscriptionRequest {
     let generation: Int
     let segment: DictationTranscriptionSegment
     let samples: [Float]
+    let lowEnergy: Bool
 }
 
 struct DictationCleanupRequest {
@@ -42,6 +66,7 @@ struct DictationCleanupRequest {
 
 enum DictationSessionOutcome: Equatable {
     case finalTranscript(generation: Int, text: String)
+    case insufficientVoice(generation: Int)
     case emptyTranscript(generation: Int)
     case failed(generation: Int, message: String)
 }
@@ -60,14 +85,14 @@ final class DictationSessionPipeline {
 
     private struct IncrementalChunk {
         let index: Int
-        let samples: [Float]
+        let audio: DictationAudioPreparation
         let pauseSecondsBefore: Double
         let sourceEndIndex: Int?
     }
 
     private struct ReleaseAudio {
-        let fullSamples: [Float]
-        let tailSamples: [Float]
+        let full: DictationAudioPreparation
+        let tail: DictationAudioPreparation
     }
 
     private final class Session {
@@ -163,13 +188,13 @@ final class DictationSessionPipeline {
             trace?.record(.incrementalSkipped, status: .noBoundary)
             return
         }
-        let chunk = AudioRecorder.trimmingSilence(Array(samples[start..<cut]))
-        guard AudioRecorder.voicedMetrics(of: chunk).voicedSeconds >= 0.3 else {
+        let chunk = DictationAudioPreparation(samples: Array(samples[start..<cut]))
+        guard chunk.isAdmitted else {
             trace?.record(.incrementalSkipped, status: .insufficientVoice)
             return
         }
         processIncrementalChunk(
-            generation: generation, samples: chunk,
+            generation: generation, audio: chunk,
             pauseSecondsAfterChunk: AudioRecorder.incrementalPauseSeconds(in: samples, around: cut),
             sourceEndIndex: cut
         )
@@ -181,6 +206,18 @@ final class DictationSessionPipeline {
         pauseSecondsAfterChunk: Double,
         sourceEndIndex: Int? = nil
     ) {
+        processIncrementalChunk(
+            generation: generation, audio: DictationAudioPreparation(samples: samples),
+            pauseSecondsAfterChunk: pauseSecondsAfterChunk, sourceEndIndex: sourceEndIndex
+        )
+    }
+
+    private func processIncrementalChunk(
+        generation: Int,
+        audio: DictationAudioPreparation,
+        pauseSecondsAfterChunk: Double,
+        sourceEndIndex: Int?
+    ) {
         guard let session = sessions[generation],
               !session.cancelled,
               !session.incrementalFailed,
@@ -188,7 +225,7 @@ final class DictationSessionPipeline {
 
         let chunk = IncrementalChunk(
             index: session.nextChunkIndex,
-            samples: samples,
+            audio: audio,
             pauseSecondsBefore: session.nextPauseSeconds,
             sourceEndIndex: sourceEndIndex
         )
@@ -199,7 +236,7 @@ final class DictationSessionPipeline {
         }
         session.pendingChunks.append(chunk)
         session.trace?.record(.chunkSubmitted, fields: [
-            .chunkIndex: Double(chunk.index), .samples: Double(samples.count),
+            .chunkIndex: Double(chunk.index), .samples: Double(audio.samples.count),
             .submittedEnd: Double(session.incrementalSampleEnd)
         ])
         advance(session)
@@ -223,6 +260,14 @@ final class DictationSessionPipeline {
               session.releaseAudio == nil else { return }
 
         recordCapturedAudio(generation: generation, samples: fullSamples)
+        let full = DictationAudioPreparation(samples: fullSamples)
+        guard full.isAdmitted else {
+            session.activeTask?.cancel()
+            session.activeTask = nil
+            session.pendingChunks.removeAll()
+            complete(session, with: .insufficientVoice(generation: generation))
+            return
+        }
         let derivedTail: [Float]
         if let tailSamples {
             derivedTail = tailSamples
@@ -233,8 +278,8 @@ final class DictationSessionPipeline {
             session.incrementalFailed = true
         }
         session.releaseAudio = ReleaseAudio(
-            fullSamples: fullSamples,
-            tailSamples: derivedTail
+            full: full,
+            tail: DictationAudioPreparation(samples: derivedTail)
         )
         session.trace?.record(.audioReleased, fields: [
             .samples: Double(fullSamples.count), .tailSamples: Double(derivedTail.count),
@@ -266,7 +311,7 @@ final class DictationSessionPipeline {
 
         if session.incrementalFailed {
             guard let release = session.releaseAudio else { return }
-            transcribeFullUtterance(session, samples: release.fullSamples, isRetry: true)
+            transcribeFullUtterance(session, audio: release.full, isRetry: true)
             return
         }
 
@@ -277,7 +322,7 @@ final class DictationSessionPipeline {
 
         guard let release = session.releaseAudio else { return }
         if session.chunkCount == 0 {
-            transcribeFullUtterance(session, samples: release.fullSamples)
+            transcribeFullUtterance(session, audio: release.full)
         } else {
             transcribeTail(session, release: release)
         }
@@ -288,12 +333,14 @@ final class DictationSessionPipeline {
         let request = DictationTranscriptionRequest(
             generation: session.generation,
             segment: .incrementalChunk(index: chunk.index),
-            samples: chunk.samples
+            samples: chunk.audio.samples,
+            lowEnergy: chunk.audio.lowEnergy
         )
         session.activeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
             do {
-                let text = try await runTranscription(request, session: session)
+                let text = request.samples.isEmpty
+                    ? "" : try await runTranscription(request, session: session)
                 guard isCurrent(session) else { return }
                 session.activeTask = nil
                 guard !text.isEmpty else {
@@ -327,15 +374,17 @@ final class DictationSessionPipeline {
         let request = DictationTranscriptionRequest(
             generation: session.generation,
             segment: .releaseTail,
-            samples: release.tailSamples
+            samples: release.tail.samples,
+            lowEnergy: release.tail.lowEnergy
         )
         session.activeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
             do {
-                let tailText = try await runTranscription(request, session: session)
+                let tailText = request.samples.isEmpty
+                    ? "" : try await runTranscription(request, session: session)
                 guard isCurrent(session) else { return }
                 session.activeTask = nil
-                let voicedTail = AudioRecorder.voicedMetrics(of: release.tailSamples).voicedSeconds > 0
+                let voicedTail = release.tail.rawVoicedSeconds > 0
                 guard !tailText.isEmpty || !voicedTail else {
                     session.incrementalFailed = true
                     advance(session)
@@ -356,14 +405,15 @@ final class DictationSessionPipeline {
         }
     }
 
-    private func transcribeFullUtterance(_ session: Session, samples: [Float], isRetry: Bool = false) {
+    private func transcribeFullUtterance(_ session: Session, audio: DictationAudioPreparation, isRetry: Bool = false) {
         if isRetry {
-            session.trace?.record(.fullRetry, fields: [.samples: Double(samples.count)])
+            session.trace?.record(.fullRetry, fields: [.samples: Double(audio.samples.count)])
         }
         let request = DictationTranscriptionRequest(
             generation: session.generation,
             segment: .fullUtterance,
-            samples: samples
+            samples: audio.samples,
+            lowEnergy: audio.lowEnergy
         )
         session.activeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
@@ -373,8 +423,8 @@ final class DictationSessionPipeline {
                 session.activeTask = nil
                 if text.isEmpty {
                     // Chunk fallback already spends the session's one recovery attempt.
-                    if !isRetry, AudioRecorder.voicedMetrics(of: samples).voicedSeconds >= 0.3 {
-                        transcribeFullUtterance(session, samples: samples, isRetry: true)
+                    if !isRetry, audio.canRetryEmptyResult {
+                        transcribeFullUtterance(session, audio: audio, isRetry: true)
                     } else {
                         complete(session, with: .emptyTranscript(generation: session.generation))
                     }
@@ -448,6 +498,7 @@ final class DictationSessionPipeline {
         let status: DictationTrace.Status
         switch outcome {
         case .finalTranscript: status = .success
+        case .insufficientVoice: status = .insufficientVoice
         case .emptyTranscript: status = .empty
         case .failed: status = .failed
         }
@@ -457,14 +508,26 @@ final class DictationSessionPipeline {
             session.personalVoice?.setFinalTranscript(text)
         case .failed(_, let message):
             session.diagnostics?.record(.init(stage: "outcome", text: message, status: status.rawValue))
+        case .insufficientVoice:
+            session.diagnostics?.record(.init(stage: "outcome", status: "cancelled"))
         case .emptyTranscript:
             session.diagnostics?.record(.init(stage: "outcome", status: status.rawValue))
         }
-        session.personalVoice?.finish(status: status.rawValue)
+        session.personalVoice?.finish(status: status == .insufficientVoice ? "cancelled" : status.rawValue)
         session.trace?.record(.resultReady, status: status)
+        if status == .insufficientVoice {
+            session.trace?.record(.cancellationRequested)
+        }
         sessions.removeValue(forKey: session.generation)
-        completed[session.generation] = (outcome, session.trace)
-        drainCompletedOutcomes()
+        if status == .insufficientVoice {
+            // A rejected recording never waits for earlier recognition work.
+            cancelled.insert(session.generation)
+            drainCompletedOutcomes()
+            DictationTrace.$current.withValue(session.trace) { onOutcome(outcome) }
+        } else {
+            completed[session.generation] = (outcome, session.trace)
+            drainCompletedOutcomes()
+        }
     }
 
     private func isCurrent(_ session: Session) -> Bool {

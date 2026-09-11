@@ -33,8 +33,11 @@ controls are unavailable in LocalFlow Local. Keep dictation and waveform behavio
 `AppDelegate.openSettings` calls `SettingsPanelController.show` in
 `Sources/LocalFlow/SettingsWindow.swift`. The controller reuses its NSWindow and
 refreshes `SettingsModel`. `SettingsView` uses NavigationSplitView and Form.
-Bindings still go through SettingsModel to SettingsApplication for validation,
-persistence, and callbacks to the running app. Pane selection is view-local.
+Bindings go through SettingsModel to SettingsApplication for validation,
+persistence, and typed effects on the running app. AppDelegate constructs the
+SettingsApplication and its production effects, then injects it into SettingsModel.
+The model keeps published view state and no longer translates effects into a
+second set of callbacks. Pane selection is view-local.
 
 Login registration failures revert the displayed value and report an issue.
 Updates are enabled only when `UpdateController.isSupported` verifies a
@@ -129,3 +132,18 @@ earlier session changes in the touched files and the new reader/view/tests.
   tests, but those tests do not verify layout. Maintainers can finish these UI
   checks when the app is idle. No audio accuracy or visible-insertion timing
   claims are made by this change.
+
+## Architecture routing follow-up
+
+The September 10, 2026 architecture implementation keeps the existing
+SettingsApplication validation and persistence rules. Typed values now reach
+model loading, microphone selection, warm-capture preference, theme selection,
+and updater preference directly. Command-hotkey reconciliation still checks
+the companion command-mode preference and backend availability.
+
+SettingsApplicationRoutingTests covers normalized window/menu changes, duplicate
+effect suppression, rejected-model rollback, and login failure/retry through an
+injected application. SettingsModelCorrectionTests checks stable correction
+identity across unrelated changes and removal. Production login registration,
+update installation, and installed UI interactions remain unverified in this
+refactor. See the [combined verification](dictation-recovery.md#architecture-implementation-verification).

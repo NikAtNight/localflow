@@ -162,26 +162,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Safety nets: a paste can fail (secure input quirks, slow app) and a
     // transcription can error — neither should ever lose the user's words.
     private var recentTranscripts: [RecentDictation] = []
-    // FIFO, bounded: two failures in a row must not discard the first
-    // dictation's audio.
-    private var retrySamples: [[Float]] = []
-
-    // A command or dictation should resolve in seconds. Once a later result
-    // is waiting, cancel a stalled head so it cannot retain audio or block
-    // every later paste forever.
-    private static let injectionStallSeconds: TimeInterval = 90
-    private lazy var injectionCoordinator = InjectionCoordinator(
-        stallTimeout: Self.injectionStallSeconds,
-        onInject: { [weak self] text in
-            self?.injectCompletedText(text)
-        },
-        onCancel: { [weak self] sequence, kind in
-            self?.cancelInjectionOperation(sequence, kind: kind)
-        },
-        onProcessingCountChange: { [weak self] count in
-            self?.processingCountDidChange(count)
-        }
-    )
     private var commandTasks: [Int: Task<Void, Never>] = [:]
     private var commandHudGenerations: [Int: Int] = [:]
 
@@ -198,29 +178,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let overlay = WaveformOverlay()
     private let textModelPolicy = LocalTextModelPolicy.shared
 
-    private struct PendingDictation {
-        let sequence: Int
-        let releasedAt: Date
-        let hudGeneration: Int?
-        let duration: Double
-        let samples: [Float]
-        let cleanupEnabled: Bool
-    }
-
-    private var pendingDictations: [Int: PendingDictation] = [:]
-    private var nextDictationGeneration = 0
     private var activeDictationGeneration: Int?
     private var activeDictationTrace: DictationTrace?
     private var incrementalTimer: DispatchWorkItem?
-    private lazy var dictationPipeline = DictationSessionPipeline(
+    private lazy var dictationDelivery = DictationDelivery(
         transcribe: { [weak self] request in
             guard let self else { throw CancellationError() }
-            let samples = AudioRecorder.trimmingSilence(request.samples)
-            guard !samples.isEmpty else { return "" }
-            let voice = AudioRecorder.voicedMetrics(of: samples)
             return try await self.transcriber.transcribe(
-                samples: samples,
-                lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS
+                samples: request.samples,
+                lowEnergy: request.lowEnergy
             )
         },
         cleanup: { [weak self] request in
@@ -241,9 +207,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return TranscriptCleanupResult(text: request.text, succeeded: false)
             }
         },
-        onOutcome: { [weak self] outcome in
-            self?.handleDictationOutcome(outcome)
-        }
+        inject: { [weak self] text, completion in
+            guard let self else { completion(); return }
+            self.injectCompletedText(text, completion: completion)
+        },
+        recordTranscript: { [weak self] text in self?.rememberTranscript(text) },
+        onOutcome: { [weak self] outcome, release in
+            self?.handleDictationOutcome(outcome, release: release)
+        },
+        onCancelled: { [weak self] release in self?.dismissHud(release.hudGeneration) },
+        onCommandCancelled: { [weak self] sequence in self?.cancelCommand(sequence) },
+        onProcessingCountChange: { [weak self] count in self?.processingCountDidChange(count) }
     )
 
     private var state: State = .loadingModel {
@@ -276,13 +250,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isRecording = false
     private var processingCount = 0
     private var pendingAudioHandoffs = 0
-    private var pendingInjections = 0
     // Lets a stale async start-failure from an abandoned recording be
     // distinguished from the one currently in flight.
     private var recordingGeneration = 0
-    // A start failure can arrive after release already queued stop(). Mark
-    // that generation so its empty result is not misreported as silence.
-    private var failedCaptureStarts: Set<Int> = []
     // Same idea for model loads: switching models twice quickly must not
     // let the slower (older) load win after the newer one finished.
     private var modelLoadGeneration = 0
@@ -313,16 +283,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Lifecycle
 
     static func terminationReply(
-        isRecording: Bool, pendingAudioHandoffs: Int, processingCount: Int, pendingInjections: Int
+        isRecording: Bool, pendingAudioHandoffs: Int, deliveryIsBusy: Bool
     ) -> NSApplication.TerminateReply {
-        isRecording || pendingAudioHandoffs > 0 || processingCount > 0 || pendingInjections > 0
+        isRecording || pendingAudioHandoffs > 0 || deliveryIsBusy
             ? .terminateCancel : .terminateNow
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let reply = Self.terminationReply(
             isRecording: isRecording, pendingAudioHandoffs: pendingAudioHandoffs,
-            processingCount: processingCount, pendingInjections: pendingInjections
+            deliveryIsBusy: dictationDelivery.isBusy
         )
         if reply == .terminateCancel {
             DiagLog.log("quit refused: dictation is still active")
@@ -393,47 +363,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ThemeIcon.apply(HudTheme.current)
     }
 
-    /// Settings live in a window (see SettingsWindow.swift); these hooks let
-    /// changes there reach the live hotkey tap, recorder, and transcriber.
+    /// Compose typed live effects once for both settings-window and menu changes.
     private func buildSettings() {
-        settingsModel = SettingsModel()
-        settingsModel?.onHotkeyChange = { [weak self] key in
-            self?.hotkey.key = key
-            self?.refreshStatusUI()
-        }
-        settingsModel?.onModelChange = { [weak self] in self?.loadModel() }
-        settingsModel?.onMicChange = { [weak self] uid in
-            // Release the old warm route and pre-open the new one so its
-            // Bluetooth hands-free transition is paid at selection time,
-            // rather than during the first dictation.
-            self?.recorder.selectDevice(uid)
-        }
-        settingsModel?.onKeepWarmChange = { [weak self] in
-            self?.recorder.keepWarm = Settings.keepMicWarm
-            if !Settings.keepMicWarm { self?.recorder.releaseWarmSession() }
-        }
-        settingsModel?.onCleanupToggle = { [weak self] in
-            guard let self, Settings.cleanupEnabled else { return }
-            self.probeOllama()
-            let model = Settings.ollamaModel
-            Task { await self.textModelPolicy.prewarm(model: model) }
-        }
-        settingsModel?.onVocabularyChange = { [weak self] terms in
-            guard let transcriber = self?.transcriber else { return }
-            Task { await transcriber.setVocabulary(terms) }
-        }
-        settingsModel?.onCommandModeChange = { [weak self] in
-            // Enabling may hinge on Ollama; the probe re-runs the hotkey
-            // start once reachability is known.
-            if Settings.commandModeEnabled { self?.probeOllama() }
-            self?.startCommandHotkey()
-        }
-        settingsModel?.onAutomaticUpdatesChange = { [weak self] in self?.updates.applyAutomaticPreference() }
-        settingsModel?.onThemeChange = { [weak self] in
-            guard let self else { return }
-            if !self.isRecording { self.overlay.preview() }
-            ThemeIcon.apply(HudTheme.current)
-        }
+        let loginAgent = Self.loginAgent
+        let application = SettingsApplication(
+            defaults: .standard,
+            supportedWhisperModels: Settings.whisperModels.map(\.name),
+            defaultWhisperModel: Settings.defaultWhisperModel,
+            effects: .init(
+                applyHotkey: { [weak self] key in
+                    self?.hotkey.key = key
+                    self?.refreshStatusUI()
+                },
+                reloadWhisperModel: { [weak self] model in self?.loadModel(model) },
+                selectMicrophone: { [weak self] uid in self?.recorder.selectDevice(uid) },
+                applyAutomaticUpdates: { [weak self] enabled in self?.updates.applyAutomaticPreference(enabled) },
+                applyCommandHotkey: { [weak self] key in
+                    if Settings.commandModeEnabled { self?.probeOllama() }
+                    self?.startCommandHotkey(key)
+                },
+                applyKeepMicWarm: { [weak self] enabled in
+                    self?.recorder.keepWarm = enabled
+                    if !enabled { self?.recorder.releaseWarmSession() }
+                },
+                applyCleanupEnabled: { [weak self] enabled in
+                    guard let self, enabled else { return }
+                    self.probeOllama()
+                    let model = Settings.ollamaModel
+                    Task { await self.textModelPolicy.prewarm(model: model) }
+                },
+                applyCommandModeEnabled: { [weak self] enabled in
+                    if enabled { self?.probeOllama() }
+                    self?.startCommandHotkey()
+                },
+                applyTheme: { [weak self] theme in
+                    guard let self else { return }
+                    if !self.isRecording { self.overlay.preview() }
+                    ThemeIcon.apply(theme)
+                },
+                applySoundCues: { _ in },
+                refreshDecoderVocabulary: { [weak self] terms in
+                    guard let transcriber = self?.transcriber else { return }
+                    Task { await transcriber.setVocabulary(terms) }
+                }
+            ),
+            loginItem: .init(
+                isEnabled: { !AppIdentity.current.isLocal && loginAgent.status == .enabled },
+                setEnabled: { enabled in
+                    guard !AppIdentity.current.isLocal else { return }
+                    if enabled { try loginAgent.register() }
+                    else { try loginAgent.unregister() }
+                }
+            )
+        )
+        settingsModel = SettingsModel(settingsApplication: application)
         settingsController = SettingsPanelController(model: settingsModel)
     }
 
@@ -528,7 +511,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// exactly like the dictation key. Silently absent when command mode is
     /// off, the keys collide, or no backend (Apple Intelligence or a
     /// reachable Ollama server) can serve it.
-    private func startCommandHotkey() {
+    private func startCommandHotkey(_ key: HotkeyManager.Key = Settings.commandHotkey) {
         guard Settings.commandModeActive else {
             if commandHotkeyActive {
                 commandHotkey.stop()
@@ -536,7 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        commandHotkey.key = Settings.commandHotkey
+        commandHotkey.key = key
         commandHotkey.onPress = { [weak self] in self?.commandKeyPressed() }
         commandHotkey.onRelease = { [weak self] in self?.commandKeyReleased() }
         commandHotkey.onTapDied = { [weak self] in
@@ -585,13 +568,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func loadModel() {
+    private func loadModel(_ model: String = Settings.whisperModel) {
         modelLoadGeneration += 1
         let generation = modelLoadGeneration
         beginModelPreparation()
         // A model switch mid-recording must not repaint the recording UI.
         if !isRecording { state = .loadingModel }
-        let model = Settings.whisperModel
         let cleanupModel = Settings.ollamaModel
         let shouldPrewarmCleanup = Settings.cleanupEnabled
         let hadLoadedModel = modelLoaded
@@ -785,22 +767,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }) { [weak self] error in
             guard let self else { return }
             if let error {
-                // A newer recording owns the UI, but the failed older start
-                // still has a queued stop completion that must be discarded.
-                guard generation == self.recordingGeneration else {
-                    self.failedCaptureStarts.insert(generation)
-                    return
-                }
+                // A newer recording owns the UI. The recorder carries the
+                // older start error in its own stop result.
+                guard generation == self.recordingGeneration else { return }
                 if self.isRecording {
                     self.isRecording = false
                     self.cancelActiveDictationSession()
                     // Release may never call stop now that the active flag is
                     // clear, so finish recorder-side cleanup here.
                     self.recorder.stop { _ in }
-                } else {
-                    // Release already queued stop; let that completion close
-                    // the HUD without treating the empty capture as silence.
-                    self.failedCaptureStarts.insert(generation)
                 }
                 self.overlay.hide()
                 self.playCue("Basso")
@@ -861,17 +836,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginDictationSession() {
         cancelActiveDictationSession()
-        let generation = nextDictationGeneration
-        nextDictationGeneration += 1
-        activeDictationGeneration = generation
         let context = captureDictationContext()
-        dictationPipeline.begin(
-            generation: generation,
+        let generation = dictationDelivery.begin(.init(
             context: context,
             trace: activeDictationTrace,
             diagnostics: diagnosticRecording(context: context, trace: activeDictationTrace),
             personalVoice: personalVoiceRecording(context: context, trace: activeDictationTrace)
-        )
+        ))
+        activeDictationGeneration = generation
         scheduleIncrementalTick(generation: generation, after: DictationSessionPipeline.incrementalStartSeconds)
     }
 
@@ -886,7 +858,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func runIncrementalTick(generation: Int) {
         guard activeDictationGeneration == generation, isRecording else { return }
         scheduleIncrementalTick(generation: generation, after: DictationSessionPipeline.incrementalTickSeconds)
-        guard dictationPipeline.canAcceptIncrementalChunk(generation: generation) else {
+        guard dictationDelivery.canAcceptIncrementalChunk(generation: generation) else {
             activeDictationTrace?.record(.incrementalSkipped, status: .busy)
             return
         }
@@ -895,7 +867,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self,
                   self.activeDictationGeneration == generation,
                   self.isRecording else { return }
-            self.dictationPipeline.processIncrementalSnapshot(generation: generation, samples: samples)
+            self.dictationDelivery.processIncrementalSnapshot(generation: generation, samples: samples)
         }
     }
 
@@ -904,7 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         incrementalTimer = nil
         guard let generation = activeDictationGeneration else { return }
         activeDictationGeneration = nil
-        dictationPipeline.cancel(generation: generation)
+        dictationDelivery.cancel(generation: generation)
     }
 
     // MARK: - Command mode (hold, speak an instruction, edit in place)
@@ -926,29 +898,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// frontmost app and run the edit. Ordered through the same injection
     /// queue as dictations so results never overtake each other.
     private func runCommand(instruction: String, seq: Int, hudGeneration: Int?) {
-        guard injectionCoordinator.isPending(seq) else { return }
+        guard dictationDelivery.isCommandPending(seq) else { return }
         TextInjector.copySelection { [weak self] selection in
-            guard let self, self.injectionCoordinator.isPending(seq) else { return }
+            guard let self, self.dictationDelivery.isCommandPending(seq) else { return }
             let task = Task {
                 defer { self.mirrorOllamaReachability() }
                 do {
                     let result = try await CommandMode.run(instruction: instruction, selection: selection)
-                    guard self.injectionCoordinator.isPending(seq) else { return }
+                    guard self.dictationDelivery.isCommandPending(seq) else { return }
                     guard !result.isEmpty else {
                         self.completeCommand(seq, with: .skip)
                         self.dismissHud(hudGeneration)
                         return
                     }
-                    self.recentTranscripts.insert(RecentDictation(text: result), at: 0)
-                    if self.recentTranscripts.count > 5 { self.recentTranscripts.removeLast() }
-                    self.settingsModel?.recentDictations = self.recentTranscripts
-                    DictationHistory.record(result)
                     self.completeCommand(seq, with: .inject(result))
                     self.dismissHud(hudGeneration)
                     DiagLog.log("command mode applied (selection=%d chars, result=%d chars)",
                           selection?.count ?? 0, result.count)
                 } catch {
-                    guard self.injectionCoordinator.isPending(seq) else { return }
+                    guard self.dictationDelivery.isCommandPending(seq) else { return }
                     self.completeCommand(seq, with: .skip)
                     self.dismissHud(hudGeneration)
                     self.playCue("Basso")
@@ -988,21 +956,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         incrementalTimer = nil
         pendingAudioHandoffs += 1
         DictationTrace.$current.withValue(trace) {
-            var nativeAudio: NativeAudioRecording?
-            recorder.stop(nativeCompletion: { nativeAudio = $0 }) { [weak self] samples in
+            recorder.stop { [weak self] recording in
                 guard let self else { return }
                 defer { self.pendingAudioHandoffs -= 1 }
-                if self.failedCaptureStarts.remove(generation) != nil {
+                if recording.startError != nil {
                     if let dictationGeneration {
-                        self.dictationPipeline.cancel(generation: dictationGeneration)
+                        self.dictationDelivery.cancel(generation: dictationGeneration)
                     }
                     self.dismissHud(generation)
                     return
                 }
                 DictationTrace.$current.withValue(trace) {
-                    self.process(samples: samples, releasedAt: releasedAt,
+                    self.process(samples: recording.samples, releasedAt: releasedAt,
                              hudGeneration: generation, asCommand: asCommand,
-                             dictationGeneration: dictationGeneration, nativeAudio: nativeAudio)
+                             dictationGeneration: dictationGeneration, nativeAudio: recording.nativeAudio)
                 }
             }
         }
@@ -1018,15 +985,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.hide()
     }
 
-    // An accidental hotkey brush captures a sliver of near-silence, and
-    // Whisper hallucinates text for it ("Thank you.") that gets pasted into
-    // the focused app. Gate on VOICED time before transcribing (whole-
-    // capture RMS diluted real speech with every thinking pause).
-    private static let minVoicedSeconds: TimeInterval = 0.3
-    // Voiced but still too quiet to trust: transcribe, but let the
-    // transcriber drop canonical hallucination phrases.
-    private static let quietVoicedDBFS: Float = -40
-
     private func process(
         samples rawSamples: [Float],
         releasedAt: Date,
@@ -1035,37 +993,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dictationGeneration: Int? = nil,
         nativeAudio: NativeAudioRecording? = nil
     ) {
-        if !asCommand, let dictationGeneration {
-            dictationPipeline.recordCapturedAudio(generation: dictationGeneration, samples: rawSamples, nativeAudio: nativeAudio)
-        }
-        // Silent bookends are Whisper's main hallucination trigger and pure
-        // wasted encode time.
-        let samples = AudioRecorder.trimmingSilence(rawSamples)
-        let duration = Double(samples.count) / AudioRecorder.sampleRate
-        let voice = AudioRecorder.voicedMetrics(of: samples)
-        guard voice.voicedSeconds >= Self.minVoicedSeconds else {
-            DictationTrace.current?.record(.resultReady, status: .insufficientVoice)
-            DiagLog.log("skipping transcription: %.2fs voiced (of %.2fs) at %.0f dBFS is below the gate",
-                  voice.voicedSeconds, duration, voice.voicedDBFS)
-            if let dictationGeneration {
-                dictationPipeline.cancel(generation: dictationGeneration)
-            }
-            reportHeardNothing()
-            dismissHud(hudGeneration)
-            return
-        }
-
         if asCommand {
-            let seq = injectionCoordinator.begin(kind: .command)
+            let audio = DictationAudioPreparation(samples: rawSamples)
+            guard audio.isAdmitted else {
+                reportHeardNothing()
+                dismissHud(hudGeneration)
+                return
+            }
+            let seq = dictationDelivery.beginCommand()
             if let hudGeneration { commandHudGenerations[seq] = hudGeneration }
             let context = captureDictationContext()
             let task = Task {
                 do {
                     let raw = try await transcriber.transcribe(
-                        samples: samples,
-                        lowEnergy: voice.voicedDBFS < Self.quietVoicedDBFS
+                        samples: audio.samples,
+                        lowEnergy: audio.lowEnergy
                     )
-                    guard self.injectionCoordinator.isPending(seq) else { return }
+                    guard self.dictationDelivery.isCommandPending(seq) else { return }
                     guard !raw.isEmpty else {
                         self.completeCommand(seq, with: .skip)
                         self.reportHeardNothing()
@@ -1078,7 +1022,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                     self.runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration)
                 } catch {
-                    guard self.injectionCoordinator.isPending(seq) else { return }
+                    guard self.dictationDelivery.isCommandPending(seq) else { return }
                     self.completeCommand(seq, with: .skip)
                     self.dismissHud(hudGeneration)
                     self.playCue("Basso")
@@ -1093,77 +1037,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let seq = injectionCoordinator.begin(kind: .dictation)
-        let generation: Int
-        if let dictationGeneration {
-            generation = dictationGeneration
-        } else {
-            generation = nextDictationGeneration
-            nextDictationGeneration += 1
-            let context = captureDictationContext()
-            let trace = DictationTrace.current ?? (Settings.saveDiagnosticRecordings ? DictationTrace() : nil)
-            dictationPipeline.begin(
-                generation: generation, context: context, trace: trace,
-                diagnostics: diagnosticRecording(context: context, trace: trace)
-            )
-        }
-        pendingDictations[generation] = PendingDictation(
-            sequence: seq,
-            releasedAt: releasedAt,
-            hudGeneration: hudGeneration,
-            duration: duration,
-            samples: rawSamples,
-            cleanupEnabled: Settings.cleanupEnabled
-        )
-        dictationPipeline.release(generation: generation, fullSamples: rawSamples)
+        guard let generation = dictationGeneration else { return }
+        dictationDelivery.release(generation: generation, samples: rawSamples,
+                                  nativeAudio: nativeAudio, releasedAt: releasedAt,
+                                  hudGeneration: hudGeneration)
     }
 
-    private func handleDictationOutcome(_ outcome: DictationSessionOutcome) {
-        let generation: Int
-        switch outcome {
-        case .finalTranscript(let value, _),
-             .emptyTranscript(let value),
-             .failed(let value, _):
-            generation = value
-        }
-        guard let pending = pendingDictations.removeValue(forKey: generation) else { return }
+    private func rememberTranscript(_ text: String) {
+        recentTranscripts.insert(RecentDictation(text: text), at: 0)
+        if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
+        settingsModel?.recentDictations = recentTranscripts
+        DictationHistory.record(text)
+    }
 
+    private func handleDictationOutcome(_ outcome: DictationSessionOutcome, release: DictationDelivery.Release) {
+        dismissHud(release.hudGeneration)
         switch outcome {
         case .finalTranscript(_, let text):
-            recentTranscripts.insert(RecentDictation(text: text), at: 0)
-            if recentTranscripts.count > 5 { recentTranscripts.removeLast() }
-            settingsModel?.recentDictations = recentTranscripts
-            DictationHistory.record(text)
-            injectionCoordinator.complete(pending.sequence, with: .inject(text))
-            dismissHud(pending.hudGeneration)
-
-            let ms = Int(Date().timeIntervalSince(pending.releasedAt) * 1000)
+            let ms = Int(Date().timeIntervalSince(release.releasedAt) * 1000)
             DiagLog.log(
                 "release-to-result-delivery %dms (%.1fs audio, cleanup=%@, outputBytes=%d; paste may still be queued)",
-                ms,
-                pending.duration,
-                pending.cleanupEnabled ? "on" : "off",
-                text.utf8.count
+                ms, release.duration, release.cleanupEnabled ? "on" : "off", text.utf8.count
             )
-
         case .emptyTranscript, .failed:
             let message: String
             if case .failed(_, let failure) = outcome {
                 message = failure
             } else {
-                DiagLog.log("transcription produced no text (%.1fs of audio); kept for retry", pending.duration)
+                DiagLog.log("transcription produced no text (%.1fs of audio); kept for retry", release.duration)
                 message = "Speech recognition returned no text."
             }
-            injectionCoordinator.complete(pending.sequence, with: .skip)
-            dismissHud(pending.hudGeneration)
-            retrySamples.append(pending.samples)
-            if retrySamples.count > 3 { retrySamples.removeFirst() }
             playCue("Basso")
             state = .failed(UserFacingIssue(
                 summary: "Couldn't transcribe audio",
                 details: "\(message) The audio was kept in memory. Use Retry Dictation in the menu before quitting."
             ))
             scheduleFailureRecovery()
+        case .insufficientVoice:
+            reportHeardNothing()
         }
     }
 
@@ -1198,32 +1109,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func completeCommand(_ sequence: Int, with outcome: InjectionCoordinator.Outcome) {
         commandTasks.removeValue(forKey: sequence)
         commandHudGenerations.removeValue(forKey: sequence)
-        injectionCoordinator.complete(sequence, with: outcome)
+        dictationDelivery.completeCommand(sequence, with: outcome)
     }
 
-    private func cancelInjectionOperation(
-        _ sequence: Int,
-        kind: InjectionCoordinator.OperationKind
-    ) {
-        switch kind {
-        case .command:
-            commandTasks.removeValue(forKey: sequence)?.cancel()
-            let hudGeneration = commandHudGenerations.removeValue(forKey: sequence)
-            dismissHud(hudGeneration)
-        case .dictation:
-            guard let entry = pendingDictations.first(where: { $0.value.sequence == sequence }) else {
-                break
-            }
-            pendingDictations.removeValue(forKey: entry.key)
-            dictationPipeline.cancel(generation: entry.key)
-            dismissHud(entry.value.hudGeneration)
-        }
-        DiagLog.log("%@ #%d stalled; cancelled to unblock later output",
-              kind == .command ? "command" : "dictation", sequence)
+    private func cancelCommand(_ sequence: Int) {
+        commandTasks.removeValue(forKey: sequence)?.cancel()
+        let hudGeneration = commandHudGenerations.removeValue(forKey: sequence)
+        dismissHud(hudGeneration)
+        DiagLog.log("command #%d stalled; cancelled to unblock later output", sequence)
     }
 
-    private func injectCompletedText(_ text: String) {
-        pendingInjections += 1
+    private func injectCompletedText(_ text: String, completion: @escaping () -> Void) {
         let trace = DictationTrace.current
         // The cue acknowledges dispatch. Clipboard restoration happens later
         // and cannot establish whether the target app inserted the text.
@@ -1233,8 +1129,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self?.playCue("Bottle")
         }) { [weak self] result in
+            completion()
             guard let self else { return }
-            self.pendingInjections -= 1
             if let issue = result.userFacingIssue {
                 DiagLog.log("text delivery warning: %@; transcript kept in Recent Dictations", issue.summary)
                 self.playCue("Basso")
@@ -1463,13 +1359,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func retryFailedDictation() {
-        guard !retrySamples.isEmpty else { return }
-        let pending = retrySamples
-        retrySamples = []
-        // Oldest first, so a multi-failure backlog pastes in spoken order
-        // (the injection queue preserves this ordering downstream too).
-        for samples in pending {
-            process(samples: samples, releasedAt: Date())
+        dictationDelivery.retryFailedDictations {
+            let context = captureDictationContext()
+            let trace = Settings.saveDiagnosticRecordings ? DictationTrace() : nil
+            return .init(context: context, trace: trace,
+                         diagnostics: diagnosticRecording(context: context, trace: trace))
         }
     }
 
@@ -1589,9 +1483,9 @@ extension AppDelegate: NSMenuDelegate {
         rebuildRecentDictationsMenu()
         rebuildMicrophoneMenu()
         refreshQuickActionChecks()
-        retryMenuItem.isHidden = retrySamples.isEmpty
-        retryMenuItem.title = retrySamples.count > 1
-            ? "Retry \(retrySamples.count) Dictations"
+        retryMenuItem.isHidden = dictationDelivery.retryCount == 0
+        retryMenuItem.title = dictationDelivery.retryCount > 1
+            ? "Retry \(dictationDelivery.retryCount) Dictations"
             : "Retry Dictation"
         refreshStatusUI()
     }

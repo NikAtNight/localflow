@@ -16,7 +16,7 @@ unchanged. The separate daily transcript log keeps its existing behavior.
 another archive if enabled. Command mode and CLI replay do not create archives.
 
 `DictationSessionPipeline` owns the archive for that generation. At release,
-`AppDelegate.process` saves audio before the voice gate and silence trimming.
+`DictationDelivery.release` saves audio before the voice gate and silence trimming.
 `release` also saves audio for sessions started by manual retry. The first save
 wins, so a trimmed request cannot overwrite the original capture.
 

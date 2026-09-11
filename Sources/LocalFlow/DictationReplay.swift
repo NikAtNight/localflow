@@ -104,8 +104,7 @@ enum DictationReplay {
         let duration = Double(samples.count) / AudioRecorder.sampleRate
         guard duration <= 300 else { throw ReplayError.audioTooLong(duration) }
 
-        let gatedSamples = AudioRecorder.trimmingSilence(samples)
-        guard AudioRecorder.voicedMetrics(of: gatedSamples).voicedSeconds >= 0.3 else {
+        guard DictationAudioPreparation(samples: samples).isAdmitted else {
             throw ReplayError.insufficientVoice
         }
 
@@ -120,12 +119,9 @@ enum DictationReplay {
         let receiver = OutcomeReceiver()
         let pipeline = DictationSessionPipeline(
             transcribe: { request in
-                let trimmed = AudioRecorder.trimmingSilence(request.samples)
-                guard !trimmed.isEmpty else { return "" }
-                let voice = AudioRecorder.voicedMetrics(of: trimmed)
-                return try await transcriber.transcribe(
-                    samples: trimmed,
-                    lowEnergy: voice.voicedDBFS < -40
+                try await transcriber.transcribe(
+                    samples: request.samples,
+                    lowEnergy: request.lowEnergy
                 )
             },
             cleanup: { request in
@@ -207,6 +203,8 @@ enum DictationReplay {
                     let data = try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys])
                     print(String(decoding: data, as: UTF8.self))
                     writeStderr("replay run \(generation)/\(options.runs): complete\n")
+                case .insufficientVoice:
+                    throw ReplayError.insufficientVoice
                 case .emptyTranscript:
                     writeStderr("replay run \(generation)/\(options.runs): empty transcript\n")
                 case .failed(_, let message):
@@ -273,7 +271,8 @@ private final class OutcomeReceiver {
     func receive(_ outcome: DictationSessionOutcome) {
         let generation: Int
         switch outcome {
-        case .finalTranscript(let value, _), .emptyTranscript(let value), .failed(let value, _):
+        case .finalTranscript(let value, _), .insufficientVoice(let value),
+             .emptyTranscript(let value), .failed(let value, _):
             generation = value
         }
         resolve(generation: generation, result: .success(outcome))

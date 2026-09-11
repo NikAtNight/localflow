@@ -7,17 +7,16 @@ final class AppTerminationTests: XCTestCase {
     func testQuitWaitsThroughEveryDictationPhase() {
         // Release clears recording before the asynchronous audio handoff;
         // dispatch clears processing before typing or clipboard restoration.
-        let phases: [(Bool, Int, Int, Int)] = [
-            (true, 0, 0, 0),
-            (false, 1, 0, 0),
-            (false, 0, 1, 0),
-            (false, 0, 0, 1),
-            (true, 1, 2, 1)
+        let phases: [(Bool, Int, Bool)] = [
+            (true, 0, false),
+            (false, 1, false),
+            (false, 0, true),
+            (true, 1, true)
         ]
-        for (recording, handoffs, processing, injections) in phases {
+        for (recording, handoffs, deliveryIsBusy) in phases {
             XCTAssertEqual(AppDelegate.terminationReply(
                 isRecording: recording, pendingAudioHandoffs: handoffs,
-                processingCount: processing, pendingInjections: injections
+                deliveryIsBusy: deliveryIsBusy
             ), .terminateCancel)
         }
     }
@@ -25,7 +24,7 @@ final class AppTerminationTests: XCTestCase {
     func testIdleAppCanQuit() {
         XCTAssertEqual(AppDelegate.terminationReply(
             isRecording: false, pendingAudioHandoffs: 0,
-            processingCount: 0, pendingInjections: 0
+            deliveryIsBusy: false
         ), .terminateNow)
     }
 }

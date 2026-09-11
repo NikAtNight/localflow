@@ -72,7 +72,7 @@ final class DictationDiagnosticPipelineTests: XCTestCase {
         let cancelledRecording = store.begin(.init(traceID: cancelledID, context: context, whisperModel: "test",
                                                    microphone: "test", vocabulary: ""))
         pipeline.begin(generation: 2, context: context, diagnostics: cancelledRecording)
-        // This is also the live path for a recording rejected by the voice gate.
+        // Capture may finish before cancellation arrives.
         pipeline.recordCapturedAudio(generation: 2, samples: [Float](repeating: 0, count: 8000))
         pipeline.cancel(generation: 2)
         store.flush()

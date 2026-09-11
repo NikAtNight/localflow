@@ -166,7 +166,8 @@ struct LocalFlowMain {
                     return
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                    recorder.stop { samples in
+                    recorder.stop { recording in
+                        let samples = recording.samples
                         let seconds = Double(samples.count) / AudioRecorder.sampleRate
                         let peak = samples.map(abs).max() ?? 0
                         print("round \(round): captured \(samples.count) samples "

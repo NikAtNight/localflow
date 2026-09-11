@@ -24,6 +24,13 @@ final class AudioRecorder {
         }
     }
 
+    /// One detached recording, including the outcome of its own queued start.
+    struct Recording {
+        let samples: [Float]
+        let nativeAudio: NativeAudioRecording?
+        let startError: Error?
+    }
+
     static let sampleRate: Double = 16_000
 
     /// RMS energy of a capture in dBFS (0 = full scale); -infinity for
@@ -259,9 +266,9 @@ final class AudioRecorder {
         interleaved: false
     )!
 
-    private var session: AVCaptureSession?
-    private var forwarder: SampleForwarder?
-    private var runtimeObserver: NSObjectProtocol?
+    private var session: AudioCaptureSession?
+    private let makeCaptureSession: AudioCaptureSession.Factory
+    private var startError: Error? // touched only on `controlQueue`
     private var samples: [Float] = []
     private var nativeAudio: NativeAudioAccumulator? // guarded by `lock`
     private var sessionDeviceUID: String? // touched only on `controlQueue`
@@ -285,6 +292,10 @@ final class AudioRecorder {
     private let controlQueue = DispatchQueue(label: "LocalFlow.AudioControl", qos: .userInitiated)
     private let sampleQueue = DispatchQueue(label: "LocalFlow.AudioSamples", qos: .userInitiated)
 
+    init(makeCaptureSession: @escaping AudioCaptureSession.Factory = AudioCaptureSession.microphone) {
+        self.makeCaptureSession = makeCaptureSession
+    }
+
     /// Starts capture; `completion` runs on the main queue with nil on
     /// success or the error that prevented recording. `onCaptureLive` fires
     /// once, on the capture queue, at this recording's first sustained
@@ -295,6 +306,7 @@ final class AudioRecorder {
         trace?.record(.captureEnqueued)
         controlQueue.async {
             trace?.record(.captureStarted)
+            self.startError = nil
             // Installed here, after any queued stop() has fully drained the
             // previous session, so old audio can never fire this callback.
             self.lock.lock()
@@ -305,7 +317,9 @@ final class AudioRecorder {
                 try self.startCapture(retainNativeAudio: retainNativeAudio)
                 DispatchQueue.main.async { completion(nil) }
             } catch {
+                self.startError = error
                 self.lock.lock()
+                self.samples = []
                 self.nativeAudio = nil
                 self.recordingActive = false
                 self.lock.unlock()
@@ -320,7 +334,7 @@ final class AudioRecorder {
     /// audio stays running (discarding buffers) for `warmWindowSeconds` so
     /// the next start is instant; a session that never went live is on a
     /// suspect route and is torn down as before.
-    func stop(nativeCompletion: ((NativeAudioRecording?) -> Void)? = nil, completion: @escaping ([Float]) -> Void) {
+    func stop(completion: @escaping (Recording) -> Void) {
         let stopTrace = DictationTrace.current
         stopTrace?.record(.stopEnqueued)
         controlQueue.async {
@@ -341,24 +355,18 @@ final class AudioRecorder {
                 self.trace = nil
                 return (captured, native, wasLive, warmWanted)
             }
+            let recording = Recording(samples: captured, nativeAudio: native, startError: self.startError)
+            self.startError = nil
             stopTrace?.record(.audioDetached, fields: [.samples: Double(captured.count)])
-            if warmWanted, wasLive, self.session != nil {
-                self.scheduleWarmTeardown()
-                DispatchQueue.main.async {
-                    stopTrace?.record(.audioHandoff)
-                    nativeCompletion?(native)
-                    completion(captured)
-                }
-            } else {
-                // Hardware shutdown can block. The immutable sample Array is
-                // already detached, so let transcription start in parallel.
-                DispatchQueue.main.async {
-                    stopTrace?.record(.audioHandoff)
-                    nativeCompletion?(native)
-                    completion(captured)
-                }
-                self.tearDownSession()
+            let keepSessionWarm = warmWanted && wasLive && self.session != nil
+            if keepSessionWarm { self.scheduleWarmTeardown() }
+            // Hardware shutdown can block. Hand off the detached recording
+            // before teardown so transcription can start in parallel.
+            DispatchQueue.main.async {
+                stopTrace?.record(.audioHandoff)
+                completion(recording)
             }
+            if !keepSessionWarm { self.tearDownSession() }
         }
     }
 
@@ -476,7 +484,7 @@ final class AudioRecorder {
             let captureTrace = trace
             lock.unlock()
             captureTrace?.record(.captureReady, status: .warm,
-                                 microphone: (session.inputs.first as? AVCaptureDeviceInput)?.device.localizedName)
+                                 microphone: session.microphoneName)
             DiagLog.log("[diag] reusing warm capture session on %@", sessionDeviceUID ?? "?")
             armNoAudioWatchdog(rebuildsLeft: 2)
             return
@@ -642,69 +650,34 @@ final class AudioRecorder {
         let generation = captureGeneration
         lock.unlock()
 
-        var device: AVCaptureDevice?
-        if let uid {
-            // AVCaptureDevice uniqueIDs are the CoreAudio device UIDs.
-            device = AVCaptureDevice(uniqueID: uid)
-            if device == nil {
-                guard fallbackToDefaultIfUnavailable else { throw RecorderError.noInput }
-                DiagLog.log("selected microphone (%@) not available — using system default", uid)
-            }
-        }
-        guard let device = device ?? AVCaptureDevice.default(for: .audio) else {
-            throw RecorderError.noInput
-        }
-
-        let session = AVCaptureSession()
-        session.beginConfiguration()
-        let input = try AVCaptureDeviceInput(device: device)
-        guard session.canAddInput(input) else { throw RecorderError.noInput }
-        session.addInput(input)
-
-        let output = AVCaptureAudioDataOutput()
-        let forwarder = SampleForwarder(targetFormat: Self.targetFormat, onRaw: { [weak self] raw in
-            self?.appendNative(raw, from: generation)
-        }) { [weak self] converted in
-            self?.append(converted, from: generation)
-        }
-        output.setSampleBufferDelegate(forwarder, queue: sampleQueue)
-        guard session.canAddOutput(output) else { throw RecorderError.noInput }
-        session.addOutput(output)
-        session.commitConfiguration()
-
-        runtimeObserver = NotificationCenter.default.addObserver(
-            forName: .AVCaptureSessionRuntimeError,
-            object: session,
-            queue: nil
-        ) { [weak self] note in
-            self?.handleRuntimeError(of: note.object as? AVCaptureSession)
-        }
-
         let startBegan = Date()
-        session.startRunning()
-        guard session.isRunning else {
-            tearDownSession()
-            throw RecorderError.noInput
-        }
+        let session = try makeCaptureSession(
+            uid, fallbackToDefaultIfUnavailable, Self.targetFormat, sampleQueue,
+            { [weak self] raw in self?.appendNative(raw, from: generation) },
+            { [weak self] converted in self?.append(converted, from: generation) },
+            { [weak self] in self?.handleRuntimeError(from: generation) }
+        )
         self.session = session
-        self.forwarder = forwarder
-        sessionDeviceUID = device.uniqueID
+        sessionDeviceUID = session.deviceUID
         lock.lock()
         sessionEpoch = Date()
         let captureTrace = trace
         lock.unlock()
-        captureTrace?.record(.captureReady, status: .cold, microphone: device.localizedName)
+        captureTrace?.record(.captureReady, status: .cold, microphone: session.microphoneName)
         DiagLog.log("[diag] capture running on %@ (startRunning blocked %.0fms)",
-              device.localizedName, Date().timeIntervalSince(startBegan) * 1000)
+              session.microphoneName, Date().timeIntervalSince(startBegan) * 1000)
     }
 
     /// The session hit a runtime error (device yanked, media services
     /// reset) mid-recording — resume on whatever device is right now,
     /// keeping the samples already captured.
-    private func handleRuntimeError(of errored: AVCaptureSession?) {
+    private func handleRuntimeError(from generation: Int) {
         controlQueue.async {
-            guard let errored, errored === self.session else { return }
             self.lock.lock()
+            guard generation == self.captureGeneration, self.session != nil else {
+                self.lock.unlock()
+                return
+            }
             let active = self.recordingActive
             self.lock.unlock()
             // A warm idle session that errors (device yanked, media services
@@ -746,14 +719,9 @@ final class AudioRecorder {
             nativeAudio.markIncomplete()
         }
         lock.unlock()
-        if let runtimeObserver {
-            NotificationCenter.default.removeObserver(runtimeObserver)
-            self.runtimeObserver = nil
-        }
         guard let session else { return }
-        session.stopRunning()
+        session.stop()
         self.session = nil
-        forwarder = nil
         sessionDeviceUID = nil
     }
 
@@ -880,6 +848,85 @@ final class AudioRecorder {
             }
             onSpectrum(bands)
         }
+    }
+}
+
+/// A running input and its teardown. Both microphone and synthetic inputs feed
+/// the recorder through the supplied sample queue and buffer callbacks.
+final class AudioCaptureSession {
+    typealias Factory = (
+        _ deviceUID: String?, _ fallbackToDefaultIfUnavailable: Bool,
+        _ targetFormat: AVAudioFormat, _ sampleQueue: DispatchQueue,
+        _ onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
+        _ onPCM: @escaping (AVAudioPCMBuffer) -> Void,
+        _ onFailure: @escaping () -> Void
+    ) throws -> AudioCaptureSession
+
+    let deviceUID: String?
+    let microphoneName: String
+    private let running: () -> Bool
+    private let teardown: () -> Void
+
+    init(deviceUID: String?, microphoneName: String,
+         isRunning: @escaping () -> Bool, stop: @escaping () -> Void) {
+        self.deviceUID = deviceUID
+        self.microphoneName = microphoneName
+        self.running = isRunning
+        self.teardown = stop
+    }
+
+    var isRunning: Bool { running() }
+
+    func stop() { teardown() }
+
+    static func microphone(
+        deviceUID uid: String?, fallbackToDefaultIfUnavailable: Bool,
+        targetFormat: AVAudioFormat, sampleQueue: DispatchQueue,
+        onRaw: @escaping (AVAudioPCMBuffer?) -> Void,
+        onPCM: @escaping (AVAudioPCMBuffer) -> Void,
+        onFailure: @escaping () -> Void
+    ) throws -> AudioCaptureSession {
+        var device: AVCaptureDevice?
+        if let uid {
+            device = AVCaptureDevice(uniqueID: uid)
+            if device == nil {
+                guard fallbackToDefaultIfUnavailable else { throw AudioRecorder.RecorderError.noInput }
+                DiagLog.log("selected microphone (%@) not available, using system default", uid)
+            }
+        }
+        guard let device = device ?? AVCaptureDevice.default(for: .audio) else {
+            throw AudioRecorder.RecorderError.noInput
+        }
+        let session = AVCaptureSession()
+        session.beginConfiguration()
+        let input = try AVCaptureDeviceInput(device: device)
+        guard session.canAddInput(input) else { throw AudioRecorder.RecorderError.noInput }
+        session.addInput(input)
+        let output = AVCaptureAudioDataOutput()
+        let forwarder = SampleForwarder(targetFormat: targetFormat, onRaw: onRaw, onPCM: onPCM)
+        output.setSampleBufferDelegate(forwarder, queue: sampleQueue)
+        guard session.canAddOutput(output) else { throw AudioRecorder.RecorderError.noInput }
+        session.addOutput(output)
+        session.commitConfiguration()
+        let observer = NotificationCenter.default.addObserver(
+            forName: .AVCaptureSessionRuntimeError, object: session, queue: nil
+        ) { _ in onFailure() }
+        session.startRunning()
+        guard session.isRunning else {
+            NotificationCenter.default.removeObserver(observer)
+            session.stopRunning()
+            throw AudioRecorder.RecorderError.noInput
+        }
+        return AudioCaptureSession(
+            deviceUID: device.uniqueID, microphoneName: device.localizedName,
+            isRunning: { session.isRunning },
+            stop: {
+                NotificationCenter.default.removeObserver(observer)
+                session.stopRunning()
+                // AVCaptureAudioDataOutput does not retain its delegate.
+                withExtendedLifetime(forwarder) {}
+            }
+        )
     }
 }
 

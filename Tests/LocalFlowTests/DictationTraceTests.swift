@@ -138,7 +138,7 @@ final class DictationTraceTests: XCTestCase {
             }
         )
         pipeline.begin(generation: 0, context: context, trace: trace)
-        pipeline.release(generation: 0, fullSamples: [0.2])
+        pipeline.release(generation: 0, fullSamples: Array(repeating: 0.2, count: 16_000))
         await fulfillment(of: [finished], timeout: 1)
         withExtendedLifetime(pipeline) {}
         return output
@@ -163,17 +163,17 @@ final class DictationTraceTests: XCTestCase {
             onOutcome: { _ in finished.fulfill() }
         )
         pipeline.begin(generation: 0, context: .init(cleanupEnabled: false, styleProfile: .general, corrections: [], snippets: []), trace: trace)
-        pipeline.processIncrementalChunk(generation: 0, samples: [0.2], pauseSecondsAfterChunk: 0, sourceEndIndex: 4)
+        pipeline.processIncrementalChunk(generation: 0, samples: Array(repeating: 0.2, count: 6_400), pauseSecondsAfterChunk: 0, sourceEndIndex: 6_400)
         await fulfillment(of: [chunkStarted], timeout: 1)
         trace.record(.hotkeyReleased)
-        pipeline.release(generation: 0, fullSamples: Array(repeating: 0.2, count: 10))
+        pipeline.release(generation: 0, fullSamples: Array(repeating: 0.2, count: 16_000))
         let release = events.events.first { $0.name == .audioReleased }
-        XCTAssertEqual(release?.fields["submittedEnd"], 4)
+        XCTAssertEqual(release?.fields["submittedEnd"], 6_400)
         XCTAssertEqual(release?.fields["completedEnd"], 0)
-        XCTAssertEqual(release?.fields["tailSamples"], 6)
+        XCTAssertEqual(release?.fields["tailSamples"], 9_600)
         chunk?.resume(returning: "chunk")
         await fulfillment(of: [finished], timeout: 1)
-        XCTAssertEqual(events.events.first { $0.name == .chunkCompleted }?.fields["completedEnd"], 4)
+        XCTAssertEqual(events.events.first { $0.name == .chunkCompleted }?.fields["completedEnd"], 6_400)
     }
 
     func testCancelledWorkRecordsItsActualReturnButNeverDeliversText() async {
@@ -195,7 +195,7 @@ final class DictationTraceTests: XCTestCase {
             onOutcome: { _ in XCTFail("cancelled output delivered") }
         )
         pipeline.begin(generation: 0, context: .init(cleanupEnabled: false, styleProfile: .general, corrections: [], snippets: []), trace: trace)
-        pipeline.release(generation: 0, fullSamples: [0.2])
+        pipeline.release(generation: 0, fullSamples: Array(repeating: 0.2, count: 16_000))
         await fulfillment(of: [started], timeout: 1)
         pipeline.cancel(generation: 0)
         XCTAssertEqual(events.events.last?.name, .cancellationRequested)
