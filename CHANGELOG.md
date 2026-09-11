@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.0](https://github.com/NikAtNight/localflow/compare/v1.5.0...v1.6.0) (2026-09-11)
+
+
+### Features
+
+* add production diagnostics with 30-day retention and export ([2201626](https://github.com/NikAtNight/localflow/commit/2201626466629327c0849554ee2dafaddd79d899))
+
+
+### Fixes
+
+* retain local diagnostics across app updates ([d08765d](https://github.com/NikAtNight/localflow/commit/d08765dd94b863c5b37b964f94eed1f9cd1c5bf3))
+
 ## [1.5.0](https://github.com/NikAtNight/localflow/compare/v1.4.1...v1.5.0) (2026-09-10)
 
 
