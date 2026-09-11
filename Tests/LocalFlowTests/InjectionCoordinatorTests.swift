@@ -57,15 +57,17 @@ final class InjectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(coordinator.pendingCount, 0)
     }
 
-    func testLaterCompletionDoesNotRestartArmedHeadStallDeadline() async {
+    func testLaterCompletionDoesNotRestartArmedHeadStallDeadline() async throws {
         var events: [String] = []
         var processingCounts: [Int] = []
         let drained = expectation(description: "original deadline drains queued results")
         drained.expectedFulfillmentCount = 3
 
+        var scheduled: [(TimeInterval, DispatchWorkItem)] = []
         let coordinator = InjectionCoordinator(
             stallTimeout: 0.4,
             injectionInterval: 0,
+            scheduleStall: { scheduled.append(($0, $1)) },
             onInject: { text in
                 events.append("paste:\(text)")
                 drained.fulfill()
@@ -84,14 +86,15 @@ final class InjectionCoordinatorTests: XCTestCase {
         let secondDictation = coordinator.begin(kind: .dictation)
         coordinator.complete(firstDictation, with: .inject("first"))
 
-        // The first completed follower arms a 400 ms deadline. A second
-        // completion 250 ms later must leave the original deadline intact.
-        try? await Task.sleep(nanoseconds: 250_000_000)
         coordinator.complete(secondDictation, with: .inject("second"))
 
-        // About 150 ms remain on the original deadline. A restarted deadline
-        // cannot cancel the head or deliver both results inside this window.
-        await fulfillment(of: [drained], timeout: 0.25)
+        // Completing another follower must preserve the first scheduled timeout.
+        XCTAssertEqual(scheduled.count, 1)
+        let timeout = try XCTUnwrap(scheduled.first)
+        XCTAssertEqual(timeout.0, 0.4)
+        XCTAssertFalse(timeout.1.isCancelled)
+        timeout.1.perform()
+        await fulfillment(of: [drained], timeout: 2)
 
         XCTAssertEqual(events, [
             "cancel:\(stalledCommand):command",

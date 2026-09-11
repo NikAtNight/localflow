@@ -23,6 +23,7 @@ final class InjectionCoordinator {
 
     private let stallTimeout: TimeInterval
     private let injectionInterval: TimeInterval
+    private let scheduleStall: (TimeInterval, DispatchWorkItem) -> Void
     private let onInject: (String) -> Void
     private let onCancel: (Int, OperationKind) -> Void
     private let onProcessingCountChange: (Int) -> Void
@@ -37,12 +38,16 @@ final class InjectionCoordinator {
     init(
         stallTimeout: TimeInterval,
         injectionInterval: TimeInterval = 0.4,
+        scheduleStall: @escaping (TimeInterval, DispatchWorkItem) -> Void = { delay, work in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        },
         onInject: @escaping (String) -> Void,
         onCancel: @escaping (Int, OperationKind) -> Void,
         onProcessingCountChange: @escaping (Int) -> Void
     ) {
         self.stallTimeout = stallTimeout
         self.injectionInterval = injectionInterval
+        self.scheduleStall = scheduleStall
         self.onInject = onInject
         self.onCancel = onCancel
         self.onProcessingCountChange = onProcessingCountChange
@@ -131,7 +136,7 @@ final class InjectionCoordinator {
         }
         stalledHeadSequence = stalledSequence
         headStallTimeout = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + stallTimeout, execute: work)
+        scheduleStall(stallTimeout, work)
     }
 
     private func cancelHeadTimeout() {
