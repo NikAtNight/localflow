@@ -11,6 +11,14 @@ enum DiagLog {
     private static let path = (NSHomeDirectory() as NSString)
         .appendingPathComponent("Library/Logs/\(AppIdentity.current.logFilename)")
     static var fileURL: URL { URL(fileURLWithPath: path) }
+    private static var archiveFailed = false
+    private static let sessionEnvironment = environmentLine()
+    static func readHistory(maximumTraces: Int) throws -> DiagnosticsSnapshot {
+        try queue.sync {
+            guard !archiveFailed else { throw CocoaError(.fileWriteUnknown) }
+            return try DiagnosticsArchive.local.read(maximumTraces: maximumTraces)
+        }
+    }
     private static let privacyLogVersionKey = "diagLogPrivacyVersion"
     private static let currentPrivacyLogVersion = 1
     private static let stamp: DateFormatter = {
@@ -20,8 +28,17 @@ enum DiagLog {
     }()
 
     /// Trim on launch so the log can't grow without bound.
-    static func startSession() {
-        queue.async {
+    static func startSession(afterRecovery: () -> Void = {}) {
+        queue.sync {
+            if AppIdentity.current.isLocal {
+                do {
+                    try DiagnosticsArchive.local.recover(log: fileURL, recordings: DiagnosticsArchive.local.directory
+                        .deletingLastPathComponent().appendingPathComponent("DiagnosticRecordings"))
+                } catch {
+                    archiveFailed = true
+                    NSLog("LocalFlow: timing history recovery failed: %@", String(describing: type(of: error)))
+                }
+            }
             // Older builds logged transcript content. Purge that legacy file
             // once so upgrading also removes text already written to disk.
             let defaults = UserDefaults.standard
@@ -36,11 +53,12 @@ enum DiagLog {
             }
 
             let attrs = try? FileManager.default.attributesOfItem(atPath: path)
-            if let size = attrs?[.size] as? Int, size > 5_000_000 {
+            if let size = attrs?[.size] as? Int, size > 5_000_000, !archiveFailed {
                 try? FileManager.default.removeItem(atPath: path)
             }
             write("=== LocalFlow session start (pid \(ProcessInfo.processInfo.processIdentifier)) ===")
-            write(environmentLine())
+            write(sessionEnvironment)
+            if !archiveFailed { afterRecovery() }
         }
     }
 
@@ -63,6 +81,13 @@ enum DiagLog {
             guard let data = try? encoder.encode(event),
                   let json = String(data: data, encoding: .utf8) else { return }
             write("timing " + json)
+            if AppIdentity.current.isLocal {
+                do { try DiagnosticsArchive.local.record(event, environment: sessionEnvironment) }
+                catch {
+                    archiveFailed = true
+                    NSLog("LocalFlow: timing history write failed: %@", String(describing: type(of: error)))
+                }
+            }
         }
     }
 

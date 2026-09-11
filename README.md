@@ -155,9 +155,12 @@ retained dictation and model-loading timings, including cleanup fallback and
 injection events. Expand an entry for its event timeline and build metadata.
 The pane reads only structured metrics, never transcripts or raw log messages,
 and does not poll in the background. Dispatch timing measures the paste/typing
-event, not visible text insertion or clipboard restoration. Older entries may
-have been cleared by the existing 5 MB log limit on launch; the viewer reads at
-most the latest 8 MB if a long session exceeds that limit.
+event, not visible text insertion or clipboard restoration. Timing history is kept across updates with no automatic expiry in
+`~/Library/Application Support/LocalFlow Local/Diagnostics`. The pane loads the
+latest 200 traces; **Load older traces** reveals more. The debug log still rotates
+at 5 MB on launch. Existing timing logs and retained recording sidecars are
+imported automatically, without audio or transcripts. Previously deleted metrics
+can only be recovered where a timing sidecar still exists.
 
 For quick dev iteration you can also `swift run`, but then the TCC permissions
 below attach to your *terminal app* instead of LocalFlow — the .app bundle is

@@ -6,6 +6,7 @@ struct DiagnosticsPane: View {
     @State private var snapshot = DiagnosticsSnapshot()
     @State private var expanded: Set<UUID> = []
     @State private var refreshID = 0
+    @State private var maximumTraces = 200
     @State private var loading = false
     @State private var loadFailed = false
     @State private var refreshedAt: Date?
@@ -22,9 +23,9 @@ struct DiagnosticsPane: View {
                 }
                 Text("\(AppBuildInfo.current.versionLabel) · \(AppBuildInfo.current.revisionLabel)")
                 Text("Built \(AppBuildInfo.current.builtAt)")
-                Text("Retained timing events only. No transcripts or audio. Older entries are cleared when the log exceeds 5 MB at launch.")
+                Text("Timing history is kept across updates with no automatic expiry. No transcripts or audio.")
                 Text("Dispatch means the paste or typing event was sent. Visible text insertion is not measured; clipboard restoration is a separate event.")
-                Text("~/Library/Logs/\(AppIdentity.current.logFilename)")
+                Text("~/Library/Application Support/LocalFlow Local/Diagnostics")
                     .textSelection(.enabled)
                 if let refreshedAt {
                     Text("\(snapshot.traces.count) traces · Updated \(refreshedAt.formatted(date: .omitted, time: .standard))")
@@ -36,15 +37,15 @@ struct DiagnosticsPane: View {
 
             if loadFailed {
                 ContentUnavailableView("Couldn't read diagnostics", systemImage: "exclamationmark.triangle",
-                                       description: Text("Try Refresh to read the local log again."))
+                                       description: Text("Timing history could not be read or saved. Try Refresh; restart the app after resolving storage problems."))
             } else if snapshot.traces.isEmpty && !loading {
                 ContentUnavailableView("No timing events yet", systemImage: "waveform.path.ecg",
                                        description: Text("Complete a dictation, then click Refresh."))
             } else {
                 List {
-                    if snapshot.wasTruncated {
-                        Text("Showing the latest 8 MB. Earlier events from this session may be missing.")
-                            .foregroundStyle(.secondary)
+                    if snapshot.hasOlderTraces {
+                        Button("Load older traces") { maximumTraces += 200; refreshID += 1 }
+                            .disabled(loading)
                     }
                     if snapshot.ignoredTimingLines > 0 {
                         Text("Skipped \(snapshot.ignoredTimingLines) incomplete or unsupported timing records.")
@@ -83,10 +84,10 @@ struct DiagnosticsPane: View {
         loading = true
         loadFailed = false
         defer { loading = false }
-        let url = DiagLog.fileURL
+        let limit = maximumTraces
         do {
             let result = try await Task.detached(priority: .utility) {
-                try DiagnosticsSnapshot.read(from: url)
+                try DiagLog.readHistory(maximumTraces: limit)
             }.value
             guard !Task.isCancelled else { return }
             snapshot = result

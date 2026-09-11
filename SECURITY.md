@@ -61,7 +61,10 @@ Nowhere. There is no account, no server, and no telemetry.
   Nothing is sent to Apple's servers.
 - **Ollama**, if you enable it, is a server you run on your own machine.
 - **The diagnostic log** (`~/Library/Logs/LocalFlow-diag.log`) records timings
-  and error messages, never transcript text.
+  and error messages, never transcript text. Local builds also keep typed timing
+  history in `~/Library/Application Support/LocalFlow Local/Diagnostics`, with no
+  automatic expiry. It contains timing and build/device metadata, not transcripts
+  or audio, and remains separate from the expiring diagnostic recording archive.
 
 The only outbound network request LocalFlow makes on its own is the one-time
 Whisper model download from Hugging Face.

@@ -310,8 +310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        DiagLog.startSession()
-        DictationDiagnosticStore.shared.startMaintenance()
+        DiagLog.startSession { DictationDiagnosticStore.shared.startMaintenance() }
         buildSettings()
         buildStatusItem()
         requestPermissions()

@@ -90,13 +90,17 @@ local login guard. Evidence files below are local, temporary artifacts.
 
 Requested in the same September 8 testing session. Owner: LocalFlow maintainers.
 `SettingsPane.available` gates the new pane by AppIdentity. `DiagnosticsPane`
-loads `DiagLog.fileURL` on opening or Refresh, using a utility-priority task.
-`DiagnosticsSnapshot.read` bounds reads to 8 MB and rejects non-regular files;
+loads the permanent local `DiagnosticsArchive` on opening or Refresh, using a
+utility-priority task. It loads 200 traces initially and offers older pages.
+`DiagnosticsSnapshot.read` rejects non-regular files;
 its parser accepts typed events and allowlisted metadata. Each trace retains its
 recorded launch environment. A missing file is an empty state, other read errors
 are failures, and malformed/unsupported events are counted. Expand a trace for
-its full metadata-only report. No timer, transcript store, new log events, or
-clipboard operation was added.
+its full metadata-only report. Timing history has no automatic expiry and survives
+app replacement and debug-log rotation. Startup imports existing typed log records
+and recording timing sidecars before starting recording maintenance. Imports merge
+events by trace ID and ordinal and preserve their original build metadata. Audio
+and transcript files are excluded. Storage failures appear in the pane.
 
 `AppBuildInfo` is shared by the sidebar and Diagnostics header. Version, build
 number, revision, and dirty state come from the installed bundle. Packaging now
@@ -147,3 +151,24 @@ injected application. SettingsModelCorrectionTests checks stable correction
 identity across unrelated changes and removal. Production login registration,
 update installation, and installed UI interactions remain unverified in this
 refactor. See the [combined verification](dictation-recovery.md#architecture-implementation-verification).
+
+## Diagnostics retention follow-up, September 10
+
+Owner: LocalFlow maintainers. A local upgrade exposed that the pane depended on
+an operational log deleted above 5 MB at launch. `DiagnosticsArchive` now owns
+per-trace timing files, reused by live logging, startup recovery, and the pane.
+Initial migration completes before capture or recording maintenance starts.
+Subsequent launches reimport the debug log to recover interrupted archive writes.
+
+Validation: the full release suite passed 286 tests. After adding the oversized
+log regression, the focused diagnostics suite passed 22 tests. Archive checks
+cover restart retention, recovery after deleting an oversized debug log,
+deduplication, original build metadata, content filtering, pagination, file
+permissions, and storage errors. Independent review found no remaining blockers.
+
+Installed the rebuilt local app and verified its signature and model readiness
+(0.99 seconds). The installed app completed migration: 135 traces, 5,421 events,
+no duplicate ordinals, and no missing events from the retained recording
+sidecars. The archive occupied about 1.6 MB. Eight older traces were also recovered
+from a timing-only local extract; their unavailable environment metadata remains
+empty. The previous app bundle was preserved by the installer.

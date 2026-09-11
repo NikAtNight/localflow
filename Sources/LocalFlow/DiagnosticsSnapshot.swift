@@ -1,6 +1,6 @@
 import Foundation
 
-/// A bounded, content-free view of the existing timing log, not a second log store.
+/// A content-free view of typed timing records.
 struct DiagnosticsSnapshot: Sendable {
     struct Trace: Identifiable, Sendable {
         let id: UUID
@@ -76,6 +76,7 @@ struct DiagnosticsSnapshot: Sendable {
     var environment: [String: String] = [:]
     var ignoredTimingLines = 0
     var wasTruncated = false
+    var hasOlderTraces = false
 
     static func parse(_ text: String) -> Self {
         let decoder = JSONDecoder()
@@ -142,7 +143,7 @@ struct DiagnosticsSnapshot: Sendable {
         let end = try handle.seekToEnd()
         let offset = end > UInt64(maximumBytes) ? end - UInt64(maximumBytes) : 0
         try handle.seek(toOffset: offset)
-        var data = try handle.read(upToCount: maximumBytes) ?? Data()
+        var data = try handle.read(upToCount: min(maximumBytes, Int(end - offset))) ?? Data()
         if offset > 0 {
             if let newline = data.firstIndex(of: 10) { data = data.suffix(from: data.index(after: newline)) }
             else { data = Data() }
