@@ -370,7 +370,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
     case personalVoice = "Personal voice"
 
     static func available(for identity: AppIdentity) -> [Self] {
-        allCases.filter { identity.isLocal || ($0 != .diagnostics && $0 != .personalVoice) }
+        allCases.filter { identity.isLocal || $0 != .personalVoice }
     }
 
     var id: Self { self }
@@ -495,7 +495,7 @@ struct SettingsView: View {
         case .text: textPane
         case .history: historyPane
         case .diagnostics:
-            if AppIdentity.current.isLocal { DiagnosticsPane() }
+            DiagnosticsPane()
         case .personalVoice:
             if AppIdentity.current.isLocal { PersonalVoicePane(model: model) }
         }

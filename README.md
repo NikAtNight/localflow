@@ -149,18 +149,24 @@ Rebuilding does not commit, push, or publish anything. Local builds include the
 working tree, including uncommitted changes. A previous installed local bundle
 is retained in a hidden `/Applications/.localflow-local.*` directory on replacement.
 
-Settings shows the installed version in the sidebar. Local builds also show the
-source revision and have a **Diagnostics** pane. Open it or click Refresh to read
+Settings shows the installed version in the sidebar. Both production and local
+builds have a **Diagnostics** pane; local builds also show the source revision. Open it or click Refresh to read
 retained dictation and model-loading timings, including cleanup fallback and
 injection events. Expand an entry for its event timeline and build metadata.
 The pane reads only structured metrics, never transcripts or raw log messages,
 and does not poll in the background. Dispatch timing measures the paste/typing
-event, not visible text insertion or clipboard restoration. Timing history is kept across updates with no automatic expiry in
+event, not visible text insertion or clipboard restoration. Production timing history is retained for 30 days across updates in
+`~/Library/Application Support/LocalFlow/Diagnostics`, with no size cap. Expired
+traces are removed at launch, hourly while running, and before reading or exporting.
+Local builds retain history without automatic expiry in
 `~/Library/Application Support/LocalFlow Local/Diagnostics`. The pane loads the
 latest 200 traces; **Load older traces** reveals more. The debug log still rotates
 at 5 MB on launch. Existing timing logs and retained recording sidecars are
 imported automatically, without audio or transcripts. Previously deleted metrics
-can only be recovered where a timing sidecar still exists.
+can only be recovered where a timing sidecar still exists. **Export diagnostics**
+saves all retained traces as a text report for support, including their original
+build/device metadata and failure statuses. It excludes raw log messages, audio,
+transcripts, clipboard contents, and vocabulary. Nothing is uploaded automatically.
 
 For quick dev iteration you can also `swift run`, but then the TCC permissions
 below attach to your *terminal app* instead of LocalFlow — the .app bundle is

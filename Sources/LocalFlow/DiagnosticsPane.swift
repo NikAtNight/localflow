@@ -1,6 +1,7 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
-/// Local-only, on-demand diagnostics. It does no work while dictation is running
+/// On-demand diagnostics. It does no work while dictation is running
 /// unless the user explicitly opens or refreshes this pane.
 struct DiagnosticsPane: View {
     @State private var snapshot = DiagnosticsSnapshot()
@@ -8,6 +9,8 @@ struct DiagnosticsPane: View {
     @State private var refreshID = 0
     @State private var maximumTraces = 200
     @State private var loading = false
+    @State private var exporting = false
+    @State private var exportMessage: String?
     @State private var loadFailed = false
     @State private var refreshedAt: Date?
 
@@ -15,18 +18,23 @@ struct DiagnosticsPane: View {
         VStack(alignment: .leading, spacing: 12) {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("Local diagnostics").font(.headline)
+                    Text("Diagnostics").font(.headline)
                     Spacer()
                     if loading { ProgressView().controlSize(.small) }
+                    Button("Export diagnostics…") { Task { await export() } }
+                        .disabled(loading || exporting || loadFailed)
                     Button("Refresh", systemImage: "arrow.clockwise") { refreshID += 1 }
                         .disabled(loading)
                 }
                 Text("\(AppBuildInfo.current.versionLabel) · \(AppBuildInfo.current.revisionLabel)")
                 Text("Built \(AppBuildInfo.current.builtAt)")
-                Text("Timing history is kept across updates with no automatic expiry. No transcripts or audio.")
+                Text(AppIdentity.current.isLocal
+                     ? "Timing history is kept across updates with no automatic expiry. No transcripts or audio."
+                     : "Timing history is kept for 30 days across updates. No transcripts or audio. Nothing is uploaded automatically.")
                 Text("Dispatch means the paste or typing event was sent. Visible text insertion is not measured; clipboard restoration is a separate event.")
-                Text("~/Library/Application Support/LocalFlow Local/Diagnostics")
+                Text("~/Library/Application Support/\(AppIdentity.current.name)/Diagnostics")
                     .textSelection(.enabled)
+                if let exportMessage { Text(exportMessage) }
                 if let refreshedAt {
                     Text("\(snapshot.traces.count) traces · Updated \(refreshedAt.formatted(date: .omitted, time: .standard))")
                 }
@@ -79,8 +87,25 @@ struct DiagnosticsPane: View {
     }
 
     @MainActor
+    private func export() async {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "LocalFlow-diagnostics.txt"
+        panel.message = "Save timing and build/device metadata to share with support. No transcripts or audio are included."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        exporting = true
+        exportMessage = nil
+        defer { exporting = false }
+        do {
+            try await Task.detached(priority: .utility) { try DiagLog.exportHistory(to: url) }.value
+            exportMessage = "Diagnostics exported. Share the file with support when you're ready."
+        } catch {
+            exportMessage = "Couldn't export diagnostics. Check the destination and available disk space, then try again."
+        }
+    }
+
+    @MainActor
     private func refresh() async {
-        guard AppIdentity.current.isLocal else { return }
         loading = true
         loadFailed = false
         defer { loading = false }

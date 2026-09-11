@@ -25,12 +25,12 @@ final class DiagnosticsReaderTests: XCTestCase {
         XCTAssertThrowsError(try DiagnosticsSnapshot.read(from: url))
     }
 
-    func testDiagnosticsOnlyAvailableInLocalBuilds() {
+    func testDiagnosticsAvailableInBothChannels() {
         XCTAssertTrue(SettingsPane.available(for: AppIdentity(bundleIdentifier: AppIdentity.localID)).contains(.diagnostics))
         for id in [AppIdentity.productionID, nil] {
             let panes = SettingsPane.available(for: AppIdentity(bundleIdentifier: id))
-            XCTAssertFalse(panes.contains(.diagnostics))
-            XCTAssertEqual(panes.count, 6)
+            XCTAssertTrue(panes.contains(.diagnostics))
+            XCTAssertEqual(panes.count, 7)
         }
     }
 

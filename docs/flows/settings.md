@@ -172,3 +172,41 @@ no duplicate ordinals, and no missing events from the retained recording
 sidecars. The archive occupied about 1.6 MB. Eight older traces were also recovered
 from a timing-only local extract; their unavailable environment metadata remains
 empty. The previous app bundle was preserved by the installer.
+
+## Production diagnostics, September 10
+
+Owner: LocalFlow maintainers. The user requested production diagnostics, manual
+support export, and 30-day retention without a size cap, followed by a release.
+Local development history remains unlimited and uses its existing separate path.
+
+Both channels expose `DiagnosticsPane`. Bundled apps write typed timing events
+through `DiagLog` to the channel's `DiagnosticsArchive`; unbundled CLI/test runs
+retain their existing debug logging without writing the installed app's archive.
+Production rejects traces older than 30 days during recovery and writes. Cleanup
+runs at launch, hourly, and before reads/exports. The cutoff uses trace start time;
+unknown neighboring files and symlinks are not deleted. The operational debug log
+keeps its separate existing 5 MB launch cleanup policy.
+
+Export diagnostics opens a save panel and writes all retained traces, including
+pages not loaded in the pane, to a text report. Reports reparse the typed event
+and environment whitelist. They include original build/device metadata and failure
+statuses, and exclude raw log lines, audio, transcripts, clipboard contents, and
+vocabulary. No upload occurs. An existing destination is replaced only after the
+report has been written successfully; failures leave it intact and appear in the
+pane. Export runs off the main thread on the logging queue.
+
+PASS: `swift test`, 290 tests; `bash Tests/ReleaseContractTests.sh`, 63 checks;
+`python3 Tests/LocalAppIdleTests.py` and `python3 Tests/StartupReadinessTests.py`,
+10 checks; shell syntax and `git diff --check`. Evidence is under
+`/tmp/localflow-production-diagnostics-final-tests.log` and
+`/tmp/localflow-production-release-contract.log`. New archive tests cover the
+30-day boundary, migration without resurrecting expired records, separate channel
+policies, all-page export, privacy filtering, replacement, and failure reporting.
+Independent review found no blockers. The existing CI deadline test now controls
+stall scheduling while retaining a separate real-dispatcher integration test.
+
+NOT RUN locally: interactive save-panel acceptance and signed production release
+installation. Publication is verified through the release workflow after commit.
+PASS: final `swift test -c release`, 290 tests, in
+`/tmp/localflow-production-diagnostics-release-tests.log`. `swift package resolve`
+completed without changing the lockfile.

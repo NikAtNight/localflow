@@ -11,12 +11,20 @@ enum DiagLog {
     private static let path = (NSHomeDirectory() as NSString)
         .appendingPathComponent("Library/Logs/\(AppIdentity.current.logFilename)")
     static var fileURL: URL { URL(fileURLWithPath: path) }
+    private static let archivesHistory = Bundle.main.bundleIdentifier == AppIdentity.current.bundleIdentifier
     private static var archiveFailed = false
+    private static var maintenance: DispatchSourceTimer?
+    static func exportHistory(to url: URL) throws {
+        try queue.sync {
+            guard !archiveFailed else { throw CocoaError(.fileWriteUnknown) }
+            try DiagnosticsArchive.current.export(to: url)
+        }
+    }
     private static let sessionEnvironment = environmentLine()
     static func readHistory(maximumTraces: Int) throws -> DiagnosticsSnapshot {
         try queue.sync {
             guard !archiveFailed else { throw CocoaError(.fileWriteUnknown) }
-            return try DiagnosticsArchive.local.read(maximumTraces: maximumTraces)
+            return try DiagnosticsArchive.current.read(maximumTraces: maximumTraces)
         }
     }
     private static let privacyLogVersionKey = "diagLogPrivacyVersion"
@@ -30,9 +38,9 @@ enum DiagLog {
     /// Trim on launch so the log can't grow without bound.
     static func startSession(afterRecovery: () -> Void = {}) {
         queue.sync {
-            if AppIdentity.current.isLocal {
+            if archivesHistory {
                 do {
-                    try DiagnosticsArchive.local.recover(log: fileURL, recordings: DiagnosticsArchive.local.directory
+                    try DiagnosticsArchive.current.recover(log: fileURL, recordings: DiagnosticsArchive.current.directory
                         .deletingLastPathComponent().appendingPathComponent("DiagnosticRecordings"))
                 } catch {
                     archiveFailed = true
@@ -59,6 +67,16 @@ enum DiagLog {
             write("=== LocalFlow session start (pid \(ProcessInfo.processInfo.processIdentifier)) ===")
             write(sessionEnvironment)
             if !archiveFailed { afterRecovery() }
+            if archivesHistory, maintenance == nil, DiagnosticsArchive.current.retentionDays != nil {
+                let timer = DispatchSource.makeTimerSource(queue: queue)
+                timer.schedule(deadline: .now() + 3600, repeating: 3600)
+                timer.setEventHandler {
+                    do { try DiagnosticsArchive.current.prune() }
+                    catch { archiveFailed = true }
+                }
+                maintenance = timer
+                timer.resume()
+            }
         }
     }
 
@@ -81,8 +99,8 @@ enum DiagLog {
             guard let data = try? encoder.encode(event),
                   let json = String(data: data, encoding: .utf8) else { return }
             write("timing " + json)
-            if AppIdentity.current.isLocal {
-                do { try DiagnosticsArchive.local.record(event, environment: sessionEnvironment) }
+            if archivesHistory {
+                do { try DiagnosticsArchive.current.record(event, environment: sessionEnvironment) }
                 catch {
                     archiveFailed = true
                     NSLog("LocalFlow: timing history write failed: %@", String(describing: type(of: error)))

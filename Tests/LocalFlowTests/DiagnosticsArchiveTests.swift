@@ -86,6 +86,62 @@ final class DiagnosticsArchiveTests: XCTestCase {
         XCTAssertEqual(try restarted.read().traces.count, 1)
     }
 
+    func testProductionRetentionBoundaryAndRecoveryDoNotResurrectExpiredTraces() throws {
+        let now = Date(timeIntervalSince1970: 4_000_000)
+        let cutoff = now.timeIntervalSince1970 - 30 * 86_400
+        let directory = root.appendingPathComponent("history")
+        let unlimited = DiagnosticsArchive(directory: directory)
+        for time in [cutoff - 1, cutoff, cutoff + 1] {
+            try unlimited.record(event(startedAt: time), environment: "timing_environment {}")
+        }
+        let archive = DiagnosticsArchive(directory: directory, retentionDays: 30)
+        let unrelated = directory.appendingPathComponent("notes.log")
+        try Data("keep me".utf8).write(to: unrelated)
+        let old = event(startedAt: cutoff - 1)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let log = root.appendingPathComponent("debug.log")
+        try Data(("0 0 timing " + String(decoding: encoder.encode(old), as: UTF8.self)).utf8).write(to: log)
+        try archive.recover(log: log, recordings: root.appendingPathComponent("missing"), now: now)
+        try archive.record(old, environment: "timing_environment {}", now: now)
+        XCTAssertEqual(try archive.read(now: now).traces.map { $0.startedAt.timeIntervalSince1970 }, [cutoff + 1, cutoff])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelated.path))
+        try archive.prune(now: now.addingTimeInterval(2))
+        XCTAssertTrue(try archive.read(now: now.addingTimeInterval(2)).traces.isEmpty)
+    }
+
+    func testChannelPoliciesKeepLocalHistoryUnlimitedAndSeparate() {
+        let production = DiagnosticsArchive.forIdentity(AppIdentity(bundleIdentifier: AppIdentity.productionID))
+        let local = DiagnosticsArchive.forIdentity(AppIdentity(bundleIdentifier: AppIdentity.localID))
+        XCTAssertEqual(production.retentionDays, 30)
+        XCTAssertNil(local.retentionDays)
+        XCTAssertNotEqual(production.directory, local.directory)
+    }
+
+    func testExportIncludesAllPagesAndOnlyTypedRetainedMetadata() throws {
+        let archive = DiagnosticsArchive(directory: root.appendingPathComponent("history"))
+        for time in 1...201 {
+            try archive.record(event(startedAt: Double(time)), environment: "timing_environment {\"buildCommit\":\"original-build\",\"transcript\":\"private-fixture\"}")
+        }
+        let files = try FileManager.default.contentsOfDirectory(at: archive.directory, includingPropertiesForKeys: nil)
+        let handle = try FileHandle(forWritingTo: XCTUnwrap(files.first))
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data("\n0 0 raw private-fixture\n".utf8))
+        try handle.close()
+        let destination = root.appendingPathComponent("export.txt")
+        try Data("old export".utf8).write(to: destination)
+        try archive.export(to: destination)
+        let text = try String(contentsOf: destination, encoding: .utf8)
+        XCTAssertEqual(text.components(separatedBy: "Trace: ").count - 1, 201)
+        XCTAssertTrue(text.contains("original-build"))
+        XCTAssertFalse(text.contains("private-fixture"))
+        XCTAssertFalse(text.contains("old export"))
+        let production = DiagnosticsArchive(directory: archive.directory, retentionDays: 30)
+        try production.export(to: destination, now: Date(timeIntervalSince1970: 4_000_000))
+        XCTAssertFalse(try String(contentsOf: destination, encoding: .utf8).contains("Trace: "))
+        XCTAssertThrowsError(try archive.export(to: root.appendingPathComponent("missing/export.txt")))
+    }
+
     func testStorageFailureIsReported() throws {
         let file = root.appendingPathComponent("not-a-directory")
         try Data().write(to: file)
