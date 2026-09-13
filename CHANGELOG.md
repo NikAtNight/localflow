@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/NikAtNight/localflow/compare/v1.6.0...v1.6.1) (2026-09-13)
+
+
+### Fixes
+
+* reduce repeated decoding of near-silent dictations ([5ddcfba](https://github.com/NikAtNight/localflow/commit/5ddcfba8922499201eb8fc8306ca0b9f338e5bee))
+
 ## [1.6.0](https://github.com/NikAtNight/localflow/compare/v1.5.0...v1.6.0) (2026-09-11)
 
 
