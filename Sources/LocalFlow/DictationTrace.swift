@@ -42,6 +42,7 @@ final class DictationTrace: @unchecked Sendable {
         case ollamaPromptTokens, ollamaOutputTokens
         case thermalState, systemLoad1m
         case voicedSeconds, voicedDBFS, lowEnergy, rawCharacters, resultCount, segmentCount, hallucinationFiltered
+        case temperatureFallbackLimit, decodingFallbacks
     }
 
     /// Host context for slow inference. Load is the system's one-minute load

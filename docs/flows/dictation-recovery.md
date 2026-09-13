@@ -38,6 +38,62 @@ manual retries never create personal voice clips. Quitting loses retry audio.
 Optional [diagnostic recordings](diagnostic-recordings.md) keep independent disk
 copies and do not restore the retry queue.
 
+## Near-silent recording latency
+
+On September 13, 2026, the user reported slow results after release, especially
+when holding the trigger without speaking. The local timing log showed two
+near-silent captures taking 3.54 and 5.66 seconds, each with two Whisper calls.
+Microphone handoff took milliseconds. Separately, one spoken dictation spent
+1.31 seconds in recognition and 2.72 seconds in Ollama cleanup. Across that day's
+95 completed sessions, median release-to-result time was 1.29 seconds.
+
+Low-energy sample decoding now uses temperature zero without WhisperKit's five
+temperature fallback attempts. Normal-energy decoding keeps its previous options.
+An unexplained empty result still gets the pipeline's existing full-audio retry.
+A canonical hallucination already filtered from low-energy audio instead returns
+`TranscriberError.noSpeech`, which completes full dictation or command handling
+as heard-nothing without another full attempt. Chunk/tail failures still allow
+full-recording recovery so a partial decision cannot reject the entire utterance.
+
+After a committed speech chunk, only an empty or all-zero tail skips recognition.
+Nonzero quiet tails remain eligible even when their energy falls below the
+full-recording admission threshold. This protects softly spoken final words.
+Original recordings remain retained before these decisions. Replay reports
+runtime no-speech outcomes per run, while its initial energy gate still rejects
+unadmitted input before loading the model.
+
+Verification used base `082025a` plus the latency fix on macOS 26.6.2, arm64,
+Swift 6.3.3. Diff evidence: `/tmp/localflow-silence-fix.diff`.
+
+- PASS: `swift test -c release --disable-automatic-resolution`, 293 tests.
+  Evidence: `/tmp/localflow-silence-release-tests.log`.
+- PASS: `DictationAudioPreparationTests` covers digital silence after committed
+  speech, nonzero final words below -50 dBFS, filtered non-speech without retry
+  or cleanup, and the existing quiet-empty recovery path. The new silent-tail
+  test failed on the old behavior in `/tmp/localflow-silence-tail-red.log`.
+- PASS: independent read-only review and follow-up review of the quiet-tail fix,
+  cancellation, gate release, command handling, and diagnostic outcomes.
+- PASS: two saved ambient candidates replayed through the cached 626 MB Whisper
+  model improved from 4.27-5.00 seconds and 4.44 seconds to 1.36-1.39 seconds.
+  They still used two pipeline calls, each with no temperature fallback.
+  One baseline run of the second candidate produced variable text instead.
+- PASS: a quiet speech candidate reproduced its 62-character baseline exactly
+  in both runs, at 0.86-0.90 seconds. A separate recording known to need recovery
+  still produced text after an initially empty result.
+- LIMIT: another ambiguous low-energy clip changed from variable short outputs
+  to empty. Its archived output matched the vocabulary prompt prefix, but it
+  has no human-verified transcript. These checks do not prove accuracy for all
+  quiet speech. Reducing temperature fallback is an accuracy/latency tradeoff.
+- Replay evidence is private under `/tmp/localflow-silence-baseline-<traceID>`
+  and `/tmp/localflow-silence-candidate-<traceID>`, with `.out` and `.log` suffixes.
+  Each command used the app bundle's `--replay <original.wav> --runs 2
+  --no-cleanup --whisper-model openai_whisper-large-v3-v20240930_626MB`.
+
+The fixed energy floor can still admit background noise and prevent incremental
+pause detection. This change does not add a speech classifier or change those
+thresholds. Cleanup remains enabled and can add variable latency. Live microphone
+behavior and human-verified quiet-speech accuracy still need user validation.
+
 The pipeline and injection coordinator retain their distinct stall rules.
 Injection-side cancellation removes the correlated dictation and cancels its
 pipeline work; late outcomes cannot write history, refill retry audio, or inject

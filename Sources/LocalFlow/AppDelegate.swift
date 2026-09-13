@@ -1020,6 +1020,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         corrections: context.corrections
                     )
                     self.runCommand(instruction: instruction, seq: seq, hudGeneration: hudGeneration)
+                } catch Transcriber.TranscriberError.noSpeech {
+                    guard self.dictationDelivery.isCommandPending(seq) else { return }
+                    self.completeCommand(seq, with: .skip)
+                    self.reportHeardNothing()
+                    self.dismissHud(hudGeneration)
                 } catch {
                     guard self.dictationDelivery.isCommandPending(seq) else { return }
                     self.completeCommand(seq, with: .skip)

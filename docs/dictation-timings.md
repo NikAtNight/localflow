@@ -53,6 +53,10 @@ Sample-based inference events also record the exact submitted sample count,
 voiced seconds, finite voiced dBFS, and the low-energy flag. Finish events report
 raw character count, result-container count, decoded segment count, and whether
 canonical-phrase filtering removed the output. These counts contain no text.
+`temperatureFallbackLimit` records the decoder's allowed temperature retries;
+`decodingFallbacks` records the sum WhisperKit reported for that inference call.
+These are separate from the pipeline's `fullRetry` event. Expected non-speech
+filtering reports `transcriptionFinished` with `insufficientVoice`.
 Zero returned characters identify an empty decoder result, but do not expose
 Whisper's internal no-speech decision for discarded segments.
 

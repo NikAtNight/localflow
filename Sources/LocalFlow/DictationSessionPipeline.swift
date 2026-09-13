@@ -380,7 +380,9 @@ final class DictationSessionPipeline {
         session.activeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else { return }
             do {
-                let tailText = request.samples.isEmpty
+                // Quiet nonzero tails can contain final words below the admission
+                // threshold. Only skip digital silence, including an empty tail.
+                let tailText = request.samples.allSatisfy({ $0 == 0 })
                     ? "" : try await runTranscription(request, session: session)
                 guard isCurrent(session) else { return }
                 session.activeTask = nil
@@ -431,6 +433,10 @@ final class DictationSessionPipeline {
                 } else {
                     finalize(session, transcript: text)
                 }
+            } catch Transcriber.TranscriberError.noSpeech {
+                guard isCurrent(session) else { return }
+                session.activeTask = nil
+                complete(session, with: .insufficientVoice(generation: session.generation))
             } catch {
                 guard isCurrent(session) else { return }
                 session.activeTask = nil
@@ -575,6 +581,12 @@ final class DictationSessionPipeline {
                                               segment: request.segment))
             session.trace?.record(.transcriptionFinished, status: Task.isCancelled ? .cancelled : (text.isEmpty ? .empty : .success))
             return text
+        } catch Transcriber.TranscriberError.noSpeech {
+            session.diagnostics?.record(.init(stage: "transcriptionResult", text: "",
+                                              status: Task.isCancelled ? "cancelled" : "insufficientVoice",
+                                              segment: request.segment))
+            session.trace?.record(.transcriptionFinished, status: Task.isCancelled ? .cancelled : .insufficientVoice)
+            throw Transcriber.TranscriberError.noSpeech
         } catch {
             session.diagnostics?.record(.init(stage: "transcriptionResult", text: error.localizedDescription,
                                               status: Task.isCancelled ? "cancelled" : "failed", segment: request.segment))

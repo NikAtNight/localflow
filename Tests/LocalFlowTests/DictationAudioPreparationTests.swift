@@ -171,6 +171,77 @@ final class DictationAudioPreparationTests: XCTestCase {
         XCTAssertEqual(segments, [.incrementalChunk(index: 0)])
     }
 
+    func testSilentTailPreservesCommittedWordsWithoutAnotherDecoderPass() async {
+        let speech = audio(0.2, seconds: 1)
+        let silence = audio(0, seconds: 8)
+        var segments: [DictationTranscriptionSegment] = []
+        let chunkCompleted = expectation(description: "speech chunk recognized")
+        let delivered = expectation(description: "silent tail delivered")
+        let pipeline = DictationSessionPipeline(transcribe: { request in
+            segments.append(request.segment)
+            if case .incrementalChunk = request.segment {
+                chunkCompleted.fulfill()
+                return "Keep every spoken word."
+            }
+            XCTFail("A tail with no voiced frames must not reach the decoder")
+            return ""
+        }, cleanup: { request in .init(text: request.text, succeeded: true) }, onOutcome: { outcome in
+            XCTAssertEqual(outcome, .finalTranscript(generation: 1, text: "Keep every spoken word."))
+            delivered.fulfill()
+        })
+        pipeline.begin(generation: 1, context: context)
+        pipeline.processIncrementalChunk(generation: 1, samples: speech, pauseSecondsAfterChunk: 0,
+                                         sourceEndIndex: speech.count)
+        await fulfillment(of: [chunkCompleted], timeout: 2)
+        pipeline.release(generation: 1, fullSamples: speech + silence)
+        await fulfillment(of: [delivered], timeout: 2)
+        XCTAssertEqual(segments, [.incrementalChunk(index: 0)])
+    }
+
+    func testQuietNonzeroTailStillDecodesEveryFinalWord() async {
+        let speech = audio(0.2, seconds: 1)
+        let quietEnding = audio(0.0025, seconds: 1)
+        XCTAssertEqual(AudioRecorder.voicedMetrics(of: quietEnding).voicedSeconds, 0)
+        var segments: [DictationTranscriptionSegment] = []
+        let delivered = expectation(description: "quiet final words delivered")
+        let pipeline = DictationSessionPipeline(transcribe: { request in
+            segments.append(request.segment)
+            if case .incrementalChunk = request.segment { return "Keep" }
+            XCTAssertEqual(request.samples, quietEnding)
+            return "all these quiet final words."
+        }, cleanup: { request in .init(text: request.text, succeeded: true) }, onOutcome: { outcome in
+            XCTAssertEqual(outcome, .finalTranscript(generation: 1, text: "Keep all these quiet final words."))
+            delivered.fulfill()
+        })
+        pipeline.begin(generation: 1, context: context)
+        pipeline.processIncrementalChunk(generation: 1, samples: speech, pauseSecondsAfterChunk: 0,
+                                         sourceEndIndex: speech.count)
+        pipeline.release(generation: 1, fullSamples: speech + quietEnding)
+        await fulfillment(of: [delivered], timeout: 2)
+        XCTAssertEqual(segments, [.incrementalChunk(index: 0), .releaseTail])
+    }
+
+    func testFilteredNonSpeechCompletesWithoutRetryOrCleanup() async {
+        var attempts = 0
+        let delivered = expectation(description: "non-speech rejected")
+        let pipeline = DictationSessionPipeline(transcribe: { _ in
+            attempts += 1
+            throw Transcriber.TranscriberError.noSpeech
+        }, cleanup: { request in
+            XCTFail("Non-speech must not reach cleanup")
+            return .init(text: request.text, succeeded: true)
+        }, onOutcome: { outcome in
+            XCTAssertEqual(outcome, .insufficientVoice(generation: 1))
+            delivered.fulfill()
+        })
+        let cleanupContext = DictationSessionContext(cleanupEnabled: true, styleProfile: .general,
+                                                     corrections: [], snippets: [])
+        pipeline.begin(generation: 1, context: cleanupContext)
+        pipeline.release(generation: 1, fullSamples: audio(0.005, seconds: 2))
+        await fulfillment(of: [delivered], timeout: 2)
+        XCTAssertEqual(attempts, 1)
+    }
+
     func testRejectedReleaseRetainsAudioAndCancelledArchiveStatus() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

@@ -33,10 +33,12 @@ actor TranscriptionGate {
 actor Transcriber {
     enum TranscriberError: Error, LocalizedError {
         case notLoaded
+        case noSpeech
 
         var errorDescription: String? {
             switch self {
             case .notLoaded: return "Whisper model is not loaded yet."
+            case .noSpeech: return "No speech was recognized in this recording."
             }
         }
     }
@@ -182,9 +184,13 @@ actor Transcriber {
         vocabularyTokens = tokens.isEmpty ? nil : Array(tokens.prefix(96))
     }
 
-    private func currentDecodingOptions() -> DecodingOptions {
+    private func currentDecodingOptions(lowEnergy: Bool = false) -> DecodingOptions {
         var options = Self.decodingOptions
         options.promptTokens = vocabularyTokens
+        // Near-silent audio can spend six decoder attempts inventing text.
+        // Keep the deterministic pass; the pipeline still recovers an unknown
+        // empty result using its original audio.
+        if lowEnergy { options.temperatureFallbackCount = 0 }
         return options
     }
 
@@ -225,7 +231,7 @@ actor Transcriber {
 
     /// `lowEnergy` marks audio whose RMS was near silence: Whisper reliably
     /// invents filler for such clips, so canonical hallucination phrases are
-    /// treated as an empty transcript. Never applied to normal-energy audio —
+    /// reported as no speech. Never applied to normal-energy audio —
     /// people legitimately dictate "thank you".
     func transcribe(
         samples: [Float],
@@ -243,7 +249,7 @@ actor Transcriber {
             await transcriptionGate.release()
             throw TranscriberError.notLoaded
         }
-        let options = currentDecodingOptions()
+        let options = currentDecodingOptions(lowEnergy: lowEnergy)
         let diagnostic = DictationDiagnosticStore.Recording.current
         let audioFile = "inference-\(UUID().uuidString).wav"
         diagnostic?.saveAudio(samples, named: audioFile)
@@ -262,6 +268,7 @@ actor Transcriber {
                     inputFields[.voicedDBFS] = Double(voice.voicedDBFS)
                 }
                 inputFields[.lowEnergy] = lowEnergy ? 1 : 0
+                inputFields[.temperatureFallbackLimit] = Double(options.temperatureFallbackCount)
                 trace.record(.inferenceStarted, fields: inputFields)
             }
             results = try await whisperKit.transcribe(
@@ -287,6 +294,7 @@ actor Transcriber {
                 outputFields[.resultCount] = Double(results.count)
                 outputFields[.segmentCount] = Double(results.reduce(0) { $0 + $1.segments.count })
                 outputFields[.hallucinationFiltered] = isHallucination ? 1 : 0
+                outputFields[.decodingFallbacks] = results.reduce(0) { $0 + $1.timings.totalDecodingFallbacks }
                 trace.record(.inferenceFinished, at: inferenceFinishedAt,
                              status: Task.isCancelled ? .cancelled : .success, fields: outputFields)
             }
@@ -306,7 +314,9 @@ actor Transcriber {
             DiagLog.log("[diag] empty transcript: rawChars=%d results=%d lowEnergy=%d",
                   raw.count, results.count, lowEnergy ? 1 : 0)
         }
-        if isHallucination { return "" }
+        // Preserve the distinction from an unexplained empty recognition result.
+        // Retrying a result we already filtered as non-speech repeats the delay.
+        if isHallucination { throw TranscriberError.noSpeech }
         return text
     }
 

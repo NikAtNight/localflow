@@ -204,7 +204,7 @@ enum DictationReplay {
                     print(String(decoding: data, as: UTF8.self))
                     writeStderr("replay run \(generation)/\(options.runs): complete\n")
                 case .insufficientVoice:
-                    throw ReplayError.insufficientVoice
+                    writeStderr("replay run \(generation)/\(options.runs): no speech recognized\n")
                 case .emptyTranscript:
                     writeStderr("replay run \(generation)/\(options.runs): empty transcript\n")
                 case .failed(_, let message):
