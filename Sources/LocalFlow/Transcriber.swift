@@ -55,6 +55,15 @@ actor Transcriber {
 
     var isLoaded: Bool { whisperKit != nil }
 
+    /// Builds a ready pipeline for a model name. Tests swap this out to
+    /// control load timing without CoreML or network access.
+    typealias PipelineLoader = (_ model: String, _ trace: DictationTrace) async throws -> WhisperKit
+    private let loadPipeline: PipelineLoader
+
+    init(loadPipeline: @escaping PipelineLoader = Transcriber.loadWhisperKit) {
+        self.loadPipeline = loadPipeline
+    }
+
     /// Where models are downloaded to. ~/Documents (WhisperKit's default) is
     /// iCloud-synced on many Macs, and "Optimize Mac Storage" can evict the
     /// 500 MB model files to dataless stubs — mysterious load failures.
@@ -86,12 +95,14 @@ actor Transcriber {
     func load(model: String) async throws {
         let trace = DictationTrace(source: .modelLoad)
         trace.record(.modelLoadRequested, model: model)
+        // Bump before the warm check: switching back to the loaded model
+        // must still make any slower in-flight load stale.
+        loadGeneration += 1
+        let generation = loadGeneration
         if loadedModel == model, whisperKit != nil {
             trace.record(.modelLoadFinished, status: .warm, model: model)
             return
         }
-        loadGeneration += 1
-        let generation = loadGeneration
 
         trace.record(.modelLoadWaitStarted)
         await loadGate.acquire()
@@ -104,32 +115,9 @@ actor Transcriber {
             return
         }
 
-        // With only `model` and `downloadBase`, WhisperKit 0.18 downloads the
-        // model but leaves CoreML unloaded until the first transcription.
-        // Load now so the app's ready state is truthful and the first hotkey
-        // release does not pay model initialization latency.
-        let cachedFolder = Self.cachedModelFolder(for: model)
-        trace.record(.modelCacheChecked, fields: [.cachePresent: cachedFolder == nil ? 0 : 1])
         let pipe: WhisperKit
         do {
-            if let cachedFolder {
-                do {
-                    pipe = try await Self.measuredLoad(Self.config(modelFolder: cachedFolder), trace: trace)
-                } catch {
-                    trace.record(.modelLoadFallback, status: .fallback)
-                    // Directory presence is only a fast completeness signal. If
-                    // CoreML or tokenizer loading finds corruption, let the Hub
-                    // path verify/repair the cache instead of stranding startup.
-                    DiagLog.log(
-                        "cached model %@ failed to load (%@) — resolving through model registry",
-                        model,
-                        error.localizedDescription
-                    )
-                    pipe = try await Self.measuredLoad(Self.config(model: model), trace: trace)
-                }
-            } else {
-                pipe = try await Self.measuredLoad(Self.config(model: model), trace: trace)
-            }
+            pipe = try await loadPipeline(model, trace)
         } catch {
             await loadGate.release()
             trace.record(.modelLoadFinished, status: error is CancellationError ? .cancelled : .failed)
@@ -147,6 +135,32 @@ actor Transcriber {
         loadedModel = model
         refreshVocabularyTokens()
         trace.record(.modelLoadFinished, status: .success)
+    }
+
+    /// With only `model` and `downloadBase`, WhisperKit 0.18 downloads the
+    /// model but leaves CoreML unloaded until the first transcription.
+    /// Load now so the app's ready state is truthful and the first hotkey
+    /// release does not pay model initialization latency.
+    private static func loadWhisperKit(model: String, trace: DictationTrace) async throws -> WhisperKit {
+        let cachedFolder = cachedModelFolder(for: model)
+        trace.record(.modelCacheChecked, fields: [.cachePresent: cachedFolder == nil ? 0 : 1])
+        guard let cachedFolder else {
+            return try await measuredLoad(config(model: model), trace: trace)
+        }
+        do {
+            return try await measuredLoad(config(modelFolder: cachedFolder), trace: trace)
+        } catch {
+            trace.record(.modelLoadFallback, status: .fallback)
+            // Directory presence is only a fast completeness signal. If
+            // CoreML or tokenizer loading finds corruption, let the Hub
+            // path verify/repair the cache instead of stranding startup.
+            DiagLog.log(
+                "cached model %@ failed to load (%@) — resolving through model registry",
+                model,
+                error.localizedDescription
+            )
+            return try await measuredLoad(config(model: model), trace: trace)
+        }
     }
 
     private static func measuredLoad(_ config: WhisperKitConfig, trace: DictationTrace) async throws -> WhisperKit {

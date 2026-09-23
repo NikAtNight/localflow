@@ -1,8 +1,10 @@
 import XCTest
+import WhisperKit
 @testable import LocalFlow
 
 /// Pure-text logic that recently misfired: Whisper marker stripping and the
 /// canonical-hallucination match used to drop invented filler for silent audio.
+/// Also model switching, with a stub pipeline loader.
 final class TranscriberTests: XCTestCase {
 
     func testInferenceGateSerializesWaitersInFIFOOrder() async {
@@ -39,6 +41,32 @@ final class TranscriberTests: XCTestCase {
             await Task.yield()
         }
         return false
+    }
+
+    // MARK: load
+
+    func testSwitchingBackToLoadedModelWinsOverSlowerPendingLoad() async throws {
+        let holdB = TranscriptionGate()
+        await holdB.acquire()
+        let bStarted = expectation(description: "B load started")
+        let transcriber = Transcriber(loadPipeline: { model, _ in
+            if model == "B" {
+                bStarted.fulfill()
+                await holdB.acquire()
+            }
+            // An empty pipeline: no model files, downloads, or CoreML.
+            return try await WhisperKit(WhisperKitConfig(load: false, download: false))
+        })
+        try await transcriber.load(model: "A")
+
+        let loadB = Task { try await transcriber.load(model: "B") }
+        await fulfillment(of: [bStarted], timeout: 1)
+        try await transcriber.load(model: "A")
+        await holdB.release()
+        try await loadB.value
+
+        let loaded = await transcriber.loadedModel
+        XCTAssertEqual(loaded, "A")
     }
 
     // MARK: stripSpecialTokens
