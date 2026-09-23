@@ -45,6 +45,13 @@ enum TextInjector {
     private static var ourChangeCount = -1
     private static var restoreGeneration = 0
 
+    // Test seams. Tests swap in a private pasteboard and a fake target app
+    // so they never touch the user's clipboard or post real key events.
+    static var pasteboard = NSPasteboard.general
+    static var postKeystroke: (CGKeyCode, CGEventFlags) -> Bool = postHIDKeystroke
+    static var isSecureInputEnabled: () -> Bool = { IsSecureEventInputEnabled() }
+    static var restoreDelay: TimeInterval = 2.5
+
     /// `completion` runs on the main queue and reports event dispatch and
     /// clipboard disturbance. Neither confirms insertion into the target app.
     static func inject(_ text: String, onDispatch: (() -> Void)? = nil, completion: ((InjectionResult) -> Void)? = nil) {
@@ -54,13 +61,13 @@ enum TextInjector {
             return
         }
 
-        if IsSecureEventInputEnabled() {
+        if isSecureInputEnabled() {
             // Password field or similar: avoid the clipboard entirely.
             typeString(text, trace: trace, onDispatch: onDispatch, completion: completion)
             return
         }
 
-        let pasteboard = NSPasteboard.general
+        let pasteboard = pasteboard
 
         // Two dictations can land within one restore window (recording while
         // the previous one transcribes is allowed). Keep the snapshot from
@@ -82,7 +89,7 @@ enum TextInjector {
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
         ourChangeCount = pasteboard.changeCount
-        guard postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_V), flags: .maskCommand) else {
+        guard postKeystroke(CGKeyCode(kVK_ANSI_V), .maskCommand) else {
             trace?.record(.pasteDispatched, status: .failed)
             // No Cmd-V went out — put the user's clipboard back right away.
             if let saved = savedItems {
@@ -99,7 +106,12 @@ enum TextInjector {
             trace?.record(.clipboardWindowResolved, status: undisturbed ? .unchangedClipboard : .changedClipboard)
             completion?(undisturbed ? .dispatched : .clipboardChanged)
         }
+        scheduleRestore(on: pasteboard)
+    }
 
+    /// Schedules the restore for the current generation. Callers own the
+    /// save state (`savedItems`, `pendingCompletion`, `ourChangeCount`).
+    private static func scheduleRestore(on pasteboard: NSPasteboard) {
         // Give the frontmost app time to service the paste before restoring —
         // slow apps can take well over a second, and restoring too early
         // pastes the user's old clipboard instead of the dictation.
@@ -122,7 +134,7 @@ enum TextInjector {
             done?(undisturbed)
         }
         restoreWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + restoreDelay, execute: work)
     }
 
     /// Reads the frontmost app's current selection by synthesizing ⌘C, then
@@ -134,26 +146,37 @@ enum TextInjector {
     /// the later `inject` snapshot it as "the user's clipboard" and hand it
     /// back to them in place of what they actually had.
     static func copySelection(completion: @escaping (String?) -> Void) {
-        guard !IsSecureEventInputEnabled() else {
+        guard !isSecureInputEnabled() else {
             completion(nil)
             return
         }
-        let pasteboard = NSPasteboard.general
+        let pasteboard = pasteboard
         let saved = snapshot(of: pasteboard)
         let before = pasteboard.changeCount
-        guard postKeystroke(virtualKey: CGKeyCode(kVK_ANSI_C), flags: .maskCommand) else {
+        // Still holding a dictation paste whose restore is pending: the
+        // pasteboard has our text, not the user's. Hold that restore until
+        // the round trip is done, or it reads the copy as the user's and
+        // drops their clipboard (or gets read back as the "selection").
+        let heldGeneration = restoreWork != nil && before == ourChangeCount ? restoreGeneration : nil
+        guard postKeystroke(CGKeyCode(kVK_ANSI_C), .maskCommand) else {
             completion(nil)
             return
+        }
+        if heldGeneration != nil {
+            restoreWork?.cancel()
+            restoreWork = nil
         }
         // The frontmost app services the copy asynchronously; poll briefly
         // rather than guessing one delay that is either slow or too short.
-        pollForCopy(pasteboard: pasteboard, before: before, saved: saved, attempt: 0, completion: completion)
+        pollForCopy(pasteboard: pasteboard, before: before, saved: saved, heldGeneration: heldGeneration,
+                    attempt: 0, completion: completion)
     }
 
     private static func pollForCopy(
         pasteboard: NSPasteboard,
         before: Int,
         saved: [NSPasteboardItem],
+        heldGeneration: Int?,
         attempt: Int,
         completion: @escaping (String?) -> Void
     ) {
@@ -161,11 +184,17 @@ enum TextInjector {
         guard copied == nil, attempt < 12 else {
             pasteboard.clearContents()
             pasteboard.writeObjects(saved)
+            // Re-adopt the pasteboard and reschedule the held restore. A newer
+            // inject bumped the generation and owns the restore state now.
+            if let heldGeneration, heldGeneration == restoreGeneration {
+                ourChangeCount = pasteboard.changeCount
+                scheduleRestore(on: pasteboard)
+            }
             completion(copied)
             return
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.025) {
-            pollForCopy(pasteboard: pasteboard, before: before, saved: saved,
+            pollForCopy(pasteboard: pasteboard, before: before, saved: saved, heldGeneration: heldGeneration,
                         attempt: attempt + 1, completion: completion)
         }
     }
@@ -186,7 +215,7 @@ enum TextInjector {
 
     // MARK: - Synthesized events
 
-    private static func postKeystroke(virtualKey: CGKeyCode, flags: CGEventFlags) -> Bool {
+    private static func postHIDKeystroke(virtualKey: CGKeyCode, flags: CGEventFlags) -> Bool {
         let source = CGEventSource(stateID: .combinedSessionState)
         guard
             let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true),
