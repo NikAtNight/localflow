@@ -701,7 +701,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Push-to-talk pipeline
 
-    private func hotkeyPressed() {
+    private func hotkeyPressed(asCommand: Bool = false) {
         // Gate only on the model and an active recording — never on the UI
         // state. Pressing while a previous dictation is still transcribing
         // (or after a transient mic error) must start a new recording.
@@ -714,6 +714,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
+        // Every press sets the mode for its own hold. A command hold that
+        // failed or was refused never reaches the reset at release, so a
+        // leftover flag must not turn the next dictation into a command.
+        recordingIsCommand = asCommand
         let trace = recordingIsCommand ? nil : DictationTrace(start: hotkey.callbackUptimeNs)
         activeDictationTrace = trace
         trace?.record(.hotkeyPressed, at: hotkey.callbackUptimeNs, fields: [
@@ -884,8 +888,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard modelLoaded, !isRecording else { return }
         let model = Settings.ollamaCommandModel
         Task { await textModelPolicy.prewarm(model: model) }
-        recordingIsCommand = true
-        hotkeyPressed()
+        hotkeyPressed(asCommand: true)
     }
 
     private func commandKeyReleased() {
