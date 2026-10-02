@@ -1,4 +1,4 @@
 chatterbox-tts==0.1.7
 # Perth 1.0.1 imports pkg_resources, removed in setuptools 81.
 resemble-perth==1.0.1
-setuptools==80.9.0
+setuptools==83.0.0
